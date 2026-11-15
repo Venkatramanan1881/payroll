@@ -1,0 +1,4 @@
+ALTER TABLE platform.support_access_grant DROP CONSTRAINT IF EXISTS support_access_grant_decider;
+DROP SCHEMA IF EXISTS iam CASCADE;
+DROP SCHEMA IF EXISTS workforce CASCADE;
+DROP SCHEMA IF EXISTS org CASCADE;
