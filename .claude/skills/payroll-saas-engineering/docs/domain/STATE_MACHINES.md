@@ -336,7 +336,7 @@ Cycle owner → DP-01 (G-A). The pre-lock checklist (PL-R2) is a computed view r
 |---|---|---|---|---|---|---|---|
 | B1 | — | CreateBatch / Upload | Draft | HR | Upload with bad rows → OQ-C15-09 / G-H | — | Manual |
 | B2 | Draft | EditEntries | Draft | HR | Validation → OQ-C15-03 | — | Manual |
-| B3 | Draft | Confirm | Confirmed | HR | OB-01 = HR Manager | Opening ledger/counter entries posted (keyed by batch + entry); comp-off expiry → OQ-C15-02; `OpeningBalancesConfirmed` | Manual |
+| B3 | Draft | Confirm | Confirmed | HR | OB-01 = HR Manager | Opening ledger/counter entries posted (keyed by batch + entry); comp-off expiry → OQ-C15-02; `OpeningBalanceConfirmed` | Manual |
 | B4 | Draft | SubmitForApproval | Pending approval | HR | OB-01 = with OA approval | — | Manual |
 | B5 | Pending approval | Approve | Confirmed | OA | OA ≠ submitter (BR-07) | as B3 | Manual |
 | B6 | Pending approval | Reject | ? | OA | Outcome not in BRD → GAP-SM-13 | — | Manual |
@@ -457,3 +457,25 @@ Scheduled → In force → Superseded are **date-derived**: PolicyResolver picks
 | GAP-SM-15 | Comp-off leave cancelled after the credit's expiry date: restored or lapsed? |
 | GAP-SM-16 | Policy version: definition of "in use"; edit/withdraw of a scheduled version; back-dating into locked periods; AC-04 rejection outcome. |
 | GAP-SM-17 | In-flight items (pending requests, open absconding cases, unexpired comp-off, raised flags) when a module or rule group is switched off. |
+
+---
+
+## 16. Lifecycles added in Phase 4 (need Gate 4 approval)
+
+Found while writing the API contracts; tables in migration 0006.
+
+### SM-CONTACT Employee contact-detail change request (EM-03)
+| From | Event | To | Actor | Notes |
+|---|---|---|---|---|
+| — | Submit | pending | EMP (self) | EM-03 = on, with approval |
+| — | Submit | applied | EMP (self) | EM-03 = on, without approval; change applied at once |
+| pending | Approve | approved → applied | HR (approver per AC-02 `contact_change`) | BR-07: approver ≠ requester; applied in the same transaction |
+| pending | Reject | rejected | HR | Reason required. Terminal |
+Illegal: any command on applied/rejected; edits to fields other than contact details. Gaps: who approves by default (OQ-C02-15 for the sign-in mobile number).
+
+### SM-SETCHG Settings change awaiting approval (AC-04 = with Organisation Admin approval)
+| From | Event | To | Actor | Notes |
+|---|---|---|---|---|
+| — | Submit | pending | HR | Only when AC-04 requires approval; otherwise the change is saved directly |
+| pending | Approve | approved | OA | Creates the new settings version effective from the requested date. BR-07; one person with both roles: OQ-C03-11 |
+| pending | Reject | rejected | OA | Terminal. What happens to the draft: GAP-SM-16 |

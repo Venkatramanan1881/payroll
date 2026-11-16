@@ -1,0 +1,874 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Permission & On-duty
+  version: 1.0.0-draft
+  description: >-
+    Permission & On-duty context (DOMAIN_MODEL §3.10), BRD module C09 (PM-R1..PM-R7, PM-01..PM-30, OD-01..OD-12):
+    permission types and their append-only versions, permission requests (applied or converted from late/early,
+    LA-15/EC-13), permission usage and balance (PM-R4), and on-duty requests. Requests follow SM-REQ.
+    Work-from-home requests are not modelled (DP-09, G-28). Conventions: docs/api/API_CONVENTIONS.md.
+security:
+  - userToken: []
+tags:
+  - name: Permission types
+  - name: Permission requests
+  - name: Permission usage
+  - name: On-duty requests
+x-exempt-permissions:
+  PRM-12: 'Work-from-home day request/approval has no aggregate in DOMAIN_MODEL or the database (DP-09, G-28, OQ-C04-14, OQ-C08-18); no operation until decided.'
+paths:
+  /v1/permissions/types:
+    get:
+      operationId: permListTypes
+      summary: List permission types
+      description: >-
+        Permission types with the version in force on `on_date` (default today). Holders of PRM-01 see all; other users
+        see only types they are eligible for (PM-25). With PM-01 = off the module rule group is off and nothing is
+        offered (AC-C09-01.1). Organisation isolation AC-C09-01.6. No separate "view type" row exists in the matrix.
+      tags: [Permission types]
+      parameters:
+        - name: on_date
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Date' }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of types.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PermissionType' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: AUTHENTICATED
+      x-module: C09
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+    post:
+      operationId: permCreateType
+      summary: Create a permission type with its first version
+      description: >-
+        Creates a PermissionType (PM-02 named types, AC-C09-01.2) and its first version. Records who, when, value and
+        reason (G9, AC-C09-01.3). Whether AC-04 approval covers types is G-08 (OQ-C03-11); this contract saves directly.
+        OD settings (OD-01..OD-12) are the OD rule group of the policy version and are edited through the policy
+        operations; PRM-01 covers both.
+      tags: [Permission types]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, name, version]
+              properties:
+                code: { type: string, minLength: 1, maxLength: 20 }
+                name: { type: string, minLength: 1, maxLength: 100 }
+                version: { $ref: '#/components/schemas/PermissionTypeVersionInput' }
+      responses:
+        '201':
+          description: Created.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PermissionType' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: PRM-01
+      x-module: C09
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/permissions/types/{id}:
+    get:
+      operationId: permGetType
+      summary: Get a permission type with all versions
+      description: Type and version history (G5, BR-05, AC-C09-01.3).
+      tags: [Permission types]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The type.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PermissionType'
+                  - type: object
+                    required: [versions]
+                    properties:
+                      versions: { type: array, items: { $ref: '#/components/schemas/PermissionTypeVersion' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: AUTHENTICATED
+      x-module: C09
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/permissions/types/{id}/versions:
+    post:
+      operationId: permPublishTypeVersion
+      summary: Publish a new version of a permission type
+      description: >-
+        Append-only (G5, AC-C09-01.3): a change is a new version with `effective_from`; existing versions are never
+        edited. Same `effective_from` as an existing version → VERSION_FROZEN. Reason required (G9). Back-dating into a
+        locked period: GAP-SM-16 (locked results never change, BR-06). Open days from `effective_from` are recalculated.
+        PM-08 payroll period in V1: OQ-C09-01; PM-23/PM-24 formulas: OQ-C09-02; PM-09 week: OQ-C09-03.
+      tags: [Permission types]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: '#/components/schemas/PermissionTypeVersionInput' } ]
+      responses:
+        '201':
+          description: Version published.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PermissionTypeVersion' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: PRM-01
+      x-module: C09
+      x-scope: org
+      x-audit: true
+      x-events: [PolicyVersionActivated]
+      x-idempotent: key
+
+  /v1/permissions/requests:
+    post:
+      operationId: permSubmitRequest
+      summary: Apply for a permission (own)
+      description: >-
+        Employee applies for themself (PM-R1, origin = applied; AC-C09-02.1). Refusals create no request (SM-REQ):
+        PM-03 unit / PM-04 min-max / PM-10 position / PM-28 reason → VALIDATION_FAILED (AC-C09-02.2, 02.3, 02.7, 02.15);
+        PM-05..PM-09 limits with PM-18 = block → LIMIT_EXCEEDED (AC-C09-02.4..02.6, AC-C09-03.1); PM-14 / PM-15 →
+        OUTSIDE_REQUEST_WINDOW (AC-C09-02.8, 02.9); PM-20 half-day leave same day → OVERLAPPING_REQUEST (AC-C09-02.10);
+        PM-25 → NOT_ELIGIBLE (AC-C09-02.13); PM-21 adjacent off, PM-22 consecutive days and PM-26 blackout have no
+        catalog code and are refused as VALIDATION_FAILED with the setting id as field-error code (AC-C09-02.11,
+        02.12, 02.14). Over limit with PM-18 = hr_approval_unpaid → created as pending_l2 with HR (SM-REQ R3,
+        AC-C09-03.2/03.3); PM-18 = convert_half_day_leave → a half-day leave request is raised instead and returned as
+        `converted_to_leave_request_id` (AC-C09-03.4; refusal of that leave: OQ-C09-05); PM-18 = debit_leave_hourly →
+        type and hour conversion OQ-C09-05. PM-16 = auto_within_limit → approved at once (SM-REQ R2, AC-C09-04.2).
+        Pending requests counting toward limits: OQ-C09-04.
+      tags: [Permission requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [permission_type_id, permission_date, start_time, end_time, reason]
+              properties:
+                permission_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                permission_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                start_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
+                end_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
+                reason: { type: string, minLength: 1, maxLength: 500, description: PM-28 reason from the list. }
+                document: { $ref: 'common.yaml#/components/schemas/FileRef' }
+      responses:
+        '201':
+          description: Submitted (or, under PM-18 = convert_half_day_leave, converted to a leave request).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/PermissionRequest'
+                  - type: object
+                    required: [converted_to_leave_request_id]
+                    properties:
+                      converted_to_leave_request_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: PRM-02
+      x-module: C09
+      x-scope: self
+      x-audit: true
+      x-events: [RequestSubmitted, RequestApproved]
+      x-idempotent: key
+    get:
+      operationId: permListRequests
+      summary: List permission requests
+      description: >-
+        Own requests for employees; scoped requests for approvers and HR (AC-07, AC-C09-04.6). Filters apply after
+        scope. No separate "view request" row in the matrix.
+      tags: [Permission requests]
+      parameters:
+        - name: employee_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: state
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/RequestState' }
+        - name: origin
+          in: query
+          schema: { $ref: '#/components/schemas/PermissionOrigin' }
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PermissionRequest' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: [PRM-02, PRM-03, PRM-04, PRM-05, PRM-07, PRM-13]
+      x-module: C09
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/permissions/requests/{id}:
+    get:
+      operationId: permGetRequest
+      summary: Get a permission request
+      description: Request with approval steps (SM-REQ, §16). Out of scope → NOT_FOUND.
+      tags: [Permission requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The request.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PermissionRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: [PRM-02, PRM-03, PRM-04, PRM-05, PRM-07, PRM-13]
+      x-module: C09
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/permissions/requests/{id}/approve:
+    post:
+      operationId: permApproveRequest
+      summary: Approve a permission request at the caller's level
+      description: >-
+        SM-REQ R4/R5. Level 1 (PRM-03) → pending_l2 when PM-16 = manager_then_hr (AC-C09-04.3), else approved; level 2
+        (PRM-04); an over-limit request under PM-18 = hr_approval_unpaid is approved by HR only (PRM-05) and records
+        the minutes as unpaid (AC-C09-03.2, 03.3). Final approval posts the usage entry (PM-R4, AC-C09-04.1) and
+        recalculates the day (AC-C09-04.7). BR-07: own request, also as delegate → SELF_APPROVAL_FORBIDDEN
+        (AC-C09-04.5). AC-03: a delegate may act; the step records actor and on-behalf-of. Outside scope → NOT_FOUND
+        (AC-C09-04.6). Approved → 200 no second usage entry; rejected/cancelled → ILLEGAL_TRANSITION. Locked date:
+        difference posted to the next open period (SM-ADJ Q1; PL-07 OQ-C12-04); pending at lock OQ-C12-03.
+        Escalation target/timer: OQ-C09-06.
+      tags: [Permission requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ApprovalDecision' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PermissionRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [PRM-03, PRM-04, PRM-05]
+      x-module: C09
+      x-scope: team
+      x-audit: true
+      x-events: [RequestApprovedAtLevel, RequestApproved, AdjustmentPosted]
+      x-idempotent: key
+  /v1/permissions/requests/{id}/reject:
+    post:
+      operationId: permRejectRequest
+      summary: Reject a permission request
+      description: >-
+        SM-REQ R6 with reason. BR-07 → SELF_APPROVAL_FORBIDDEN (incl. delegate, AC-C09-04.5); AC-03 delegate recorded.
+        Rejected → 200; approved/cancelled → ILLEGAL_TRANSITION.
+      tags: [Permission requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/RejectionDecision' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PermissionRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [PRM-03, PRM-04, PRM-05]
+      x-module: C09
+      x-scope: team
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/permissions/requests/{id}/cancel:
+    post:
+      operationId: permCancelRequest
+      summary: Cancel a permission request
+      description: >-
+        PM-29: the employee before the start time (PRM-06), HR afterwards with a reason (PRM-07); an employee after the
+        start time → ILLEGAL_TRANSITION (AC-C09-07.1, 07.2). SM-REQ R10/R11: usage reversal entry, recalculation;
+        locked period unchanged and difference posted to the next open period (SM-ADJ Q1, AC-C09-07.3).
+        Cancelled → 200; rejected → ILLEGAL_TRANSITION.
+      tags: [Permission requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ReasonRequired' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PermissionRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [PRM-06, PRM-07]
+      x-module: C09
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RequestCancelled, AdjustmentPosted]
+      x-idempotent: key
+  /v1/permissions/requests/{id}/change:
+    post:
+      operationId: permChangeRequest
+      summary: Change the time of a permission request
+      description: >-
+        PM-29 change, same actor rule as cancel (PRM-06 before start, PRM-07 after with reason; AC-C09-07.2/07.3).
+        A submitted request is never edited in place (SM-REQ); this is transition R12. Whether a change needs fresh
+        approval (the resulting state) is OQ-C09-10: the response returns whatever state results. The new times are
+        re-checked against the type's limits and windows (same refusal codes as permSubmitRequest).
+      tags: [Permission requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [start_time, end_time, reason]
+              properties:
+                start_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
+                end_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Request after the change.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PermissionRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [PRM-06, PRM-07]
+      x-module: C09
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RequestCancelled, RequestSubmitted, AdjustmentPosted]
+      x-idempotent: key
+  /v1/permissions/conversion-suggestions:
+    get:
+      operationId: permListConversionSuggestions
+      summary: Own late/early marks offered for conversion to a permission
+      description: >-
+        With LA-15 / EC-13 = suggest, a late arrival or early check-out beyond grace with a permission left is offered
+        for conversion (AC-C09-06.3); with automatic, the engine converts with origin converted_late/converted_early
+        and nothing is offered (AC-C09-06.1, 06.5); with off, nothing (AC-C09-06.6). Engine result, read-only.
+        Unanswered suggestion at day/period end and whether conversion must meet PM-04/09/10/25: OQ-C09-09.
+        Whether a converted permission is a request needing approval: GAP-SM-11.
+      tags: [Permission requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+      responses:
+        '200':
+          description: Open suggestions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [attendance_date, origin, minutes, permission_type_id]
+                      properties:
+                        attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                        origin: { type: string, enum: [converted_late, converted_early] }
+                        minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+                        start_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
+                        end_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
+                        permission_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: ATT-08
+      x-module: C09
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/permissions/conversion-suggestions/accept:
+    post:
+      operationId: permAcceptConversionSuggestion
+      summary: Accept a suggested late/early → permission conversion
+      description: >-
+        Employee accepts a suggestion (LA-15 / EC-13 = suggest, AC-C09-06.3). Creates a PermissionRequest with
+        origin converted_late / converted_early; PM-30 decides whether it counts toward the limit (AC-C09-06.4).
+        Whether it is then approved at once or routed for approval is GAP-SM-11: the response returns the resulting
+        state. No open suggestion for that date/origin → NOT_FOUND; already accepted → 200 with the existing request.
+        Day in a locked period → PERIOD_LOCKED (OQ-C09-09 covers the deadline).
+      tags: [Permission requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [attendance_date, origin]
+              properties:
+                attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                origin: { type: string, enum: [converted_late, converted_early] }
+      responses:
+        '200':
+          description: Conversion made (or already made).
+          content: { application/json: { schema: { $ref: '#/components/schemas/PermissionRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: ATT-08
+      x-module: C09
+      x-scope: self
+      x-audit: true
+      x-events: [RequestSubmitted, RequestApproved]
+      x-idempotent: key
+
+  /v1/permissions/employees/{employee_id}/usage:
+    get:
+      operationId: permGetUsage
+      summary: Permission usage and balance of an employee
+      description: >-
+        Used and remaining per type for the limit period containing `on_date` (PM-R4, AC-C09-08.1), by count, minutes or
+        both per PM-05, including opening usage (OB-R2, AC-C09-08.4) and conversions (PM-30). Employees see their own
+        subject to AC-05; whether AC-05 = off also hides the remaining count on the request screen is OQ-C09-11
+        (this contract does not decide it). Manager access to team balances: G-39. Pending requests: OQ-C09-04.
+      tags: [Permission usage]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+        - name: on_date
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Date' }
+      responses:
+        '200':
+          description: Usage per type.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [employee_id, items]
+                properties:
+                  employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [permission_type_id, limit_basis, period_from, period_to, used_count, used_minutes]
+                      properties:
+                        permission_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        limit_basis: { type: string, enum: [count, hours, both] }
+                        period_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                        period_to: { $ref: 'common.yaml#/components/schemas/Date' }
+                        used_count: { type: integer }
+                        used_minutes: { type: integer }
+                        limit_count: { type: [integer, 'null'] }
+                        limit_minutes: { type: [integer, 'null'] }
+                        remaining_count: { type: [integer, 'null'] }
+                        remaining_minutes: { type: [integer, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: PRM-13
+      x-module: C09
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/on-duty/requests:
+    post:
+      operationId: permSubmitOnDuty
+      summary: Apply for on-duty (own)
+      description: >-
+        PM-R5: hours, half day, full day or several days, with purpose and place (OD-06) and optional proof
+        (AC-C09-09.1). Refusals: OD-01 off → RULE_GROUP_DISABLED (AC-C09-09.7); OD-02 kind switched off, OD-06 missing
+        purpose/place/proof → VALIDATION_FAILED (AC-C09-09.2, 09.4); OD-04 → OUTSIDE_REQUEST_WINDOW (AC-C09-09.3);
+        OD-11 → NOT_ELIGIBLE (AC-C09-09.5); overlap with an active on-duty → OVERLAPPING_REQUEST. OD-12: the
+        permission limit is never checked or used (AC-C09-09.6). OD-03 limit outcome and month: OQ-C09-12. Which half
+        of the day a half_day covers is not a column (OQ-C09-12); hours use from_time/to_time.
+      tags: [On-duty requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [duration_kind, from_date, to_date, purpose, place]
+              properties:
+                duration_kind: { $ref: '#/components/schemas/OnDutyDurationKind' }
+                from_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                to_date: { $ref: 'common.yaml#/components/schemas/Date', description: Equals from_date unless several_days. }
+                from_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay', description: Required iff duration_kind = hours. }
+                to_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay', description: Required iff duration_kind = hours. }
+                purpose: { type: string, minLength: 1, maxLength: 500 }
+                place: { type: string, minLength: 1, maxLength: 300 }
+                proof: { $ref: 'common.yaml#/components/schemas/FileRef' }
+      responses:
+        '201':
+          description: Submitted.
+          content: { application/json: { schema: { $ref: '#/components/schemas/OnDutyRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: PRM-08
+      x-module: C09
+      x-scope: self
+      x-audit: true
+      x-events: [RequestSubmitted]
+      x-idempotent: key
+    get:
+      operationId: permListOnDuty
+      summary: List on-duty requests
+      description: Own for employees; scoped for approvers and HR (AC-07). Filters after scope.
+      tags: [On-duty requests]
+      parameters:
+        - name: employee_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: state
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/RequestState' }
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of on-duty requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/OnDutyRequest' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: [PRM-08, PRM-09, PRM-10, PRM-11]
+      x-module: C09
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/on-duty/requests/{id}:
+    get:
+      operationId: permGetOnDuty
+      summary: Get an on-duty request
+      description: Request with approval steps. Out of scope → NOT_FOUND.
+      tags: [On-duty requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The request.
+          content: { application/json: { schema: { $ref: '#/components/schemas/OnDutyRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: [PRM-08, PRM-09, PRM-10, PRM-11]
+      x-module: C09
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/on-duty/requests/{id}/approve:
+    post:
+      operationId: permApproveOnDuty
+      summary: Approve an on-duty request at the caller's level
+      description: >-
+        SM-REQ R4/R5. Level 1 (PRM-09) → pending_l2 when OD-05 = manager then HR (AC-C09-10.2); level 2 (PRM-10).
+        Final approval recalculates covered days (AC-C09-10.1); no permission usage (OD-12); comp-off if OD-10
+        (AC-C09-11.5). BR-07 → SELF_APPROVAL_FORBIDDEN incl. delegate (AC-C09-10.4); AC-03 delegate recorded.
+        Approved → 200; rejected/cancelled → ILLEGAL_TRANSITION. Locked dates → PeriodAdjustment (SM-ADJ Q1;
+        OQ-C12-04). Timers and auto-decision: OQ-C09-06.
+      tags: [On-duty requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ApprovalDecision' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/OnDutyRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [PRM-09, PRM-10]
+      x-module: C09
+      x-scope: team
+      x-audit: true
+      x-events: [RequestApprovedAtLevel, RequestApproved, AdjustmentPosted]
+      x-idempotent: key
+  /v1/on-duty/requests/{id}/reject:
+    post:
+      operationId: permRejectOnDuty
+      summary: Reject an on-duty request
+      description: >-
+        SM-REQ R6 with reason; covered days recalculated from punches if previously counted (AC-C09-11.6). BR-07 →
+        SELF_APPROVAL_FORBIDDEN incl. delegate (AC-C09-10.4); AC-03 delegate recorded. Rejected → 200;
+        approved/cancelled → ILLEGAL_TRANSITION.
+      tags: [On-duty requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/RejectionDecision' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/OnDutyRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [PRM-09, PRM-10]
+      x-module: C09
+      x-scope: team
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/on-duty/requests/{id}/cancel:
+    post:
+      operationId: permCancelOnDuty
+      summary: Cancel an on-duty request
+      description: >-
+        SM-REQ R10/R11; approved on-duty cancelled → days recalculated from punches (AC-C09-11.6); locked dates →
+        PeriodAdjustment (SM-ADJ Q1). Who may cancel or change on-duty, and until when, is OQ-C09-10 (G-27; matrix
+        "?"): this contract takes no position. Change of on-duty is not offered until G-27 is decided.
+        Cancelled → 200; rejected → ILLEGAL_TRANSITION.
+      tags: [On-duty requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ReasonRequired' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/OnDutyRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: PRM-11
+      x-module: C09
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RequestCancelled, AdjustmentPosted]
+      x-idempotent: key
+
+components:
+  schemas:
+    PermissionOrigin:
+      type: string
+      enum: [applied, converted_late, converted_early]
+    PermissionRequest:
+      allOf:
+        - $ref: 'leave.yaml#/components/schemas/ApprovalStatus'
+        - type: object
+          required: [id, employee_id, permission_type_id, permission_date, start_time, end_time, minutes, reason, origin]
+          properties:
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            permission_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            permission_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            start_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
+            end_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
+            minutes: { type: integer, minimum: 1 }
+            reason: { type: string }
+            document_path: { type: [string, 'null'] }
+            origin: { $ref: '#/components/schemas/PermissionOrigin' }
+            requested_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ], description: Null for converted origins. }
+    OnDutyDurationKind:
+      type: string
+      enum: [hours, half_day, full_day, several_days]
+    OnDutyRequest:
+      allOf:
+        - $ref: 'leave.yaml#/components/schemas/ApprovalStatus'
+        - type: object
+          required: [id, employee_id, duration_kind, from_date, to_date, purpose, place, requested_by]
+          properties:
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            duration_kind: { $ref: '#/components/schemas/OnDutyDurationKind' }
+            from_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            to_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            from_time: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+            to_time: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+            purpose: { type: string }
+            place: { type: string }
+            proof_path: { type: [string, 'null'] }
+            requested_by: { $ref: 'common.yaml#/components/schemas/Id' }
+    PermissionType:
+      type: object
+      required: [id, code, name]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        code: { type: string }
+        name: { type: string }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        current_version: { $ref: '#/components/schemas/PermissionTypeVersion' }
+    PermissionTypeVersion:
+      type: object
+      required: [id, permission_type_id, effective_from]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        permission_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        settings:
+          type: object
+          description: The version's PM settings, same fields as PermissionTypeVersionInput.
+          additionalProperties: true
+    PermissionTypeVersionInput:
+      type: object
+      additionalProperties: false
+      description: Columns of perm.permission_type_version (PM-02..PM-30). PM-28 reason list and PM-29 cancel rule are fixed behaviour.
+      required: [effective_from, reason, duration_unit, min_minutes, max_minutes, limit_basis, limit_period, allowed_position, paid, counts_as_worked, counts_toward_overtime, apply_window, min_notice_minutes, approval, timeout_action, over_limit, over_stay, same_day_half_leave_allowed, adjacent_off_allowed, mid_period_joiner, eligibility, blackout_enabled, blackout_dates, punch_requirement, converted_uses_limit]
+      properties:
+        effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        reason: { type: string, minLength: 1, maxLength: 1000, description: G9 change reason. }
+        duration_unit: { type: string, enum: [any_minutes, block_30, block_60], description: PM-03 }
+        min_minutes: { type: integer, minimum: 1, description: PM-04 }
+        max_minutes: { type: integer, minimum: 1, description: PM-04 (>= min_minutes) }
+        limit_basis: { type: string, enum: [count, hours, both], description: PM-05 }
+        limit_count: { type: integer, minimum: 0, description: PM-06; required unless limit_basis = hours. }
+        limit_minutes: { type: integer, minimum: 0, description: PM-07; required unless limit_basis = count. }
+        limit_period: { type: string, enum: [week, calendar_month, payroll_period, quarter, year], description: PM-08 (payroll_period in V1 OQ-C09-01) }
+        max_per_day: { type: integer, minimum: 1, description: PM-09 }
+        max_per_week: { type: integer, minimum: 1, description: PM-09 (week OQ-C09-03) }
+        allowed_position: { type: string, enum: [start_of_shift, end_of_shift, middle_of_shift, any], description: PM-10 }
+        paid: { type: boolean, description: PM-11 }
+        counts_as_worked: { type: boolean, description: PM-12 }
+        counts_toward_overtime: { type: boolean, description: PM-13 }
+        apply_window: { type: string, enum: [before_only, before_or_on_day, after_within_days], description: PM-14 }
+        after_event_days: { type: integer, minimum: 0, description: PM-14; required when apply_window = after_within_days. }
+        min_notice_minutes: { type: integer, minimum: 0, description: PM-15 }
+        approval: { type: string, enum: [auto_within_limit, manager, manager_then_hr], description: PM-16 }
+        timeout_action: { type: string, enum: [escalate, auto_approve, auto_reject], description: PM-17 }
+        timeout_minutes: { type: integer, minimum: 1, description: PM-17 }
+        over_limit: { type: string, enum: [block, hr_approval_unpaid, convert_half_day_leave, debit_leave_hourly], description: PM-18 (conversions OQ-C09-05) }
+        over_stay: { type: string, enum: [late_early_minutes, half_day_leave, second_permission, flag_only], description: PM-19 (OQ-C09-08) }
+        same_day_half_leave_allowed: { type: boolean, description: PM-20 }
+        adjacent_off_allowed: { type: boolean, description: PM-21 }
+        max_consecutive_days: { type: integer, minimum: 1, description: PM-22 }
+        carry_forward_max: { type: integer, minimum: 1, description: PM-23 }
+        mid_period_joiner: { type: string, enum: [full, prorated], description: PM-24 (formula OQ-C09-02) }
+        eligibility: { type: object, additionalProperties: true, description: PM-25 categories / employee types / statuses. }
+        blackout_enabled: { type: boolean, description: PM-26 }
+        blackout_dates: { type: array, items: { $ref: 'common.yaml#/components/schemas/Date' }, description: PM-26 }
+        punch_requirement: { type: object, additionalProperties: true, description: 'PM-27 per position (OQ-C09-07).' }
+        converted_uses_limit: { type: boolean, description: PM-30 }

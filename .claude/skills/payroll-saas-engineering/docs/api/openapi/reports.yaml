@@ -1,0 +1,612 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Reports, dashboards, audit, jobs and files
+  version: 1.0.0-draft
+  description: |
+    Reporting & Dashboards context (read models only, SERVICE_BOUNDARIES §3) and Audit (§16). BRD modules C13
+    (reports R1-R10, R13, R25-R27, §14), C16 (dashboards DB-R1..R8, DB-01, DB-02) and §16 audit trail. Also the
+    shared generic endpoints used by every context: job polling (API_CONVENTIONS §7) and upload links (TB-02).
+
+    Reports are report-run jobs (`POST` -> 202 `Job`, poll `GET /v1/jobs/{id}`); the finished job carries a
+    short-lived signed link to a spreadsheet with the same rows and filters as the screen (AC-C13-01.4, AC-C13-01.7).
+    Common filters: period, branch, department, employee (AC-C13-01.1), always applied after the caller's scope
+    (AC-C13-01.2). Report runs and downloads are allowed while the organisation is suspended (VC-R4, AC-C13-01.8).
+    A report of a disabled module is refused with MODULE_DISABLED and hidden from menus (AC-C13-01.6). Default
+    report rights per role are G-33 / OQ-C13-04; meaning of "period" is OQ-C13-01; locked periods with later
+    corrections are OQ-C13-02; columns of rule groups switched off are OQ-C13-03; report language is OQ-C13-05.
+    No money in any V1 report (BRX-02).
+security:
+  - userToken: []
+tags:
+  - name: Reports
+  - name: Dashboards
+  - name: Audit
+  - name: Jobs and files
+
+x-exempt-permissions:
+  ADT-03: 'Fixed denial (§16, TSD §15): audit entries are insert-only; no edit or delete operation exists.'
+  ADT-04: 'Fixed denial (BR-01, PC-R6): raw punches are never edited or deleted; no operation exists.'
+
+x-response-sets:
+  read: &read
+    '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+    '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+  write: &write
+    '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+    '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+    '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+    '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+paths:
+  /v1/reports/attendance/{report}/runs:
+    parameters:
+      - name: report
+        in: path
+        required: true
+        schema: { type: string, enum: [R1, R2, R3, R4, R5] }
+    post:
+      operationId: reportsRunAttendance
+      summary: Run / export an attendance report (R1-R5)
+      description: |
+        R1 daily attendance (status, in, out, net hours, flags; AC-C13-02.1; `from` = `to` = the date), R2 monthly
+        register (AC-C13-02.2), R3 late / early marks, minutes and penalties (AC-C13-02.3..02.5), R4 missed punches
+        and regularisations with status (AC-C13-02.6), R5 flagged punches and device status (AC-C13-02.7). Same filters
+        on a locked period give identical output (AC-C13-01.9). Grants for roles other than HR / Auditor: G-33.
+      tags: [Reports]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportFilters' }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: RPT-01
+      x-module: C13
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/reports/leave/{report}/runs:
+    parameters:
+      - name: report
+        in: path
+        required: true
+        schema: { type: string, enum: [R6, R7, R8, R9] }
+    post:
+      operationId: reportsRunLeave
+      summary: Run / export a leave, absence, permission or comp-off report (R6-R9)
+      description: |
+        R6 leave balance and taken (AC-C13-03.1), R7 uninformed / excess absence with informed and uninformed counts
+        in separate columns and sandwich days (AC-C13-03.2/03.3), R8 permission and on-duty register (AC-C13-03.4), R9
+        comp-off earned, taken, expired (AC-C13-04.1). Each also needs its module: R6/R7 C08, R8 C09, R9 M02;
+        disabled -> MODULE_DISABLED and hidden (AC-C13-04.2). Grants: G-33.
+      tags: [Reports]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportFilters' }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: RPT-02
+      x-module: C13
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/reports/people/runs:
+    post:
+      operationId: reportsRunPeople
+      summary: Run / export the people report (R10)
+      description: |
+        R10 employee list and headcount by branch, department, category and employee type, and days worked by branch
+        per EM-08 (AC-C13-05.1..05.3, E17). Grants: G-33, G-14.
+      tags: [Reports]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportFilters' }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: RPT-03
+      x-module: C13
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/reports/payroll-input-summary/runs:
+    post:
+      operationId: reportsRunPayrollInputSummary
+      summary: Run / export the payroll input summary (R13)
+      description: |
+        R13 per employee: payable days, deduction days, late / early minutes, identified overtime, in days and
+        minutes only (AC-C13-06.1), with adjustments tagged by original date (E15, AC-C13-06.2); a locked period's
+        R13 never changes. Whether R13 equals the MD-06 export content is OQ-C12-11. Grants: G-29 / G-31.
+      tags: [Reports]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportFilters' }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: RPT-04
+      x-module: C13
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/reports/control/{report}/runs:
+    parameters:
+      - name: report
+        in: path
+        required: true
+        schema: { type: string, enum: [R25, R26] }
+    post:
+      operationId: reportsRunControl
+      summary: Run / export R25 opening balances or R26 settings history
+      description: |
+        R25 opening balances as confirmed with as-of dates (AC-C13-07.1, AC-C15-03.4); R26 settings changes with who,
+        when, old, new, reason and policy assignments with effective dates (AC-C13-07.2, G9). Auditor views and
+        exports, never changes (AC-C13-07.5). OA / HR access: G-34.
+      tags: [Reports]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportFilters' }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: RPT-05
+      x-module: C13
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/reports/audit-trail/runs:
+    post:
+      operationId: reportsRunAuditTrail
+      summary: Run / export the audit trail report (R27)
+      description: |
+        R27: every create, change, approval, waiver, lock and settings change with user and time (AC-C13-07.3);
+        vendor actions under a support grant are visible to the organisation (VC-R6, AC-C13-07.4). Auditor read-only
+        (AC-C13-07.5). OA / HR access: G-34.
+      tags: [Reports]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportFilters' }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: RPT-06
+      x-module: C13
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/dashboards/me:
+    get:
+      operationId: dashboardsGetMine
+      summary: Dashboard for the caller's role
+      description: |
+        DB-R1 (AC-C16-01.1/01.2): the caller lands on their role's dashboard; widgets are those chosen under DB-01 for
+        the role (AC-C16-08.1), minus widgets of disabled modules (DB-R8, AC-C16-08.2) and items AC-05 hides from
+        employees (AC-C16-07.2). Every count is within the caller's scope (DB-R8, AC-C16-03.3, AC-C16-04.3,
+        AC-C16-05.2). Defaults from DB-02 apply unless overridden by query, and overrides stay within scope
+        (AC-C16-08.4). Which dashboard a multi-role or custom-role user gets is OQ-C16-01 (`role` selects among the
+        caller's roles). Whether the Auditor has a dashboard is OQ-C16-02 / G-35: until answered the Auditor receives
+        an empty widget list, not an error. Default widgets before any DB-01 choice: OQ-C16-06. Widget freshness:
+        OQ-C16-04 (`as_of` per widget). The vendor dashboard is in the vendor console contract, not here (organisation
+        users are refused there, AC-C16-02.4).
+      tags: [Dashboards]
+      parameters:
+        - { name: role, in: query, schema: { type: string, maxLength: 64 }, description: Role code to use when the caller holds several (OQ-C16-01). }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - { name: period_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+      responses:
+        '200':
+          description: Dashboard.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+        <<: *read
+      x-permission: DSH-01
+      x-module: C16
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/dashboards/widget-choices:
+    get:
+      operationId: dashboardsListWidgetChoices
+      summary: Widget choices per role
+      description: For each role, the widgets offered (role list minus disabled modules) and the ones chosen (DB-01).
+      tags: [Dashboards]
+      responses:
+        '200':
+          description: Choices.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/WidgetChoice' } }
+        <<: *read
+      x-permission: DSH-02
+      x-module: C16
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/dashboards/widget-choices/{role_id}:
+    parameters:
+      - name: role_id
+        in: path
+        required: true
+        schema: { $ref: 'common.yaml#/components/schemas/Id' }
+    put:
+      operationId: dashboardsSetWidgetChoice
+      summary: Organisation Admin chooses the widgets for a role
+      description: |
+        DB-01 (AC-C16-08.1..08.3, 08.6): only widgets from that role's list and of enabled modules may be chosen
+        (others -> VALIDATION_FAILED). Change recorded with who, when, old and new (G9). Requires If-Match from the
+        last read of the choices.
+      tags: [Dashboards]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [widgets]
+              properties:
+                widgets: { type: array, maxItems: 50, uniqueItems: true, items: { $ref: '#/components/schemas/WidgetCode' } }
+      responses:
+        '200':
+          description: Saved.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WidgetChoice' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        <<: *write
+      x-permission: DSH-02
+      x-module: C16
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+
+  /v1/dashboards/default-filters/{user_id}:
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema: { $ref: 'common.yaml#/components/schemas/Id' }
+    get:
+      operationId: dashboardsGetDefaultFilters
+      summary: Get a user's default dashboard filters
+      description: DB-02 default branch and period filter for a user. Who sets them (the user or an admin) is G-35.
+      tags: [Dashboards]
+      responses:
+        '200':
+          description: Filters.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DefaultFilters' }
+        <<: *read
+      x-permission: DSH-03
+      x-module: C16
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+    put:
+      operationId: dashboardsSetDefaultFilters
+      summary: Set a user's default dashboard filters
+      description: |
+        DB-02 (AC-C16-08.4). The branch must be inside the target user's scope (else VALIDATION_FAILED). Actor is G-35
+        (DB-02 names none); the grant is DSH-03 whoever holds it.
+      tags: [Dashboards]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                period: { type: [string, 'null'], enum: [current, previous, null], description: Default period relative to today. }
+      responses:
+        '200':
+          description: Saved.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DefaultFilters' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        <<: *write
+      x-permission: DSH-03
+      x-module: C16
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+
+  /v1/audit/entries:
+    get:
+      operationId: auditListEntries
+      summary: Query the audit trail
+      description: |
+        Insert-only AuditEntry trail (§16), read-only for every role (P10, P11). Auditor within scope; the
+        Organisation Admin sees entries made under a vendor support grant (VC-R6, PLT-18); other OA / HR access is
+        G-34. Filters after scope. Viewing is itself audited because entries carry before / after values.
+      tags: [Audit]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - { name: actor_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: actor_kind, in: query, schema: { type: string, enum: [user, vendor_user, system_job, device] } }
+        - { name: target_type, in: query, schema: { type: string, maxLength: 64 } }
+        - { name: target_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: action, in: query, schema: { type: string, maxLength: 64 } }
+        - { name: support_access_only, in: query, schema: { type: boolean, default: false } }
+        - { name: sort, in: query, schema: { type: string, enum: [occurred_at, -occurred_at], default: -occurred_at } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: ADT-01
+      x-module: C13
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/audit/settings-changes:
+    get:
+      operationId: auditListSettingsChanges
+      summary: Settings change history
+      description: |
+        SettingsChange view of audit entries for settings and policy versions (G9): who, when, old, new, reason
+        (AC-C06-01.3, AC-C06-01.5 Auditor read-only). OA / HR access: G-34.
+      tags: [Audit]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - { name: setting_ref, in: query, description: 'BRD setting id, e.g. PL-06.', schema: { type: string, maxLength: 16 } }
+        - { name: actor_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of changes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: ADT-02
+      x-module: C13
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/jobs/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: jobsGet
+      summary: Poll a job
+      description: |
+        Status of a job the caller started (reports, exports, uploads, bulk work; API_CONVENTIONS §7). A job of
+        another user or organisation -> NOT_FOUND. A finished job carries a short-lived signed download link and, for
+        uploads, an error report link (TB-02); links are issued only after the access check. Common to every module
+        (x-module names the always-on reporting module).
+      tags: [Jobs and files]
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema: { $ref: 'common.yaml#/components/schemas/Job' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: AUTHENTICATED
+      x-module: C13
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/files/upload-links:
+    post:
+      operationId: filesCreateUploadLink
+      summary: Get a short-lived signed upload link
+      description: |
+        TSD §9.2, §11, TB-02. The storage path starts with the organisation from the token; the returned FileRef is
+        then passed to the command that uses the file (e.g. opening-balance upload, request attachment). Type or size
+        not allowed for the purpose -> 422 FILE_TYPE_NOT_ALLOWED (DC-06). Using the file is still checked by that
+        command's own permission. Refused while the organisation is suspended (ORG_SUSPENDED, VC-R4): every purpose
+        here feeds a write.
+      tags: [Jobs and files]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [purpose, file_name, content_type, size_bytes]
+              properties:
+                purpose: { type: string, enum: [opening_balances, employee_import, roster_import, request_attachment] }
+                file_name: { type: string, minLength: 1, maxLength: 255 }
+                content_type: { type: string, maxLength: 127 }
+                size_bytes: { type: integer, minimum: 1 }
+      responses:
+        '201':
+          description: Upload link.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upload_url, method, expires_at, file]
+                properties:
+                  upload_url: { type: string, format: uri }
+                  method: { type: string, enum: [PUT] }
+                  headers: { type: object, additionalProperties: { type: string } }
+                  expires_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                  file: { $ref: 'common.yaml#/components/schemas/FileRef' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: AUTHENTICATED
+      x-module: C13
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+components:
+  securitySchemes:
+    userToken: { $ref: 'common.yaml#/components/securitySchemes/userToken' }
+  schemas:
+    ReportFilters:
+      type: object
+      additionalProperties: false
+      description: |
+        Common report filters (AC-C13-01.1), applied after scope. Give either `period_id` or `from` + `to`
+        (OQ-C13-01). `format` is the spreadsheet type.
+      properties:
+        period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        from: { $ref: 'common.yaml#/components/schemas/Date' }
+        to: { $ref: 'common.yaml#/components/schemas/Date' }
+        branch_ids: { type: array, maxItems: 200, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+        department_ids: { type: array, maxItems: 200, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+        employee_ids: { type: array, maxItems: 1000, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+        format: { type: string, enum: [xlsx, csv], default: xlsx }
+    WidgetCode:
+      type: string
+      description: |
+        V1 widget codes per role (DB-R3..R7): org_admin / hr - today_counts_by_branch, missed_punches,
+        pending_approvals, devices_offline, joiners_leavers; payroll_officer - periods_awaiting_lock,
+        pre_lock_issues; manager - team_attendance_today, pending_approvals, team_leave_calendar,
+        late_absence_trends; supervisor - who_is_in_now, roster_today_tomorrow; employee - today_punch_status,
+        month_attendance, leave_balance, permission_balance, comp_off_balance, my_pending_requests.
+      enum: [today_counts_by_branch, missed_punches, pending_approvals, devices_offline, joiners_leavers,
+             periods_awaiting_lock, pre_lock_issues, team_attendance_today, team_leave_calendar, late_absence_trends,
+             who_is_in_now, roster_today_tomorrow, today_punch_status, month_attendance, leave_balance,
+             permission_balance, comp_off_balance, my_pending_requests]
+    Widget:
+      type: object
+      required: [code, as_of, data]
+      properties:
+        code: { $ref: '#/components/schemas/WidgetCode' }
+        as_of: { $ref: 'common.yaml#/components/schemas/Instant' }
+        data: { type: object, additionalProperties: true, description: Widget-specific counts and rows, no money. }
+    Dashboard:
+      type: object
+      required: [role, widgets]
+      properties:
+        role: { type: string }
+        filters:
+          type: object
+          properties:
+            branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            period_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        widgets: { type: array, items: { $ref: '#/components/schemas/Widget' } }
+    WidgetChoice:
+      type: object
+      required: [role_id, offered, chosen]
+      properties:
+        role_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        role_name: { type: string }
+        offered: { type: array, items: { $ref: '#/components/schemas/WidgetCode' } }
+        chosen: { type: array, items: { $ref: '#/components/schemas/WidgetCode' } }
+        default_applied: { type: boolean, description: True while no DB-01 choice was made (defaults OQ-C16-06). }
+    DefaultFilters:
+      type: object
+      required: [user_id]
+      properties:
+        user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        period: { type: [string, 'null'], enum: [current, previous, null] }
+    AuditEntry:
+      type: object
+      required: [id, actor_kind, action, target_type, occurred_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        actor_kind: { type: string, enum: [user, vendor_user, system_job, device] }
+        actor_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        support_grant_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        action: { type: string }
+        target_type: { type: string }
+        target_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        reason: { type: [string, 'null'] }
+        before_value: { type: [object, 'null'], additionalProperties: true }
+        after_value: { type: [object, 'null'], additionalProperties: true }
+        change_ref: { type: [string, 'null'] }
+        correlation_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        occurred_at: { $ref: 'common.yaml#/components/schemas/Instant' }

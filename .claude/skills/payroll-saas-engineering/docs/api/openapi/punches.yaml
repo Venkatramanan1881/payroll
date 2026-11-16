@@ -1,0 +1,1202 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Time Capture (punches, devices, flags)
+  version: 1.0.0-draft
+  description: >-
+    Time Capture context (DOMAIN_MODEL §3.5), BRD module C04 Punch collection (PC-R1..PC-R15, PC-01..PC-17),
+    with E17/E18, BR-01, BR-06, BR-07, BR-11, N4, TB-04. Commands for app/web punches, offline batch sync (TSD §9.3),
+    the normalised device-ingestion contract (TSD §9.1), devices and enrolment (SM-DEVICE, SM-ENROL),
+    manual attendance for device failure (PC-R9), punch flags (SM-FLAG) and punch evidence reads (PC-R13).
+    RawPunch is insert-only (BR-01): no operation in this file edits or deletes a punch.
+    The eSSL wire protocol adapter is NOT designed here: blocked on Q15 / D1 (TB-04).
+security:
+  - userToken: []
+x-blocked:
+  essl-wire-adapter: >-
+    The eSSL device wire protocol (what the device sends to the gateway, HTTPS vs relay, contact rate) is blocked on
+    Q15 / D1 (TB-04). Only the normalised internal contract the gateway hands to the core (tag "Device ingestion") is specified.
+x-exempt-permissions:
+  TCP-11: >-
+    Punch settings PC-01..PC-17 are the PC rule group of a policy version (policy.rule_group_code 'PC'); they are written by
+    policyPutRuleGroup / policySwitchRuleGroup in policy.yaml, which additionally require TCP-11 when rule_group = PC.
+tags:
+  - name: Punches
+    description: App and web punches by the employee, and punch evidence reads for HR (PC-R5, PC-R11, PC-R13).
+  - name: Offline sync
+    description: Offline app punches synced later in one batch (N4, TSD §9.3).
+  - name: Device ingestion
+    description: >-
+      Internal contract between the device gateway and the core API (TSD §9.1). Not callable by users or devices.
+      Security: the device is resolved by its registered serial number, which also gives the organisation (P3, TB-01);
+      an unregistered serial is refused with DEVICE_UNKNOWN and logged. The device-facing wire protocol is blocked on Q15 / D1 (TB-04).
+  - name: Devices
+    description: Device registration, retirement and online state (PC-R2, PC-R10, SM-DEVICE).
+  - name: Enrolment
+    description: Enrolment ID mappings and enrolment status (PC-R3, PC-R8, SM-ENROL).
+  - name: Manual attendance
+    description: Manual punches for a device failure (PC-R9, PC-11) and bulk regularisation of an outage (RG-11).
+  - name: Punch flags
+    description: Flagged punches and their decision (SM-FLAG, E18).
+paths:
+  /v1/punches:
+    post:
+      operationId: timecapRecordPunch
+      tags: [Punches]
+      summary: Record an app or web punch
+      description: >-
+        Employee records one punch from the app (PC-R5, PC-02) or web (PC-R11, PC-12). The client sends location and accuracy
+        read at the moment of the punch (PC-R15), the client clock time, the capture time zone and, where PC-02 selfie = on,
+        a selfie FileRef from an upload link (PC-R4, TB-02). The server alone computes fence distance and inside/outside against
+        the fences that apply (PC-16) and applies the accuracy threshold (PC-14), IP rule (PC-05/PC-15), branch rule (EM-07),
+        day rule (PC-06) and WFH rule (PC-09, PC-17) using the settings version in force on the punch date (TSD §9.2, BR-05).
+        Any client "inside" claim is not an input: the request body has no such field and unknown fields are refused (AC-C04-11.1).
+        Outcomes: accepted (201), flagged with reasons (201, SM-FLAG F1), or refused (422 PUNCH_REFUSED with rule_ref, E18),
+        in which case no RawPunch is created and a refused PunchAttempt is recorded (DOMAIN_MODEL §3.5).
+        Idempotency: the body carries idempotency_key (API_CONVENTIONS §5); a retry with the same key returns 200 with the stored punch.
+        Direction is never assigned here (BRX-01, AC-C04-07.6). Open and kept neutral: app punch with no location (OQ-C04-10),
+        PC-13 vs PC-15 with IP passing (OQ-C04-11), selfie face match (OQ-C04-09), punches while the organisation is suspended
+        (G-40, OQ-V01-08), whether a flagged punch counts before decision (DP-05, OQ-C04-01).
+        Date in a locked period: the punch is stored; the difference posts to the next open period (SM-ADJ Q1, OQ-C12-10).
+        Satisfies AC-C04-07.1..07.6, AC-C04-09.1..09.12, AC-C04-11.1..11.8, AC-C04-12.2, AC-C04-12.3, AC-C04-12.5,
+        AC-C04-13.1..13.3, AC-C04-16.1..16.4, AC-C04-17.1.
+      x-permission: TCP-03
+      x-module: C04
+      x-scope: self
+      x-audit: true
+      x-events: [PunchRecorded, PunchFlagged]
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PunchCapture' }
+      responses:
+        '201':
+          description: Punch stored, accepted or flagged.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PunchOutcome' }
+        '200':
+          description: Same idempotency_key already stored; the stored outcome is returned unchanged.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PunchOutcome' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/PunchRefused' }
+        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
+    get:
+      operationId: timecapListPunches
+      tags: [Punches]
+      summary: List raw punches
+      description: >-
+        HR lists punches with source, device, event and receipt times, time zone, manual marker, flags (PC-R6, PC-R13, US-C04-18).
+        Scope is applied first (AC-07, AT13); an Employee (Self cell, AC-05 own punches on) sees only own punches.
+        Location fields (latitude, longitude, accuracy, fence distance) are returned only to callers who also hold TCP-08;
+        otherwise `location` is null (PERMISSION_MATRIX §4). Which other roles may read punches: G-36; location/selfie visibility: G-18 (OQ-C04-17).
+        Satisfies AC-C04-06.5, AC-C04-06.6, AC-C04-18.1, AC-C04-18.3, AC-C04-18.4.
+      x-permission: TCP-07
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - { name: source, in: query, schema: { $ref: '#/components/schemas/PunchSource' } }
+        - { name: device_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: has_open_flag, in: query, schema: { type: boolean } }
+        - { name: sort, in: query, schema: { type: string, enum: [event_at, -event_at, received_at, -received_at], default: -event_at } }
+      responses:
+        '200':
+          description: Page of punches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PunchRecord' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+  /v1/punches/{id}:
+    get:
+      operationId: timecapGetPunch
+      tags: [Punches]
+      summary: Get one raw punch
+      description: >-
+        Full punch record (PC-R13, §16 Punch): times, source, device, enrolment ID, manual reason / entered by / approval reference,
+        flags and decisions. Location only with TCP-08 (G-18). Outside scope or another organisation returns 404 (TB-01, AT20).
+        Satisfies AC-C04-02.1, AC-C04-02.2, AC-C04-06.4, AC-C04-15.2, AC-C04-18.1.
+      x-permission: TCP-07
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The punch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PunchRecord' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+  /v1/punches/{id}/selfie-link:
+    post:
+      operationId: timecapCreateSelfieLink
+      tags: [Punches]
+      summary: Get a short-lived link to a punch selfie
+      description: >-
+        Returns a short-lived signed read link to the selfie after an access check (PC-R4, TB-02, K5). Which roles may open selfies,
+        whether each view is logged and retention are open (G-18, OQ-C04-17); the contract logs the view (x-audit) and grants only TCP-08.
+        404 when the punch has no selfie or is outside scope. Satisfies AC-C04-07.3.
+      x-permission: TCP-08
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: Signed link.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, expires_at]
+                properties:
+                  url: { type: string, format: uri }
+                  expires_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+  /v1/punch-attempts:
+    get:
+      operationId: timecapListRefusedPunchAttempts
+      tags: [Punches]
+      summary: List refused punch attempts
+      description: >-
+        Refused punch attempts with the rule that refused them and the message the employee saw (E18, DOMAIN_MODEL §3.5
+        PunchAttempt). HR within scope; Employee sees own only (Self); Auditor within scope. Location only with TCP-08 (G-18).
+      x-permission: TCP-09
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - { name: rule_ref, in: query, schema: { $ref: '#/components/schemas/RuleRef' } }
+      responses:
+        '200':
+          description: Page of refused attempts, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PunchAttempt' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+
+  /v1/punches/sync:
+    post:
+      operationId: timecapSyncOfflinePunches
+      tags: [Offline sync]
+      summary: Sync a batch of offline app punches
+      description: >-
+        The app sends punches captured without a network (N4, PC-R5, TSD §9.3). Each item carries its own idempotency_key,
+        the phone clock time at capture and the phone uptime-clock reading at capture; the batch carries the phone clock and
+        uptime at the moment of sync, so the server can detect a changed phone clock and flag "clock_mismatch" (PC-08; how the
+        comparison is measured is OQ-C04-05). Each item is evaluated exactly like timecapRecordPunch with the settings in force
+        on its punch date (AC-C04-08.6, BR-05) and gets its own result: accepted, duplicate (DUPLICATE_PUNCH, already stored,
+        not an error), flagged (e.g. late_sync after PC-07 days, AC-C04-08.5), or refused (PUNCH_REFUSED or VALIDATION_FAILED for that item).
+        The batch never fails as a whole because of one bad item; 422 is returned only when the envelope itself is malformed.
+        Items are stored in the original time order for recalculation (PC-R7, AC-C04-08.4). Locked dates: stored, difference posts
+        to the next open period (SM-ADJ, OQ-C12-10); arrival beyond PL-07 or after exit is OQ-C04-13 (reported per item, neutral).
+        Satisfies AC-C04-08.2, AC-C04-08.3, AC-C04-08.4, AC-C04-08.5, AC-C04-08.6, AC-C04-08.8, AC-C04-14.3, AC-C04-14.5.
+      x-permission: TCP-03
+      x-module: C04
+      x-scope: self
+      x-audit: true
+      x-events: [PunchRecorded, PunchFlagged]
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OfflineSyncBatch' }
+      responses:
+        '200':
+          description: One result per item, in request order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results]
+                properties:
+                  results: { type: array, items: { $ref: '#/components/schemas/BatchItemResult' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
+
+  /v1/internal/device-gateway/punches:
+    post:
+      operationId: timecapIngestDevicePunches
+      tags: [Device ingestion]
+      summary: Store device punches normalised by the gateway (internal)
+      description: >-
+        Normalised internal contract produced by the device gateway after it has received a push and saved the raw payload
+        (TSD §9.1). The device is resolved by `device_serial` (globally unique); that gives the organisation and branch (P3, TB-01).
+        Unknown or retired serial: 401 DEVICE_UNKNOWN, logged, nothing stored (SM-DEVICE; retired device handling GAP-SM-05).
+        Each record becomes one RawPunch with source = device, the device time as sent, the receipt time and the branch time zone
+        (PC-R6, BR-11). The enrolment ID resolves the employee through the mapping valid on the punch date (PC-R3).
+        Idempotency is natural on (device, device_record_id): a resend returns outcome duplicate and the gateway still acknowledges
+        the device (AC-C04-02.3). The gateway acknowledges the device only after this call returns (TSD §9.1). Contact also moves the
+        device to online (SM-DEVICE D2). Late or clock-mismatched records are stored and flagged, never refused for that alone
+        (PC-07, PC-08, AC-C04-14.1..14.4). Suspended organisation: still stored (VC-R4, AC-C04-02.5).
+        Neutral: enrolment ID not mapped (stored with employee_id null, or refused) OQ-C04-04 / G-G; "block" settings for device punches
+        (EM-07, PC-06) OQ-C04-06; device source switched off in PC-01 OQ-C04-07. Each such record reports its outcome; the batch never fails
+        for one record. The device-facing wire protocol is blocked on Q15 / D1 (TB-04) and is not part of this contract.
+      security:
+        - deviceGateway: []
+      x-permission: SYSTEM
+      x-module: C04
+      x-scope: org
+      x-audit: true
+      x-events: [PunchRecorded, PunchFlagged]
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DevicePunchBatch' }
+      responses:
+        '200':
+          description: One result per record, in request order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [device_id, results]
+                properties:
+                  device_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [device_record_id, outcome]
+                      properties:
+                        device_record_id: { type: string }
+                        outcome: { type: string, enum: [stored, duplicate, flagged, refused] }
+                        punch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                        employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                        flags: { type: array, items: { $ref: '#/components/schemas/FlagReason' } }
+                        refusal: { $ref: '#/components/schemas/ItemProblem' }
+        '401':
+          description: DEVICE_UNKNOWN (serial not registered or retired) or invalid gateway identity.
+          content: { application/problem+json: { schema: { $ref: 'common.yaml#/components/schemas/Problem' } } }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+  /v1/internal/device-gateway/contacts:
+    post:
+      operationId: timecapRecordDeviceContact
+      tags: [Device ingestion]
+      summary: Record a device contact (heartbeat) normalised by the gateway (internal)
+      description: >-
+        SM-DEVICE D2 ContactReceived: updates last contact and moves the device to online; ends the current offline spell so a later
+        outage can alert again (PC-R10, D4). Offline threshold and initial state: GAP-SM-05. Unknown serial: 401 DEVICE_UNKNOWN.
+        Wire protocol blocked on Q15 / D1 (TB-04).
+      security:
+        - deviceGateway: []
+      x-permission: SYSTEM
+      x-module: C04
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [device_serial, contacted_at]
+              properties:
+                device_serial: { type: string, minLength: 1, maxLength: 64 }
+                contacted_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+      responses:
+        '204': { $ref: 'common.yaml#/components/responses/NoContent' }
+        '401':
+          description: DEVICE_UNKNOWN or invalid gateway identity.
+          content: { application/problem+json: { schema: { $ref: 'common.yaml#/components/schemas/Problem' } } }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+
+  /v1/devices:
+    post:
+      operationId: timecapRegisterDevice
+      tags: [Devices]
+      summary: Register a device against a branch
+      description: >-
+        SM-DEVICE D1 RegisterDevice (PC-R2, TSD §9.1). Serial must be globally unique (422 field `serial` code `not_unique`).
+        Who registers (OA or HR) is G-12 (OQ-C01-01); the grant comes from TCP-01 role configuration. Initial state before first
+        contact: offline (GAP-SM-05). Branch must be in the caller's scope (AC-07). Satisfies AC-C04-01.1, AC-C04-01.4, AC-C04-01.6.
+      x-permission: TCP-01
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: [DeviceRegistered]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [serial, make, adapter, branch_id]
+              properties:
+                serial: { type: string, minLength: 1, maxLength: 64 }
+                make: { type: string, minLength: 1, maxLength: 64, description: 'e.g. eSSL (PC-R1).' }
+                adapter: { type: string, minLength: 1, maxLength: 64, description: 'Gateway adapter code (TSD §9.1). V1 has the eSSL adapter only.' }
+                branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                name: { type: string, maxLength: 120 }
+      responses:
+        '201':
+          description: Device registered.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Device' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: timecapListDevices
+      tags: [Devices]
+      summary: List devices with online state
+      description: >-
+        Devices of branches in scope with online state, last contact and offline-alert marker (PC-R2, PC-R10, SM-DEVICE, DB-R3).
+        Retired devices are excluded unless include_retired. OA read: G-12. Satisfies AC-C04-01.2, AC-C04-01.4, AC-C04-04.4.
+      x-permission: TCP-10
+      x-module: C04
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - { name: online_state, in: query, schema: { type: string, enum: [online, offline] } }
+        - { name: include_retired, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: Page of devices.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Device' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/devices/{id}:
+    get:
+      operationId: timecapGetDevice
+      tags: [Devices]
+      summary: Get a device
+      description: Device with online state (PC-R2, SM-DEVICE). Returns ETag. Satisfies AC-C04-01.2.
+      x-permission: TCP-10
+      x-module: C04
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The device.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Device' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    patch:
+      operationId: timecapUpdateDevice
+      tags: [Devices]
+      summary: Rename a device or move it to another branch
+      description: >-
+        Field edit on the Device (TCP-01). Moving to another branch: no BRD lifecycle (GAP-SM-05); the contract only records the new
+        branch from now on and never rewrites stored punches (BR-01). Both branches must be in scope. Satisfies AC-C04-01.6.
+      x-permission: TCP-01
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                name: { type: string, maxLength: 120 }
+                branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Updated device.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Device' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/devices/{id}/retire:
+    post:
+      operationId: timecapRetireDevice
+      tags: [Devices]
+      summary: Retire a device
+      description: >-
+        Sets retired_at; later pushes from its serial are refused with DEVICE_UNKNOWN. Deregistration is not in the BRD (GAP-SM-05):
+        what happens to its open enrolment mappings is left open (GAP-SM-04). Stored punches are untouched (BR-01).
+        Retiring a retired device returns 200 with the current device. Satisfies AC-C04-01.6.
+      x-permission: TCP-01
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Device retired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Device' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/enrolment-mappings:
+    post:
+      operationId: timecapMapEnrolmentId
+      tags: [Enrolment]
+      summary: Map an enrolment ID to an employee on a device
+      description: >-
+        SM-ENROL N2 / N4 RecordEnrolment / MapEnrolmentId (PC-R3, PC-R8): maps enrolment_id on a device to an employee from valid_from.
+        The employee's enrolment status becomes enrolled. A changed mapping ends the current range and inserts the next one (history kept).
+        Refused (422, field `enrolment_id`, code `already_mapped`) when the ID is mapped to another employee on that device for an
+        overlapping date (DP-07). Mapping the same ID to the same employee for the same dates returns 200 with the existing mapping.
+        Uniqueness scope (organisation, branch or device) is OQ-C04-04 / OQ-C02-03 (G-G); earlier unmapped punches with this ID: OQ-C04-04.
+        Satisfies AC-C04-03.2, AC-C04-03.5, AC-C04-03.6.
+      x-permission: TCP-02
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: [EnrolmentMapped]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [device_id, enrolment_id, employee_id, valid_from]
+              properties:
+                device_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                enrolment_id: { type: string, minLength: 1, maxLength: 64 }
+                employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '201':
+          description: Mapping created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrolmentMapping' }
+        '200':
+          description: Identical mapping already exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrolmentMapping' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: timecapListEnrolmentMappings
+      tags: [Enrolment]
+      summary: List enrolment mappings
+      description: Mappings with their date ranges (PC-R3, DOMAIN_MODEL §10 mapping history). Satisfies AC-C04-03.6.
+      x-permission: TCP-02
+      x-module: C04
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: device_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: enrolment_id, in: query, schema: { type: string, maxLength: 64 } }
+        - { name: on_date, in: query, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+      responses:
+        '200':
+          description: Page of mappings.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/EnrolmentMapping' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/enrolment-mappings/{id}/end:
+    post:
+      operationId: timecapEndEnrolmentMapping
+      tags: [Enrolment]
+      summary: End an enrolment mapping
+      description: >-
+        Ends the mapping's date range at valid_to (inclusive). Whether the employee's status then returns to not enrolled is
+        SM-ENROL N5, GAP-SM-04 (left to the server's status history, not decided here). Ending at the same date again returns 200.
+      x-permission: TCP-02
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [valid_to, reason]
+              properties:
+                valid_to: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Mapping ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrolmentMapping' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/enrolments/{employee_id}:
+    get:
+      operationId: timecapGetEnrolmentStatus
+      tags: [Enrolment]
+      summary: Get an employee's enrolment status and history
+      description: >-
+        Current SM-ENROL status (not_enrolled, enrolled, re_enrolment_needed), status history and current mappings (PC-R8).
+        Satisfies AC-C04-03.1, AC-C04-03.3, AC-C04-03.6.
+      x-permission: TCP-02
+      x-module: C04
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+      responses:
+        '200':
+          description: Enrolment status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrolmentStatus' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+  /v1/enrolments/{employee_id}/mark-re-enrolment-needed:
+    post:
+      operationId: timecapMarkReEnrolmentNeeded
+      tags: [Enrolment]
+      summary: Mark an employee as needing re-enrolment
+      description: >-
+        SM-ENROL N3 Enrolled → Re-enrolment needed (PC-R8). Who or what may set it is OQ-C04-12; this contract offers the manual
+        command under TCP-02 only. Whether punches still resolve meanwhile: OQ-C04-12. From not_enrolled → ILLEGAL_TRANSITION;
+        repeat → 200 with current status. Satisfies AC-C04-03.3.
+      x-permission: TCP-02
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Status now re-enrolment needed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrolmentStatus' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/manual-attendance:
+    post:
+      operationId: timecapRecordManualAttendance
+      tags: [Manual attendance]
+      summary: Record manual attendance for a device failure
+      description: >-
+        PC-R9: HR records attendance for the affected employees of one branch on one screen with a reason. Each entry becomes a
+        new RawPunch with source = manual, the reason, the entering user and time (BR-01, §16); existing punches are never edited
+        and stay visible next to the manual ones (AC-C04-05.6). PC-11 = delegate to Supervisor lets a delegated Supervisor do it for
+        that branch, logged under the Supervisor; otherwise Supervisors get 403 (AC-C04-05.3, AC-C04-05.4). One transaction: any
+        invalid entry refuses the whole request with field errors (errors[].field = entries[i].…). Blank reason → 422 (AC-C04-05.5).
+        Open period: affected days recalculated (BR-03). Locked period: punches are stored, the locked result is unchanged and the
+        difference posts to the next open period (SM-ADJ Q1, AC-C04-05.7); older than PL-07 → ADJUSTMENT_WINDOW_EXCEEDED (OQ-C12-04).
+        Neutral: the BR-01 approver of an HR-entered manual punch (G-17, OQ-C04-08, DP-08), so manual_approval_ref may be null;
+        behaviour when PC-01 "entry by HR" is off (OQ-C04-07). Satisfies AC-C04-05.1..05.7.
+      x-permission: TCP-04
+      x-module: C04
+      x-scope: branch-department
+      x-audit: true
+      x-events: [PunchRecorded]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManualAttendanceRequest' }
+      responses:
+        '201':
+          description: Manual punches created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [punches]
+                properties:
+                  punches: { type: array, items: { $ref: '#/components/schemas/PunchRecord' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/device-outages/regularise:
+    post:
+      operationId: timecapBulkRegulariseDeviceOutage
+      tags: [Manual attendance]
+      summary: Bulk regularise a device outage
+      description: >-
+        RG-11 (C06 regularisation): HR corrects all affected days of one branch for a device outage in one command with a reason
+        (AC-C06-14.10). Refused with RULE_GROUP_DISABLED when RG-01 or RG-11 is off for the affected employees (G2). Corrections are
+        added as manual punches linked to this command (manual_approval_ref), never edits (BR-01); same lock and PL-07 handling as
+        timecapRecordManualAttendance (SM-ADJ, OQ-C12-04). Whether a correction may be an override record instead of a punch is the
+        C06 regularisation model (SM-REQ §8.2 RegularisationRequest), not decided here.
+      x-permission: TCP-05
+      x-module: C06
+      x-scope: branch-department
+      x-audit: true
+      x-events: [PunchRecorded]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManualAttendanceRequest' }
+      responses:
+        '201':
+          description: Corrections created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [punches]
+                properties:
+                  punches: { type: array, items: { $ref: '#/components/schemas/PunchRecord' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/punch-flags:
+    get:
+      operationId: timecapListPunchFlags
+      tags: [Punch flags]
+      summary: List punch flags
+      description: >-
+        Flags the caller may decide, default state = raised (SM-FLAG). Manager sees only employees routed to them (AC-02, AT13);
+        each item carries reason, evidence, and the punch (location only with TCP-08; the Manager's need to see location to decide a
+        geo flag is G-18). Who decides each reason: G-16 (DP-05, OQ-C04-02). Satisfies AC-C04-15.4, AC-C04-18.2 (list part).
+      x-permission: TCP-06
+      x-module: C04
+      x-scope: team
+      x-audit: true
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: state, in: query, schema: { type: string, enum: [raised, accepted, rejected], default: raised } }
+        - { name: reason, in: query, schema: { $ref: '#/components/schemas/FlagReason' } }
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+      responses:
+        '200':
+          description: Page of flags, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PunchFlag' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+  /v1/punch-flags/{id}/accept:
+    post:
+      operationId: timecapAcceptPunchFlag
+      tags: [Punch flags]
+      summary: Accept a flagged punch
+      description: >-
+        SM-FLAG F2 Raised → Accepted: the punch counts and the day is recalculated (BR-03, E18, AC-C04-15.1). The punch is unchanged;
+        decision, decider and time are recorded against the flag (BR-01, AC-C04-15.2). The approver per reason is G-16 (DP-05,
+        OQ-C04-02): the contract only requires TCP-06 plus routing. SELF_APPROVAL_FORBIDDEN (403) when the decider is the punch's
+        employee, including when acting as a delegate under AC-03 for that employee's approver (BR-07, AC-C04-15.3).
+        Accept on accepted → 200 with current decision, no second recalculation; accept on rejected → ILLEGAL_TRANSITION
+        (reversal is GAP-SM-06). Locked date: decision recorded, difference posts to the next open period (SM-ADJ, OQ-C12-10);
+        older than PL-07 → ADJUSTMENT_WINDOW_EXCEEDED (OQ-C12-04). Several flags on one punch: GAP-SM-06.
+      x-permission: TCP-06
+      x-module: C04
+      x-scope: team
+      x-audit: true
+      x-events: [PunchFlagDecided]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Flag accepted (or already accepted).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PunchFlag' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/punch-flags/{id}/reject:
+    post:
+      operationId: timecapRejectPunchFlag
+      tags: [Punch flags]
+      summary: Reject a flagged punch
+      description: >-
+        SM-FLAG F3 Raised → Rejected, reason required: the punch stays as evidence and is excluded from the day result; the day is
+        recalculated (BR-01, BR-03). Never deletes the punch. Same approver, BR-07 / AC-03 delegation, lock and idempotency rules as
+        timecapAcceptPunchFlag (G-16, GAP-SM-06, OQ-C12-10).
+      x-permission: TCP-06
+      x-module: C04
+      x-scope: team
+      x-audit: true
+      x-events: [PunchFlagDecided]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Flag rejected (or already rejected).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PunchFlag' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+components:
+  securitySchemes:
+    deviceGateway:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        Service identity of the device gateway (Cloud Run service-to-service token). Carries no organisation: the organisation
+        comes from the registered device serial (TSD §9.1, PERMISSION_MATRIX P3). Defined locally; candidate for common.yaml.
+  responses:
+    PunchRefused:
+      description: >-
+        PUNCH_REFUSED with rule_ref (one of the PC-xx / EM-07 / MD-02 block settings) and the message shown to the employee (E18),
+        or VALIDATION_FAILED with field errors.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/PunchRefusedProblem' }
+  schemas:
+    PunchSource:
+      type: string
+      enum: [device, app, web, kiosk, import, manual]
+      description: 'PC-01 sources. kiosk and import are listed but not described in V1 (OQ-C04-07).'
+    RuleRef:
+      type: string
+      pattern: '^[A-Z]{2}-[0-9]{2}$'
+      description: BRD setting that decided the outcome, e.g. PC-13.
+    FlagReason:
+      type: string
+      enum: [outside_fence, branch_not_allowed, no_shift_or_off_day, late_sync, clock_mismatch, location_unavailable, low_accuracy, ip_check_failed]
+      description: SM-FLAG reasons (PC-04, EM-07, PC-06, PC-07, PC-08, PC-13, PC-14, PC-05/PC-15).
+    Location:
+      type: object
+      additionalProperties: false
+      required: [latitude, longitude, accuracy_m]
+      properties:
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        accuracy_m: { type: integer, minimum: 0, description: Accuracy reported by the phone or browser, in metres. }
+    PunchCapture:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key, source, client_time, captured_tz]
+      description: >-
+        One app or web punch as captured. There is deliberately no inside/outside or distance field: the server computes them (TSD §9.2).
+      properties:
+        idempotency_key: { type: string, format: uuid, description: Client-generated; unique per organisation (TSD §5.5, §9.3). }
+        source: { type: string, enum: [app, web] }
+        client_time: { $ref: 'common.yaml#/components/schemas/Instant' }
+        captured_tz: { $ref: 'common.yaml#/components/schemas/TimeZone' }
+        location:
+          description: Omitted or null when the client could not read a location (PC-13; app case OQ-C04-10).
+          oneOf: [ { $ref: '#/components/schemas/Location' }, { type: 'null' } ]
+        location_unavailable_reason: { type: [string, 'null'], enum: [permission_denied, no_fix, not_supported, null] }
+        selfie: { $ref: 'common.yaml#/components/schemas/FileRef' }
+        client_ref: { type: string, maxLength: 200, description: App install or browser identifier. }
+    OfflinePunch:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key, client_time, captured_tz, device_uptime_ms]
+      properties:
+        idempotency_key: { type: string, format: uuid }
+        client_time: { $ref: 'common.yaml#/components/schemas/Instant', description: Phone clock at capture. }
+        captured_tz: { $ref: 'common.yaml#/components/schemas/TimeZone' }
+        device_uptime_ms: { type: integer, minimum: 0, description: Phone uptime-clock reading at capture (TSD §9.3). }
+        location: { oneOf: [ { $ref: '#/components/schemas/Location' }, { type: 'null' } ] }
+        location_unavailable_reason: { type: [string, 'null'], enum: [permission_denied, no_fix, not_supported, null] }
+        selfie: { $ref: 'common.yaml#/components/schemas/FileRef' }
+        client_ref: { type: string, maxLength: 200 }
+    OfflineSyncBatch:
+      type: object
+      additionalProperties: false
+      required: [sync_client_time, sync_uptime_ms, punches]
+      properties:
+        sync_client_time: { $ref: 'common.yaml#/components/schemas/Instant', description: Phone clock at the moment of sync. }
+        sync_uptime_ms: { type: integer, minimum: 0, description: Phone uptime-clock reading at the moment of sync. }
+        punches:
+          type: array
+          minItems: 1
+          maxItems: 500
+          description: Item-level problems are reported per item in the results, not as a 422 for the batch.
+          items: { $ref: '#/components/schemas/OfflinePunch' }
+    ItemProblem:
+      type: [object, 'null']
+      required: [code]
+      properties:
+        code: { type: string, enum: [PUNCH_REFUSED, VALIDATION_FAILED, DEVICE_UNKNOWN, ADJUSTMENT_WINDOW_EXCEEDED] }
+        rule_ref: { $ref: '#/components/schemas/RuleRef' }
+        message: { type: string, description: Localised message shown to the employee (E18, N7). }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [code]
+            properties:
+              field: { type: string }
+              code: { type: string }
+              message: { type: string }
+    BatchItemResult:
+      type: object
+      required: [idempotency_key, outcome]
+      properties:
+        idempotency_key: { type: string }
+        outcome: { type: string, enum: [accepted, duplicate, flagged, refused] }
+        code: { type: [string, 'null'], enum: [DUPLICATE_PUNCH, null], description: Set for duplicate. }
+        punch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        flags: { type: array, items: { $ref: '#/components/schemas/FlagReason' } }
+        refusal: { $ref: '#/components/schemas/ItemProblem' }
+    DevicePunchRecord:
+      type: object
+      additionalProperties: false
+      required: [device_record_id, enrolment_id, event_time, received_at, raw_payload_ref]
+      properties:
+        device_record_id: { type: string, minLength: 1, maxLength: 128, description: Record identifier from the device log; with the device it is the idempotency key. }
+        enrolment_id: { type: string, minLength: 1, maxLength: 64 }
+        event_time:
+          type: string
+          pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})?$'
+          description: >-
+            Device time exactly as sent. Without an offset it is read in the device branch's time zone (BR-11). Whether eSSL sends an
+            offset is an adapter concern (Q15 / D1).
+        received_at: { $ref: 'common.yaml#/components/schemas/Instant', description: Gateway receipt time. }
+        raw_payload_ref: { type: string, maxLength: 500, description: Storage path of the saved raw payload; starts with the organisation (TB-02). }
+    DevicePunchBatch:
+      type: object
+      additionalProperties: false
+      required: [device_serial, records]
+      properties:
+        device_serial: { type: string, minLength: 1, maxLength: 64 }
+        records: { type: array, minItems: 1, maxItems: 1000, items: { $ref: '#/components/schemas/DevicePunchRecord' } }
+    PunchLocation:
+      type: [object, 'null']
+      description: Null when not captured or when the caller lacks TCP-08 (G-18).
+      properties:
+        latitude: { type: number }
+        longitude: { type: number }
+        accuracy_m: { type: [integer, 'null'] }
+        fence_distance_m: { type: [integer, 'null'], description: Server-computed distance to the nearest applicable fence (PC-R13). }
+        inside_fence: { type: [boolean, 'null'], description: Server-computed (TSD §9.2). }
+    PunchFlagSummary:
+      type: object
+      required: [id, reason, state]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        reason: { $ref: '#/components/schemas/FlagReason' }
+        state: { type: string, enum: [raised, accepted, rejected] }
+        counts_before_decision: { type: boolean, description: DP-05. }
+    PunchRecord:
+      type: object
+      required: [id, source, event_at, captured_tz, received_at, is_manual, flags]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ], description: Null only for an unattributed device punch (OQ-C04-04). }
+        source: { $ref: '#/components/schemas/PunchSource' }
+        event_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        captured_tz: { $ref: 'common.yaml#/components/schemas/TimeZone' }
+        received_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        device_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        enrolment_id: { type: [string, 'null'] }
+        client_ref: { type: [string, 'null'] }
+        direction_tag: { type: [string, 'null'], enum: [in, out, null], description: Only when the source itself provides one (BRX-01). }
+        device_uptime_ms: { type: [integer, 'null'] }
+        is_manual: { type: boolean }
+        manual_reason: { type: [string, 'null'] }
+        manual_entered_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        manual_approval_ref: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ], description: Approver reference (G-17). }
+        has_selfie: { type: boolean }
+        location: { $ref: '#/components/schemas/PunchLocation' }
+        flags: { type: array, items: { $ref: '#/components/schemas/PunchFlagSummary' } }
+    PunchOutcome:
+      type: object
+      required: [outcome, punch]
+      properties:
+        outcome: { type: string, enum: [accepted, flagged] }
+        punch: { $ref: '#/components/schemas/PunchRecord' }
+    PunchRefusedProblem:
+      allOf:
+        - $ref: 'common.yaml#/components/schemas/Problem'
+        - type: object
+          properties:
+            rule_ref: { $ref: '#/components/schemas/RuleRef' }
+            attempt_id: { $ref: 'common.yaml#/components/schemas/Id' }
+    PunchAttempt:
+      type: object
+      required: [id, source, attempted_at, rule_ref, message]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        source: { $ref: '#/components/schemas/PunchSource' }
+        device_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        attempted_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        rule_ref: { $ref: '#/components/schemas/RuleRef' }
+        message: { type: string }
+        location: { $ref: '#/components/schemas/PunchLocation' }
+    Device:
+      type: object
+      required: [id, serial, make, adapter, branch_id, online_state]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        serial: { type: string }
+        make: { type: string }
+        adapter: { type: string }
+        name: { type: [string, 'null'] }
+        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        online_state: { type: string, enum: [online, offline], description: SM-DEVICE. }
+        last_contact_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        offline_alert_sent_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ], description: Set once per offline spell (PC-10, D4). }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    EnrolmentMapping:
+      type: object
+      required: [id, device_id, enrolment_id, employee_id, valid_from, valid_to]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        device_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        enrolment_id: { type: string }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ], description: Inclusive; null = open. }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    EnrolmentStatusValue:
+      type: string
+      enum: [not_enrolled, enrolled, re_enrolment_needed]
+    EnrolmentStatus:
+      type: object
+      required: [employee_id, status, history, mappings]
+      properties:
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        status: { $ref: '#/components/schemas/EnrolmentStatusValue' }
+        history:
+          type: array
+          items:
+            type: object
+            required: [to_status, effective_at]
+            properties:
+              from_status: { oneOf: [ { $ref: '#/components/schemas/EnrolmentStatusValue' }, { type: 'null' } ] }
+              to_status: { $ref: '#/components/schemas/EnrolmentStatusValue' }
+              enrolment_mapping_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+              reason: { type: [string, 'null'] }
+              effective_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+              created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        mappings: { type: array, items: { $ref: '#/components/schemas/EnrolmentMapping' } }
+    ManualAttendanceRequest:
+      type: object
+      additionalProperties: false
+      required: [branch_id, reason, entries]
+      properties:
+        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        device_id: { $ref: 'common.yaml#/components/schemas/Id', description: The failed device, when known. }
+        reason: { type: string, minLength: 1, maxLength: 1000 }
+        entries:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            type: object
+            additionalProperties: false
+            required: [employee_id, event_at]
+            properties:
+              employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+              event_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    PunchFlag:
+      type: object
+      required: [id, punch_id, employee_id, reason, state, counts_before_decision, evidence, created_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        punch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        reason: { $ref: '#/components/schemas/FlagReason' }
+        state: { type: string, enum: [raised, accepted, rejected] }
+        counts_before_decision: { type: boolean, description: DP-05 (E18 - outside fence does not count). }
+        evidence: { type: object, additionalProperties: true, description: 'Values that raised the flag (distance, accuracy, delay ...).' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        decision:
+          type: [object, 'null']
+          properties:
+            decision: { type: string, enum: [accepted, rejected] }
+            decided_by: { $ref: 'common.yaml#/components/schemas/Id' }
+            on_behalf_of_user_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ], description: Set when decided as a delegate (AC-03). }
+            reason: { type: [string, 'null'] }
+            decided_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        punch: { $ref: '#/components/schemas/PunchRecord' }

@@ -60,6 +60,7 @@ Purpose and key constraints of each table are in the migration file and in `COMM
 | perm | `permission_type`, `permission_type_version`, `permission_usage_entry`, `permission_request`, `on_duty_request` | 0004 |
 | shared requests | `app.approval_step` (one row per approval action for any request type; BR-07 enforced by CHECK) | 0004 |
 | notify | `notification_rule`, `notification` | 0004 |
+| added in 0006 (Phase 4) | `workforce.contact_change_request` (SM-CONTACT), `org.settings_change_request` (SM-SETCHG), `period.unlock_request` (SM-REQ), `notify.push_device`; new columns: VC-03 flag, notification `read_at`, comp-off `employee_choice` | 0006 |
 
 ## 4. Tenancy and access
 

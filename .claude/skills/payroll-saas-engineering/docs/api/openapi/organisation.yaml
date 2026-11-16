@@ -1,0 +1,1254 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Organisation Structure
+  version: 1.0.0-draft
+  description: |
+    Organisation Structure context (BRD C01 Organisation setup: OR-R1..OR-R5, OR-01..OR-04; EM-01..EM-09 organisation-wide
+    settings; PC-R14 geo-fences; PC-05 IP allow list; AC-04 settings approval for organisation settings).
+    Organisation always comes from the token (TB-01). Who maintains branches, fences, IP lists, lists and contractors
+    (OA, HR or both) is G-11 / OQ-C01-01: the contract carries the matrix code only.
+    Dated rows (daterange in the database) are exposed as `valid_from` (inclusive) and `valid_to` (exclusive, null = open).
+security:
+  - userToken: []
+tags:
+  - name: Branches
+  - name: Geo-fences
+  - name: Lists
+  - name: Contractors
+  - name: Organisation settings
+x-exempt-permissions: {}
+paths:
+  /v1/organisation:
+    get:
+      operationId: orgGetOwnOrganisation
+      summary: Get the signed-in user's organisation
+      description: Display name, legal name and state (active / suspended, VC-R4) of the caller's own organisation (TB-01). ORG-07.
+      tags: [Organisation settings]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Own organisation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/branches:
+    get:
+      operationId: orgListBranches
+      summary: List branches in scope
+      description: |
+        Branches visible to the caller after AC-07 scope (AC-C01-01.5, AC-C01-01.8; UM-R2, TB-01). OR-R1.
+      tags: [Branches]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: q
+          in: query
+          description: Name or code contains.
+          schema: { type: string, maxLength: 100 }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [name, -name, code, -code] }
+      responses:
+        '200':
+          description: Page of branches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Branch' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: orgCreateBranch
+      summary: Create a branch
+      description: |
+        Creates a branch with name, code, address and time zone (OR-R1, BR-11). A branch without a time zone is refused
+        (AC-C01-01.1, AC-C01-01.3). The time zone becomes the first dated `branch_timezone` row from `time_zone_valid_from`.
+        Audited with old/new values (AC-C01-01.7, G9). Actor: G-11 / OQ-C01-01. Refused for roles without the grant (AC-C01-01.6).
+      tags: [Branches]
+      x-permission: ORG-01
+      x-module: C01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, code, tz, time_zone_valid_from]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                code: { type: string, minLength: 1, maxLength: 20 }
+                address: { type: string, maxLength: 500 }
+                tz: { $ref: 'common.yaml#/components/schemas/TimeZone' }
+                time_zone_valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+      responses:
+        '201':
+          description: Branch created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/branches/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: orgGetBranch
+      summary: Get a branch
+      description: |
+        Branch with its current time zone, geo-fences and IP allow list count (OR-R1, AC-C01-01.2). Holiday calendar and
+        devices are attached by the scheduling and time-capture contexts. Outside scope → NOT_FOUND (AC-C01-01.5).
+      tags: [Branches]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Branch.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    patch:
+      operationId: orgUpdateBranch
+      summary: Change branch name, code or address
+      description: |
+        Plain field edits (OR-R1). Time zone is not editable here: it is dated (see change-time-zone, OQ-C01-03).
+        Closing a branch is not offered (OQ-C01-02). Audited with old/new values (AC-C01-01.7).
+      tags: [Branches]
+      x-permission: ORG-01
+      x-module: C01
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                code: { type: string, minLength: 1, maxLength: 20 }
+                address: { type: [string, 'null'], maxLength: 500 }
+      responses:
+        '200':
+          description: Branch changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/branches/{id}/change-time-zone:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgChangeBranchTimeZone
+      summary: Change a branch's time zone from a date
+      description: |
+        Ends the current `branch_timezone` range at `valid_from` and starts a new one (OR-R1, BR-11, G5). Whether punches
+        and results already held are re-shown or recalculated in the new zone is OQ-C01-03; the contract records the
+        dated change only and does not decide it. A `valid_from` inside a locked period: outcome follows SM-ADJ
+        (difference posted as an adjustment, or PERIOD_LOCKED / ADJUSTMENT_WINDOW_EXCEEDED where PL-07 is exceeded,
+        OQ-C12-04). Repeating the same zone and date is a no-op (STATE_MACHINES §0). Audited (G9).
+      tags: [Branches]
+      x-permission: ORG-01
+      x-module: C01
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tz, valid_from, reason]
+              properties:
+                tz: { $ref: 'common.yaml#/components/schemas/TimeZone' }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Time zone history after the change.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/branches/{id}/geo-fences:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: orgListGeoFences
+      summary: List a branch's geo-fences
+      description: Fences of the branch with enabled flag and last test (PC-R14, OR-R1, AC-C01-01.2).
+      tags: [Geo-fences]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Fences.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/GeoFence' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    post:
+      operationId: orgCreateGeoFence
+      summary: Set a geo-fence for a branch
+      description: |
+        HR sets a fence by coordinates or a point picked on a map (PC-R14). A new fence starts switched off so it can be
+        tested first. Actor: G-11 (PC-R14 says HR, US-C01-01 says OA). Audited.
+      tags: [Geo-fences]
+      x-permission: ORG-02
+      x-module: C01
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GeoFenceInput' }
+      responses:
+        '201':
+          description: Fence created (enabled = false).
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GeoFence' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/geo-fences/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    patch:
+      operationId: orgUpdateGeoFence
+      summary: Change a geo-fence's point, radius or name
+      description: |
+        Edits the fence (PC-R14). A change clears the last test result (`tested_at`) because the tested shape no longer
+        exists. Audited with old/new values (G9).
+      tags: [Geo-fences]
+      x-permission: ORG-02
+      x-module: C01
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                name: { type: [string, 'null'], maxLength: 120 }
+                latitude: { type: number, minimum: -90, maximum: 90 }
+                longitude: { type: number, minimum: -180, maximum: 180 }
+                radius_m: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Fence changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GeoFence' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/geo-fences/{id}/test:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgTestGeoFence
+      summary: Test a fence from here
+      description: |
+        "Test from the branch before switching it on" (PC-R14). The caller sends the device's current position; the
+        server answers whether it falls inside the fence and the distance to its centre, and records `tested_at` /
+        `tested_by`. No punch is created. Works whether the fence is on or off. Repeats are harmless.
+      tags: [Geo-fences]
+      x-permission: ORG-02
+      x-module: C01
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [latitude, longitude]
+              properties:
+                latitude: { type: number, minimum: -90, maximum: 90 }
+                longitude: { type: number, minimum: -180, maximum: 180 }
+                accuracy_m: { type: number, minimum: 0, description: Reported location accuracy in metres. }
+      responses:
+        '200':
+          description: Test result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [inside, distance_m, tested_at]
+                properties:
+                  inside: { type: boolean }
+                  distance_m: { type: number, minimum: 0, description: Distance from the fence centre. }
+                  radius_m: { type: integer }
+                  tested_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+
+  /v1/geo-fences/{id}/switch-on:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgSwitchOnGeoFence
+      summary: Switch a geo-fence on
+      description: |
+        Starts enforcing the fence for app and web punches (PC-R14, PC-R12). PC-R14 says the fence "can" be tested first;
+        it does not require a test, so an untested fence is not refused. Already on → 200 with current state.
+      tags: [Geo-fences]
+      x-permission: ORG-02
+      x-module: C01
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Fence on.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GeoFence' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/geo-fences/{id}/switch-off:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgSwitchOffGeoFence
+      summary: Switch a geo-fence off
+      description: Stops enforcing the fence (PC-R14). Already off → 200 with current state. Audited.
+      tags: [Geo-fences]
+      x-permission: ORG-02
+      x-module: C01
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Fence off.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GeoFence' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/branches/{id}/ip-allow-list:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: orgGetBranchIpAllowList
+      summary: Get a branch's allowed web IP list
+      description: Networks from which web punches are accepted when PC-05 = on. ORG-07.
+      tags: [Branches]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: IP list.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IpAllowList' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+
+  /v1/branches/{id}/ip-allow-list/change:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgChangeBranchIpAllowList
+      summary: Replace a branch's allowed web IP list
+      description: |
+        Replaces the list (PC-05). Matrix marks this `Cfg(AC-04)`: under AC-04 = with Organisation Admin approval the
+        response is 202 with a pending settings change and the old list stays in force until approved (AC-C03-09.3);
+        otherwise 200. Actor: G-11. Audited (G9).
+      tags: [Branches]
+      x-permission: ORG-03
+      x-module: C01
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [networks, reason]
+              properties:
+                networks:
+                  type: array
+                  maxItems: 100
+                  uniqueItems: true
+                  items: { type: string, maxLength: 43, description: 'IPv4/IPv6 network in CIDR form (column `network`, type cidr).' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: List applied.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IpAllowList' }
+        '202':
+          description: Pending Organisation Admin approval (AC-04).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettingsChange' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/lists/{kind}:
+    parameters:
+      - $ref: '#/components/parameters/ListKind'
+    get:
+      operationId: orgListListEntries
+      summary: List departments, designations, categories or employee types
+      description: |
+        Entries of one list (OR-R2, OR-R3, OR-R5). Retired entries are hidden unless `include_retired=true`
+        (history and reports keep them). Department users see their departments only (AC-C01-02.4).
+      tags: [Lists]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: include_retired
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Page of entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ListEntry' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: orgCreateListEntry
+      summary: Add a list entry
+      description: |
+        Adds a department, designation, category or employee type; usable on the employee master straight away
+        (AC-C01-02.2, AC-C01-03.2; OR-R2, OR-R3, OR-R5). Names are unique per list. Actor: G-11. Audited (AC-C01-02.5).
+      tags: [Lists]
+      x-permission: ORG-04
+      x-module: C01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                code: { type: string, maxLength: 20 }
+      responses:
+        '201':
+          description: Entry created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListEntry' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/lists/{kind}/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ListKind'
+      - $ref: 'common.yaml#/components/parameters/Id'
+    patch:
+      operationId: orgUpdateListEntry
+      summary: Change a list entry's name or code
+      description: |
+        Whether an entry in use may be renamed, and how history and reports show it, is OQ-C01-04; the contract allows
+        the edit and keeps the audit (AC-C01-02.5). Audited with old/new values.
+      tags: [Lists]
+      x-permission: ORG-04
+      x-module: C01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                code: { type: [string, 'null'], maxLength: 20 }
+      responses:
+        '200':
+          description: Entry changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListEntry' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/lists/{kind}/{id}/retire:
+    parameters:
+      - $ref: '#/components/parameters/ListKind'
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgRetireListEntry
+      summary: Retire a list entry
+      description: |
+        Sets `retired_at`; the entry is no longer offered for new assignments but stays on history, reports and existing
+        assignments (OR-R5, EM-R6). There is no delete. Whether an entry still assigned to employees may be retired is
+        OQ-C01-04 (if refused, CONFLICTING_SETTINGS). Already retired → 200 with current state.
+      tags: [Lists]
+      x-permission: ORG-04
+      x-module: C01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Entry retired.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListEntry' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/contractors:
+    get:
+      operationId: orgListContractors
+      summary: List contractors
+      description: Contractors of the organisation (OR-R4). Retired hidden unless `include_retired=true`.
+      tags: [Contractors]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: include_retired
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Page of contractors.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Contractor' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: orgCreateContractor
+      summary: Create a contractor
+      description: Creates a contractor that can then be chosen on the employee master (OR-R4, AC-C01-04.1). Actor G-11. Audited.
+      tags: [Contractors]
+      x-permission: ORG-05
+      x-module: C01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 200 }
+                contact: { type: string, maxLength: 500 }
+      responses:
+        '201':
+          description: Contractor created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Contractor' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/contractors/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: orgGetContractor
+      summary: Get a contractor with the employees it supplies
+      description: |
+        Contractor and the employees currently linked to it through a `contractor` assignment (OR-R4, AC-C01-04.2).
+        Employees outside the caller's scope are left out (AC-07).
+      tags: [Contractors]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Contractor.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Contractor'
+                  - type: object
+                    properties:
+                      supplied_employees:
+                        type: array
+                        items:
+                          type: object
+                          required: [employee_id, employee_code, full_name]
+                          properties:
+                            employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                            employee_code: { type: string }
+                            full_name: { type: string }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    patch:
+      operationId: orgUpdateContractor
+      summary: Change a contractor's name or contact
+      description: Plain field edits (OR-R4). Rename while in use is OQ-C01-04. Audited with old/new values.
+      tags: [Contractors]
+      x-permission: ORG-05
+      x-module: C01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 1, maxLength: 200 }
+                contact: { type: [string, 'null'], maxLength: 500 }
+      responses:
+        '200':
+          description: Contractor changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Contractor' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/contractors/{id}/retire:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgRetireContractor
+      summary: Retire a contractor
+      description: |
+        Sets `retired_at`; not offered for new links, kept on history (OR-R4, EM-R6). No delete. Retiring a contractor
+        that still supplies employees is OQ-C01-04. Already retired → 200 with current state.
+      tags: [Contractors]
+      x-permission: ORG-05
+      x-module: C01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Contractor retired.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Contractor' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/organisation-settings:
+    get:
+      operationId: orgGetOrganisationSettings
+      summary: Get organisation settings in force on a date
+      description: |
+        The `organisation_settings_version` in force on `on` (default today): latest `effective_from` on or before the date
+        (DATA_MODEL; G5). OR-01..OR-04, EM-01..EM-08 (AC-C01-05.1).
+      tags: [Organisation settings]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - name: 'on'
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Date' }
+      responses:
+        '200':
+          description: Version in force.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrganisationSettingsVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/organisation-settings/versions:
+    get:
+      operationId: orgListOrganisationSettingsVersions
+      summary: List organisation settings versions
+      description: All versions, newest `effective_from` first; versions are append-only and never edited (G5, G9, AC-C01-05.6).
+      tags: [Organisation settings]
+      x-permission: ORG-07
+      x-module: C01
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of versions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/OrganisationSettingsVersion' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: orgCreateOrganisationSettingsVersion
+      summary: Save a new organisation settings version
+      description: |
+        Saves a complete settings document from `effective_from` with a reason (G5, G9; OR-01..OR-04, EM-01..EM-08).
+        A change is always a new row; a future version cannot be edited, only replaced by another version with the same
+        date (DATA_MODEL; GAP-SM-16). Languages offered limit what users can choose (AC-C01-05.3).
+        Approval path (AC-04): under "HR Manager only" the version is saved and returned with 201 (AC-C03-09.1); under
+        "with Organisation Admin approval" a pending settings change is returned with 202 and the old values stay in force
+        until approved (AC-C03-09.3). Who approves when one person holds both roles is OQ-C03-11.
+        Conflicting values the BRD requires refusing → CONFLICTING_SETTINGS; saved with warnings → `warnings` (SETTINGS_WARNING).
+        Back-dating into a locked period: GAP-SM-16 / DP-10 (if refused, PERIOD_LOCKED). Whether OR-01 may change mid-year
+        is OQ-C01-07; number formats OQ-C01-08; probation reminder OQ-C02-06; EM-06 scope OQ-C02-11.
+        Refused for roles without the grant (AC-C01-05.5).
+      tags: [Organisation settings]
+      x-permission: ORG-06
+      x-module: C01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [effective_from, reason, schema_version, settings]
+              properties:
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+                schema_version: { type: integer, minimum: 1 }
+                settings: { $ref: '#/components/schemas/OrganisationSettings' }
+      responses:
+        '201':
+          description: Version saved (AC-04 = HR Manager only).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OrganisationSettingsVersion'
+                  - $ref: '#/components/schemas/Warnings'
+        '202':
+          description: Pending Organisation Admin approval (AC-04 = with approval).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettingsChange' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/settings-changes:
+    get:
+      operationId: orgListSettingsChanges
+      summary: List settings changes waiting for approval
+      description: |
+        Organisation and access settings changes held under AC-04 = with Organisation Admin approval (AC-C03-09.3).
+        Policy versions have their own approval routes in the policy context. Approvers see changes routed to them
+        (AC-02 `settings_change`).
+      tags: [Organisation settings]
+      x-permission: IAM-08
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/SettingsChangeState' }
+      responses:
+        '200':
+          description: Page of settings changes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/SettingsChange' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/settings-changes/{id}/approve:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgApproveSettingsChange
+      summary: Approve a pending settings change
+      description: |
+        Organisation Admin approves (AC-04, AC-C03-09.3, AC-C03-09.5); the change is applied from its effective date
+        and the history shows who approved. BR-07: the submitter may not approve their own change, including when acting
+        as a delegate (AC-03) → SELF_APPROVAL_FORBIDDEN (P5). When one person holds both roles: OQ-C03-11.
+        Already approved → 200 with current state; rejected → ILLEGAL_TRANSITION.
+      tags: [Organisation settings]
+      x-permission: IAM-08
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Approved and applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettingsChange' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/settings-changes/{id}/reject:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: orgRejectSettingsChange
+      summary: Reject a pending settings change
+      description: |
+        Old value stays in force and the submitter sees the rejection (AC-C03-09.4). What the rejected draft becomes
+        afterwards is GAP-SM-16 (state `rejected` only is recorded here). BR-07 and the AC-03 delegation case apply as for
+        approve → SELF_APPROVAL_FORBIDDEN. Already rejected → 200; approved → ILLEGAL_TRANSITION.
+      tags: [Organisation settings]
+      x-permission: IAM-08
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SettingsChange' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+components:
+  parameters:
+    ListKind:
+      name: kind
+      in: path
+      required: true
+      description: 'Maps to `list_entry.kind`: departments → department, designations → designation, categories → category, employee-types → employee_type.'
+      schema: { type: string, enum: [departments, designations, categories, employee-types] }
+  schemas:
+    Organisation:
+      type: object
+      required: [display_name, legal_name, state, state_changed_at]
+      properties:
+        display_name: { type: string }
+        legal_name: { type: string }
+        state: { type: string, enum: [active, suspended] }
+        state_changed_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    BranchTimeZone:
+      type: object
+      required: [tz, valid_from, valid_to]
+      properties:
+        tz: { $ref: 'common.yaml#/components/schemas/TimeZone' }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+    Branch:
+      type: object
+      required: [id, name, code, tz, time_zones, created_at, updated_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        name: { type: string }
+        code: { type: string }
+        address: { type: [string, 'null'] }
+        tz: { $ref: 'common.yaml#/components/schemas/TimeZone' }
+        time_zones: { type: array, items: { $ref: '#/components/schemas/BranchTimeZone' }, description: Dated history (BR-11). }
+        holiday_calendar_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        closed_on: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ], description: Read-only; closing is OQ-C01-02. }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    GeoFenceInput:
+      type: object
+      additionalProperties: false
+      required: [latitude, longitude, radius_m]
+      properties:
+        name: { type: string, maxLength: 120 }
+        latitude: { type: number, minimum: -90, maximum: 90, description: 'numeric(9,6)' }
+        longitude: { type: number, minimum: -180, maximum: 180, description: 'numeric(9,6)' }
+        radius_m: { type: integer, minimum: 1 }
+    GeoFence:
+      type: object
+      required: [id, branch_id, latitude, longitude, radius_m, enabled]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        name: { type: [string, 'null'] }
+        latitude: { type: number }
+        longitude: { type: number }
+        radius_m: { type: integer }
+        enabled: { type: boolean }
+        tested_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        tested_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    IpAllowList:
+      type: object
+      required: [branch_id, networks]
+      properties:
+        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        networks: { type: array, items: { type: string } }
+    ListEntry:
+      type: object
+      required: [id, kind, name, retired_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        kind: { type: string, enum: [department, designation, category, employee_type] }
+        name: { type: string }
+        code: { type: [string, 'null'] }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+    Contractor:
+      type: object
+      required: [id, name, retired_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        name: { type: string }
+        contact: { type: [string, 'null'] }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+    OrganisationSettings:
+      type: object
+      additionalProperties: false
+      description: |
+        Content of `organisation_settings_version.settings` (jsonb). Keys are defined here because no settings schema exists
+        yet in docs/database; the core settings schema (TSD §5.4) must adopt them. Defaults per AC-C01-05.1 and G6.
+      required: [financial_year, week_start, languages, currency, employee_code_mode, mandatory_fields, contact_self_edit,
+                 probation_months, rejoin_code, allowed_branches_mode, non_allowed_branch_punch, other_branch_costing]
+      properties:
+        financial_year:
+          type: object
+          additionalProperties: false
+          required: [kind]
+          description: OR-01. Separate leave year is OQ-C01-07.
+          properties:
+            kind: { type: string, enum: [calendar_year, april_to_march, custom] }
+            custom_start_month: { type: integer, minimum: 1, maximum: 12 }
+        week_start: { type: string, enum: [monday, tuesday, wednesday, thursday, friday, saturday, sunday], description: OR-02 }
+        languages:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: 'common.yaml#/components/schemas/Language' }
+          description: OR-03 languages offered.
+        currency: { type: string, pattern: '^[A-Z]{3}$', description: 'OR-04 (ISO 4217, default INR). Display only: no money fields in V1.' }
+        number_format: { type: string, maxLength: 30, description: OR-04 number format; options OQ-C01-08. }
+        employee_code_mode: { type: string, enum: [automatic, manual], description: EM-01 }
+        branch_code_prefixes:
+          type: object
+          description: EM-01 automatic prefix per branch, keyed by branch id.
+          additionalProperties: { type: string, maxLength: 10 }
+        mandatory_fields: { type: array, uniqueItems: true, items: { type: string, maxLength: 80 }, description: 'EM-02; standard field names or custom field ids (AC-C02-10.2).' }
+        contact_self_edit: { type: string, enum: [off, on_with_approval, on_without_approval], description: EM-03 }
+        probation_months: { type: integer, minimum: 0, maximum: 60, description: EM-04 }
+        confirmation_reminder_days: { type: integer, minimum: 0, description: 'EM-04 reminder lead time; recipient and lead time OQ-C02-06.' }
+        rejoin_code: { type: string, enum: [new_code, reuse_old_code], description: EM-05 }
+        allowed_branches_mode: { type: string, enum: [master_only, chosen_branches, all_branches], description: 'EM-06; organisation-wide vs per employee OQ-C02-11.' }
+        non_allowed_branch_punch: { type: string, enum: [block, record_and_flag], description: EM-07 }
+        other_branch_costing: { type: string, enum: [branch_worked, master_branch], description: EM-08 }
+    OrganisationSettingsVersion:
+      type: object
+      required: [id, effective_from, schema_version, settings, created_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        schema_version: { type: integer }
+        settings: { $ref: '#/components/schemas/OrganisationSettings' }
+        reason: { type: [string, 'null'] }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    Warnings:
+      type: object
+      properties:
+        warnings:
+          type: array
+          description: SETTINGS_WARNING items (K4).
+          items:
+            type: object
+            required: [code, message]
+            properties:
+              code: { type: string }
+              field: { type: string }
+              message: { type: string }
+    SettingsChangeState:
+      type: string
+      enum: [pending, approved, rejected]
+      description: 'Local enum: pending settings changes have no table of their own (approval_step request_type settings_change). Outcome after rejection GAP-SM-16.'
+    SettingsChange:
+      type: object
+      required: [id, target, state, submitted_by, submitted_at, effective_from]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        target: { type: string, enum: [organisation_settings, access_settings, employee_visibility, branch_ip_allow_list] }
+        target_ref: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        state: { $ref: '#/components/schemas/SettingsChangeState' }
+        effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        reason: { type: string }
+        old_value: { type: object, additionalProperties: true }
+        new_value: { type: object, additionalProperties: true }
+        submitted_by: { $ref: 'common.yaml#/components/schemas/Id' }
+        submitted_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        steps: { type: array, items: { $ref: 'common.yaml#/components/schemas/ApprovalStep' } }

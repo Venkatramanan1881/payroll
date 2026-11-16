@@ -1,0 +1,904 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Attendance
+  version: 1.0.0-draft
+  description: |
+    Attendance context (DOMAIN_MODEL §3.8): AttendanceDay / DayResult with explanation, RegularisationRequest
+    (incl. HR direct correction), BulkWaiver, bulk regularisation, recalculation requests, PeriodCounterSet and
+    PeriodPenalty views, LA-15/EC-13 conversion acceptance and LA-05 held check-in release. BRD module C06
+    (attendance rules). AbscondingCase decisions (ATT-12) live in leave.yaml (/v1/leave/absconding-cases).
+    No money anywhere (BRX-02): results are days and minutes only.
+
+    Lock rule used by every write here (BR-06, SM-DAY A10, SM-ADJ Q1): a write that changes an input for a date in a
+    Locked period never creates a new current DayResult in that period. Where the operation may post a correction,
+    the difference is posted as a PeriodAdjustment to the next open period (within PL-07; older ->
+    ADJUSTMENT_WINDOW_EXCEEDED, outcome OQ-C12-04). Which post-lock routes are allowed at all is OQ-C12-03.
+security:
+  - userToken: []
+tags:
+  - name: Attendance days
+  - name: Regularisation
+  - name: Waivers and bulk corrections
+  - name: Counters
+
+x-exempt-permissions:
+  ATT-10: 'EC-14 names no request type or approver (G-22); no operation until G-22 is answered.'
+  ATT-11: 'Who acts on an LV-01 flag and what the action is are open (G-23, OQ-C08-18); no operation until answered.'
+
+x-response-sets:
+  read: &read
+    '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+    '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+  write: &write
+    '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+    '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+    '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+    '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+paths:
+  /v1/attendance/employees/{employee_id}/days/{date}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+      - $ref: '#/components/parameters/DatePath'
+    get:
+      operationId: attendanceGetDay
+      summary: Get an employee's attendance day (current result, superseded history, explanation)
+      description: |
+        Returns the AttendanceDay with its current DayResult, the superseded DayResults (append-only history, BRX-03,
+        AC-C06-03.4) and each result's explanation (BR-08, AC-C06-03.3). Scope: HR within AC-07 scope, Manager /
+        Supervisor own team (G-15), Auditor read-only (P11), Employee self only. For an Employee the response is
+        filtered by AC-05 (own punches, day status, counters, reason for any deduction): hidden parts are omitted,
+        never nulled. OA/PO reads are G-14. A day the caller cannot see returns NOT_FOUND.
+      tags: [Attendance days]
+      responses:
+        '200':
+          description: The attendance day.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttendanceDay' }
+        <<: *read
+      x-permission: ATT-01
+      x-module: C06
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/attendance/daily:
+    get:
+      operationId: attendanceListDaily
+      summary: Daily attendance view for a team or branch (R1 shape)
+      description: |
+        One row per employee in scope for a date: day status, first in, last out, net minutes, flags (R1,
+        AC-C13-02.1, DB-R3/DB-R5/DB-R6 "team attendance"). Filters are applied after scope (AC-07). Manager: own team;
+        Supervisor: team per G-15. Employees use attendanceGetDay instead.
+      tags: [Attendance days]
+      parameters:
+        - { name: date, in: query, required: true, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - { name: day_status, in: query, schema: { $ref: '#/components/schemas/DayStatus' } }
+        - { name: processing_state, in: query, schema: { $ref: '#/components/schemas/ProcessingState' } }
+        - { name: sort, in: query, schema: { type: string, enum: [employee_code, -employee_code, day_status, -day_status] } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of daily rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/DailyRow' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: ATT-01
+      x-module: C06
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/attendance/employees/{employee_id}/calendar:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    get:
+      operationId: attendanceGetCalendar
+      summary: Employee attendance calendar for a month
+      description: |
+        One entry per date of the month with the current day status, processing state and marks (DB-R7 "this month's
+        attendance", R2 shape for one employee). Whether "month" means calendar month or attendance period is
+        OQ-C16-05 / OQ-C12-01; this operation takes a calendar month and returns the period ids that cover each
+        date. Employee view filtered by AC-05.
+      tags: [Attendance days]
+      parameters:
+        - { name: month, in: query, required: true, schema: { type: string, pattern: '^[0-9]{4}-(0[1-9]|1[0-2])$' } }
+      responses:
+        '200':
+          description: Calendar.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [employee_id, month, days]
+                properties:
+                  employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                  month: { type: string }
+                  days: { type: array, items: { $ref: '#/components/schemas/CalendarDay' } }
+        <<: *read
+      x-permission: ATT-01
+      x-module: C06
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/attendance/employees/{employee_id}/counters:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    get:
+      operationId: attendanceGetCounters
+      summary: Period counters and period penalties for an employee
+      description: |
+        The PeriodCounterSet covering the given date (late / early marks and minutes, grace uses, opening counters
+        from OB-R2) and the PeriodPenalty outcomes with explanations (LA-06..12, EC-05..11, BR-10, AC-C06-15.11,
+        AC-C06-15.14). Counter period follows LA-18 / EC-17. Employees see this only where AC-05 shows counters;
+        OA/PO reads are G-14. Derived data: rebuilt from current DayResults, never edited.
+      tags: [Counters]
+      parameters:
+        - { name: date, in: query, required: true, description: Any date inside the wanted counter period., schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+      responses:
+        '200':
+          description: Counters and penalties.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PeriodCounters' }
+        <<: *read
+      x-permission: ATT-13
+      x-module: C06
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/attendance/employees/{employee_id}/days/{date}/permission-conversion/accept:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+      - $ref: '#/components/parameters/DatePath'
+    post:
+      operationId: attendanceAcceptPermissionConversion
+      summary: Employee accepts the suggested late / early -> permission conversion
+      description: |
+        Under LA-15 / EC-13 = suggest, the employee takes up the suggested conversion of a late arrival or early
+        check-out into a permission (AC-C06-07.5). Until accepted the slab action stands. Uses one permission from the
+        limit when PM-30 = yes. Whether the conversion is a PermissionRequest needing approval is GAP-SM-11: the
+        response returns the day as recalculated or as awaiting that outcome, without deciding it. Own days only.
+        No suggestion open -> ILLEGAL_TRANSITION; no balance -> LIMIT_EXCEEDED; LA-15/EC-13 off ->
+        RULE_GROUP_DISABLED. Date in a locked period -> PERIOD_LOCKED.
+      tags: [Attendance days]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [late, early] }
+      responses:
+        '200':
+          description: Conversion accepted; current day returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttendanceDay' }
+        <<: *write
+      x-permission: ATT-08
+      x-module: C06
+      x-scope: self
+      x-audit: true
+      x-events: [DayResultChanged]
+      x-idempotent: key
+
+  /v1/attendance/employees/{employee_id}/days/{date}/held-check-in/release:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+      - $ref: '#/components/parameters/DatePath'
+    post:
+      operationId: attendanceReleaseHeldCheckIn
+      summary: Manager releases a check-in held under LA-05
+      description: |
+        LA-05 slab action "hold check-in until the manager approves". The manager releases the hold so the day is
+        recalculated. What the day is meanwhile, and the outcome on rejection or no action, are OQ-C06-07: this
+        operation only records the release. Nothing held -> ILLEGAL_TRANSITION. BR-07: a manager cannot release
+        their own held check-in (SELF_APPROVAL_FORBIDDEN), including as a delegate (AC-03). Locked date ->
+        PERIOD_LOCKED or adjustment per OQ-C12-03.
+      tags: [Attendance days]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                comment: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Released; current day returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttendanceDay' }
+        <<: *write
+      x-permission: ATT-09
+      x-module: C06
+      x-scope: team
+      x-audit: true
+      x-events: [DayResultChanged]
+      x-idempotent: key
+
+  /v1/attendance/regularisation-requests:
+    post:
+      operationId: attendanceSubmitRegularisation
+      summary: Employee submits a regularisation request
+      description: |
+        SM-REQ R1/R2/R3 (US-C06-14). Checks: RG-01 on else RULE_GROUP_DISABLED (AC-C06-14.11); type enabled in RG-02;
+        reason mandatory and attachment per RG-09 (AC-C06-14.14) else VALIDATION_FAILED; RG-04 window "within N days
+        and before lock" else OUTSIDE_REQUEST_WINDOW (AC-C06-14.2: a date in a locked period is refused this way);
+        RG-03 limit with RG-08 = block -> LIMIT_EXCEEDED, = HR approval only -> created in pending_l2 routed to HR
+        (R3, AC-C06-14.3). RG-06 types are auto-approved on submit (R2, AC-C06-14.6). Refused submissions create no
+        request. Origin is always `employee`. The attachment is a FileRef from POST /v1/files/upload-links.
+      tags: [Regularisation]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegularisationInput' }
+      responses:
+        '201':
+          description: Request created (pending_l1, pending_l2 or approved).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegularisationRequest' }
+        <<: *write
+      x-permission: ATT-02
+      x-module: C06
+      x-scope: self
+      x-audit: true
+      x-events: [RequestSubmitted, RequestApproved]
+      x-idempotent: key
+    get:
+      operationId: attendanceListRegularisations
+      summary: List regularisation requests in scope
+      description: |
+        Requests visible to the caller after scope (AC-07): HR in scope, Manager own team only (AC-C06-14.13),
+        Employee own, Auditor read-only. Filters applied after scope.
+      tags: [Regularisation]
+      parameters:
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: state, in: query, schema: { $ref: 'common.yaml#/components/schemas/RequestState' } }
+        - { name: origin, in: query, schema: { type: string, enum: [employee, hr_direct] } }
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - { name: sort, in: query, schema: { type: string, enum: [attendance_date, -attendance_date, created_at, -created_at] } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of requests.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegularisationPage' }
+        <<: *read
+      x-permission: ATT-01
+      x-module: C06
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/attendance/regularisation-requests/pending-approval:
+    get:
+      operationId: attendanceListPendingRegularisations
+      summary: Regularisation requests waiting for the caller's decision
+      description: |
+        Pending requests routed to the caller at their level by AC-02, or delegated to them (AC-03), within scope.
+        The caller's own requests never appear (BR-07). Level 1: ATT-03; level 2 (RG-05): ATT-04; over-limit HR
+        route (RG-08): ATT-05.
+      tags: [Regularisation]
+      parameters:
+        - { name: level, in: query, schema: { type: integer, enum: [1, 2] } }
+        - { name: escalated, in: query, schema: { type: boolean } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of requests.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegularisationPage' }
+        <<: *read
+      x-permission: [ATT-03, ATT-04, ATT-05]
+      x-module: C06
+      x-scope: team
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/attendance/regularisation-requests/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: attendanceGetRegularisation
+      summary: Get a regularisation request with its approval steps
+      description: Request, state (SM-REQ) and approval history (AuditEntry-backed, §16). Out of scope -> NOT_FOUND.
+      tags: [Regularisation]
+      responses:
+        '200':
+          description: The request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegularisationRequest' }
+        <<: *read
+      x-permission: ATT-01
+      x-module: C06
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/attendance/regularisation-requests/{id}/approve:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: attendanceApproveRegularisation
+      summary: Approve a regularisation request at the caller's level
+      description: |
+        SM-REQ R4 (pending_l1 -> pending_l2 when RG-05 = two levels, AC-C06-14.4) or R5 (final -> approved). The grant
+        checked depends on the request's level: ATT-03 (level 1), ATT-04 (level 2, RG-05), ATT-05 (over-limit HR route,
+        RG-08). On approval a manual RawPunch or override record is produced (never an edit of a punch, BR-01,
+        AC-C06-14.8) and the day is recalculated (BR-03, SM-DAY A4).
+        SELF_APPROVAL_FORBIDDEN (BR-07, AC-C06-14.7) when the caller is the requester, including when acting as a
+        delegate of someone else (AC-03): the delegate may never decide their own request. Approve on approved ->
+        200 with current state, no second effect; from rejected / cancelled -> ILLEGAL_TRANSITION.
+        Request still pending when its date's period was locked: OQ-C12-03 (PERIOD_LOCKED, or the effect posted as a
+        PeriodAdjustment); a new DayResult in the locked period is never created.
+      tags: [Regularisation]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Current state of the request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegularisationRequest' }
+        <<: *write
+      x-permission: [ATT-03, ATT-04, ATT-05]
+      x-module: C06
+      x-scope: team
+      x-audit: true
+      x-events: [RequestApproved, DayResultChanged, AdjustmentPosted]
+      x-idempotent: key
+
+  /v1/attendance/regularisation-requests/{id}/reject:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: attendanceRejectRegularisation
+      summary: Reject a regularisation request
+      description: |
+        SM-REQ R6. Reason mandatory. The day result is unchanged and the decision is audited (AC-C06-14.12).
+        Grant by level as for approve (ATT-03 / ATT-04 / ATT-05). SELF_APPROVAL_FORBIDDEN (BR-07) for the requester,
+        including via delegation (AC-03). Reject on rejected -> 200; from approved / cancelled -> ILLEGAL_TRANSITION.
+      tags: [Regularisation]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Current state of the request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegularisationRequest' }
+        <<: *write
+      x-permission: [ATT-03, ATT-04, ATT-05]
+      x-module: C06
+      x-scope: team
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/attendance/regularisation-requests/{id}/cancel:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: attendanceCancelRegularisation
+      summary: Requester cancels a regularisation request
+      description: |
+        SM-REQ R10 (from pending). Who may cancel, until when, and whether an approved request can be cancelled (R11)
+        are not in the BRD (GAP-SM-09): this contract accepts the requester's cancel of a pending request and returns
+        ILLEGAL_TRANSITION for other states until GAP-SM-09 is answered. Cancel on cancelled -> 200.
+      tags: [Regularisation]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Current state of the request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegularisationRequest' }
+        <<: *write
+      x-permission: ATT-02
+      x-module: C06
+      x-scope: self
+      x-audit: true
+      x-events: [RequestCancelled]
+      x-idempotent: key
+
+  /v1/attendance/hr-corrections:
+    post:
+      operationId: attendanceRecordHrCorrection
+      summary: HR records a direct correction of a day with a reason
+      description: |
+        RG-10 direct correction (AC-C06-14.9). Stored as a RegularisationRequest with origin `hr_direct`; the day is
+        recalculated and the correction audited. RG-10 off -> RULE_GROUP_DISABLED. Whether a second person must
+        approve it is DP-08 / G-17 (OQ-C04-08): the response state is `approved` when no second person is required,
+        or `pending_l1` if DP-08 is answered that way; clients must handle both. BR-07 does not apply while no
+        second approver exists. Date in a locked period: OQ-C12-03 decides whether this route is allowed; where it is,
+        the difference is posted as a PeriodAdjustment (SM-ADJ Q1) within PL-07, older -> ADJUSTMENT_WINDOW_EXCEEDED
+        (OQ-C12-04); otherwise PERIOD_LOCKED.
+      tags: [Regularisation]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/RegularisationInput'
+              required: [employee_id]
+      responses:
+        '201':
+          description: Correction recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegularisationRequest' }
+        <<: *write
+      x-permission: ATT-06
+      x-module: C06
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RequestApproved, DayResultChanged, AdjustmentPosted]
+      x-idempotent: key
+
+  /v1/attendance/bulk-regularisations:
+    post:
+      operationId: attendanceBulkRegulariseOutage
+      summary: HR bulk-regularises a device outage for a date and branch
+      description: |
+        RG-11 (AC-C06-14.10, PC-R9): every affected day of the branch on the date is corrected with the reason logged
+        and recalculated. Runs as a job (API_CONVENTIONS §7); the job's error report lists employees that could not
+        be corrected. RG-11 off -> RULE_GROUP_DISABLED. The matrix has no own row for RG-11; mapped to ATT-06 (HR
+        correction) pending a matrix decision. Locked date: as attendanceRecordHrCorrection (OQ-C12-03, OQ-C12-04).
+      tags: [Waivers and bulk corrections]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [branch_id, attendance_date, correction, reason]
+              properties:
+                branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                device_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                correction:
+                  type: string
+                  enum: [use_shift_times, mark_present]
+                  description: How affected days are corrected. Exact options follow RG-11 / PC-R9 wording.
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: ATT-06
+      x-module: C06
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RequestApproved, DayResultChanged]
+      x-idempotent: key
+
+  /v1/attendance/bulk-waivers:
+    post:
+      operationId: attendanceCreateBulkWaiver
+      summary: HR creates a bulk late / early waiver for a date and branch or shift
+      description: |
+        LA-17 (late) / EC-16 (early) bulk waiver (E14, AC-C06-07.10, AC-C06-09.10). Clears the marks of that rule group
+        for every employee of the branch or shift on the date, logs the reason and triggers recalculation of the
+        affected days and counters (BR-03, BR-08) through `WaiverChanged`. LA-17 / EC-16 off -> RULE_GROUP_DISABLED.
+        Locked date: SM-DAY A10 posts the differences as PeriodAdjustments (within PL-07, else
+        ADJUSTMENT_WINDOW_EXCEEDED per OQ-C12-04); whether waivers are an allowed post-lock route is OQ-C12-03.
+      tags: [Waivers and bulk corrections]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [waiver_date, rule_group, scope_kind, reason]
+              properties:
+                waiver_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                rule_group: { type: string, enum: [late, early] }
+                scope_kind: { type: string, enum: [branch, shift] }
+                branch_id: { $ref: 'common.yaml#/components/schemas/Id', description: Required when scope_kind = branch. }
+                shift_id: { $ref: 'common.yaml#/components/schemas/Id', description: Required when scope_kind = shift. }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: Waiver created; recalculation queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BulkWaiver' }
+        <<: *write
+      x-permission: ATT-07
+      x-module: C06
+      x-scope: branch-department
+      x-audit: true
+      x-events: [WaiverChanged]
+      x-idempotent: key
+    get:
+      operationId: attendanceListBulkWaivers
+      summary: List bulk waivers
+      description: Waivers in scope, newest first. Filters after scope. (LA-17, EC-16)
+      tags: [Waivers and bulk corrections]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - { name: rule_group, in: query, schema: { type: string, enum: [late, early] } }
+        - { name: include_withdrawn, in: query, schema: { type: boolean, default: false } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of waivers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/BulkWaiver' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: ATT-07
+      x-module: C06
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/attendance/bulk-waivers/{id}/withdraw:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: attendanceWithdrawBulkWaiver
+      summary: Withdraw a bulk waiver
+      description: |
+        Withdrawing restores the marks by recalculation (E14 "creating or withdrawing triggers recalculation").
+        Withdraw on a withdrawn waiver -> 200 with current state. Locked dates: as create (SM-DAY A10, OQ-C12-03,
+        OQ-C12-04).
+      tags: [Waivers and bulk corrections]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Waiver withdrawn.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BulkWaiver' }
+        <<: *write
+      x-permission: ATT-07
+      x-module: C06
+      x-scope: branch-department
+      x-audit: true
+      x-events: [WaiverChanged]
+      x-idempotent: key
+
+  /v1/attendance/recalculations:
+    post:
+      operationId: attendanceRequestRecalculation
+      summary: HR requests recalculation of a date range
+      description: |
+        Queues idempotent (organisation, employee, date) recalculation work (BR-03, TSD §5.2, RecalculationScheduler)
+        for the employees in scope and the range. Days whose fingerprint is unchanged are skipped (BR-02, SM-DAY
+        A11). Dates in locked periods never get a new current DayResult; differences are posted as
+        PeriodAdjustments per SM-DAY A10 (PL-07; older -> ADJUSTMENT_WINDOW_EXCEEDED, OQ-C12-04). Recalculation is a
+        system operation (matrix P14); the HR trigger has no own matrix row and is mapped to ATT-06 pending a matrix
+        decision. Range limit is a server setting (VALIDATION_FAILED above it).
+      tags: [Waivers and bulk corrections]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [from, to, reason]
+              properties:
+                from: { $ref: 'common.yaml#/components/schemas/Date' }
+                to: { $ref: 'common.yaml#/components/schemas/Date' }
+                employee_ids: { type: array, maxItems: 1000, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+                branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                department_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: ATT-06
+      x-module: C06
+      x-scope: branch-department
+      x-audit: true
+      x-events: [DayResultChanged, AdjustmentPosted]
+      x-idempotent: key
+
+components:
+  securitySchemes:
+    userToken: { $ref: 'common.yaml#/components/securitySchemes/userToken' }
+  parameters:
+    DatePath:
+      name: date
+      in: path
+      required: true
+      description: Attendance date (YYYY-MM-DD).
+      schema: { $ref: 'common.yaml#/components/schemas/Date' }
+  schemas:
+    DayStatus:
+      type: string
+      enum: [present, half_day, quarter_day, absent, leave, half_day_leave, holiday, weekly_off, on_duty]
+    ProcessingState:
+      type: string
+      enum: [provisional, exception, absence_pending, finalised, locked]
+      description: SM-DAY. "Finalised" is undefined in the BRD (GAP-SM-07).
+    Session:
+      type: object
+      required: [in_at]
+      properties:
+        in_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        out_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+    PunchUsed:
+      type: object
+      required: [raw_punch_id, excluded]
+      properties:
+        raw_punch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        assigned_direction: { type: [string, 'null'], enum: [in, out, null] }
+        session_no: { type: [integer, 'null'], minimum: 1 }
+        excluded: { type: boolean }
+        excluded_reason: { type: [string, 'null'] }
+    DayEffect:
+      type: object
+      required: [effect_kind, reason_code, rule_ref]
+      description: A deduction in days or minutes with its reason (BR-04 at most one per shortfall). Never money.
+      properties:
+        effect_kind: { type: string, enum: [late_slab, early_slab, missed_punch, hours_shortfall, absence_lop, uninformed_absence_cut] }
+        days: { oneOf: [ { $ref: 'common.yaml#/components/schemas/DayQuantity' }, { type: 'null' } ] }
+        minutes: { type: [integer, 'null'], minimum: 0 }
+        reason_code: { type: string }
+        rule_ref: { type: string }
+    DayResult:
+      type: object
+      required: [id, attendance_date, produced_at, is_current]
+      description: |
+        One immutable result (BRX-03). For an Employee caller, fields hidden by AC-05 are omitted (punches_used and
+        sessions when "own punches" is off, day_status when "day status" is off, day_effects reasons and their
+        explanation steps when "reason for any deduction" is off).
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        is_current: { type: boolean }
+        supersedes_result_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        day_status: { $ref: '#/components/schemas/DayStatus' }
+        day_fraction_present: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        gross_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        break_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        net_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        late_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        early_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        early_arrival_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        overtime_identified_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        late_mark: { type: boolean }
+        early_mark: { type: boolean }
+        flags: { type: array, items: { type: string } }
+        sessions: { type: array, items: { $ref: '#/components/schemas/Session' } }
+        punches_used: { type: array, items: { $ref: '#/components/schemas/PunchUsed' } }
+        day_effects: { type: array, items: { $ref: '#/components/schemas/DayEffect' } }
+        explanation: { type: array, items: { $ref: 'common.yaml#/components/schemas/ExplanationStep' } }
+        policy_version_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        shift_version_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        schedule_tz: { $ref: 'common.yaml#/components/schemas/TimeZone' }
+        costed_branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        engine_version: { type: string }
+        trigger_kind: { type: string, description: What produced this result (punch, request decision, waiver, policy change, job ...). }
+        trigger_ref: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        for_adjustment: { type: boolean, description: True when produced for a locked date and used only to compute a PeriodAdjustment. }
+        produced_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    AttendanceDay:
+      type: object
+      required: [employee_id, attendance_date, processing_state, current_result, history]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        processing_state: { $ref: '#/components/schemas/ProcessingState' }
+        period_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        current_result: { oneOf: [ { $ref: '#/components/schemas/DayResult' }, { type: 'null' } ] }
+        history:
+          type: array
+          description: Superseded results, newest first.
+          items: { $ref: '#/components/schemas/DayResult' }
+        permission_conversion_suggested: { type: [string, 'null'], enum: [late, early, null], description: Open LA-15 / EC-13 suggestion, if any. }
+        check_in_held: { type: boolean, description: LA-05 hold in force (OQ-C06-07). }
+        open_regularisation_request_ids: { type: array, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+    DailyRow:
+      type: object
+      required: [employee_id, attendance_date]
+      properties:
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string }
+        employee_name: { type: string }
+        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        department_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        processing_state: { $ref: '#/components/schemas/ProcessingState' }
+        day_status: { oneOf: [ { $ref: '#/components/schemas/DayStatus' }, { type: 'null' } ] }
+        first_in_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        last_out_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        net_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        late_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        early_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        flags: { type: array, items: { type: string } }
+    CalendarDay:
+      type: object
+      required: [attendance_date]
+      properties:
+        attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        period_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        processing_state: { $ref: '#/components/schemas/ProcessingState' }
+        day_status: { oneOf: [ { $ref: '#/components/schemas/DayStatus' }, { type: 'null' } ] }
+        late_mark: { type: boolean }
+        early_mark: { type: boolean }
+        has_exception: { type: boolean }
+    PeriodCounters:
+      type: object
+      required: [employee_id, counter_period_start, counter_period_end]
+      properties:
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        counter_period_start: { $ref: 'common.yaml#/components/schemas/Date' }
+        counter_period_end: { $ref: 'common.yaml#/components/schemas/Date' }
+        late_marks: { type: integer, minimum: 0 }
+        early_marks: { type: integer, minimum: 0 }
+        late_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        early_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        grace_uses_late: { type: integer, minimum: 0 }
+        grace_uses_early: { type: integer, minimum: 0 }
+        opening_late_marks: { type: integer, minimum: 0 }
+        opening_early_marks: { type: integer, minimum: 0 }
+        opening_late_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        opening_early_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        rebuilt_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        penalties:
+          type: array
+          items:
+            type: object
+            required: [id, rule_ref]
+            properties:
+              id: { $ref: 'common.yaml#/components/schemas/Id' }
+              period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+              rule_ref: { type: string, enum: [LA-06, LA-10, EC-05, EC-09, LM-25, LM-26] }
+              days: { oneOf: [ { $ref: 'common.yaml#/components/schemas/DayQuantity' }, { type: 'null' } ] }
+              minutes: { type: [integer, 'null'], minimum: 0 }
+              recovered_as: { type: [string, 'null'], description: Leave type debited or loss of pay (LA-12 / EC-11). }
+              explanation: { type: array, items: { $ref: 'common.yaml#/components/schemas/ExplanationStep' } }
+    RegularisationInput:
+      type: object
+      additionalProperties: false
+      required: [attendance_date, request_type, reason]
+      properties:
+        employee_id:
+          $ref: 'common.yaml#/components/schemas/Id'
+          description: Ignored for employee submissions (always the caller); required for HR corrections.
+        attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        request_type: { type: string, enum: [missed_punch, late_arrival, early_checkout, wrong_punch, whole_day] }
+        proposed_in_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        proposed_out_at: { $ref: 'common.yaml#/components/schemas/Instant', description: Must be after proposed_in_at when both are given. }
+        target_raw_punch_id: { $ref: 'common.yaml#/components/schemas/Id', description: The punch a wrong_punch request corrects (never edited, BR-01). }
+        reason: { type: string, minLength: 1, maxLength: 1000 }
+        attachment: { $ref: 'common.yaml#/components/schemas/FileRef' }
+    RegularisationRequest:
+      allOf:
+        - $ref: 'common.yaml#/components/schemas/RequestSummary'
+        - type: object
+          required: [id, employee_id, attendance_date, request_type, origin, reason, requested_by_user_id]
+          properties:
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            request_type: { type: string, enum: [missed_punch, late_arrival, early_checkout, wrong_punch, whole_day] }
+            origin: { type: string, enum: [employee, hr_direct], description: hr_direct = RG-10 correction (DP-08). }
+            proposed_in_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+            proposed_out_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+            target_raw_punch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            reason: { type: string }
+            attachment: { oneOf: [ { $ref: 'common.yaml#/components/schemas/FileRef' }, { type: 'null' } ] }
+            requested_by_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            decided_by_user_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            decided_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+            approval_steps: { type: array, items: { $ref: 'common.yaml#/components/schemas/ApprovalStep' } }
+    RegularisationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/RegularisationRequest' } }
+        next_cursor: { type: [string, 'null'] }
+    BulkWaiver:
+      type: object
+      required: [id, waiver_date, rule_group, scope_kind, reason, created_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        waiver_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        rule_group: { type: string, enum: [late, early] }
+        scope_kind: { type: string, enum: [branch, shift] }
+        branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        shift_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        reason: { type: string }
+        created_by: { $ref: 'common.yaml#/components/schemas/Id' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        withdrawn_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        withdrawn_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }

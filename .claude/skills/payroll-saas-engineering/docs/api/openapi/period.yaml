@@ -1,0 +1,806 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Period
+  version: 1.0.0-draft
+  description: |
+    Period context (DOMAIN_MODEL §3.11): attendance cycles, AttendancePeriod (SM-PERIOD), pre-lock checklist,
+    lock / unlock, PeriodTotals, PeriodAdjustment (SM-ADJ) and PayrollInputExport producing `PayrollInput v1`
+    (DOMAIN_MODEL §7). BRD module C12 (PL-R1..R4, PL-01..07, MD-06, E15). Days and minutes only; no money (BRX-02).
+    Period generation is a system job (SM-PERIOD P1; job not named: GAP-SM-12). Whether the Payroll Officer exists in
+    V1 and who locks / exports is OQ-C12-05 / G-29 / G-31: the contract names grants, not roles.
+security:
+  - userToken: []
+tags:
+  - name: Cycles and settings
+  - name: Periods
+  - name: Lock and unlock
+  - name: Totals and adjustments
+  - name: Payroll input export
+
+x-response-sets:
+  read: &read
+    '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+    '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+  write: &write
+    '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+    '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+    '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+    '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+paths:
+  /v1/period/cycles:
+    get:
+      operationId: periodListCycles
+      summary: List attendance cycles
+      description: |
+        Cycle definitions (PL-01, PL-02) with their validity ranges. The owner of a cycle is DP-01 (G-A, OQ-C12-01):
+        `owner_kind` is returned as stored (organisation, branch or policy_set) and the contract does not assume
+        which one V1 uses.
+      tags: [Cycles and settings]
+      parameters:
+        - { name: owner_kind, in: query, schema: { $ref: '#/components/schemas/OwnerKind' } }
+        - { name: owner_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of cycles.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AttendanceCycle' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: PER-01
+      x-module: C12
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+    post:
+      operationId: periodCreateCycle
+      summary: Define an attendance cycle from a date
+      description: |
+        PL-01 (frequency, calendar month or custom start day such as 26th-25th, AC-C12-01.1/01.2) and PL-02 cut-off
+        day. Cycles are effective-dated and never overlap for one owner (DB exclusion); a change is a new cycle from
+        a later date. V1 offers monthly only (AC-C12-01.3): other frequencies -> VALIDATION_FAILED. How the transition
+        period is formed when PL-01 changes, and the default when PL-02 is unset, are OQ-C12-09. Owner kind: DP-01.
+        Under AC-04 with approval the change waits for Organisation Admin approval (OQ-C03-11 / G-08); the response
+        then carries `pending_approval: true`.
+      tags: [Cycles and settings]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [owner_kind, owner_id, frequency, start_kind, valid_from]
+              properties:
+                owner_kind: { $ref: '#/components/schemas/OwnerKind' }
+                owner_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                frequency: { type: string, enum: [daily, weekly, bi_weekly, monthly], description: V1 accepts monthly only. }
+                start_kind: { type: string, enum: [calendar, custom] }
+                custom_start_day: { type: integer, minimum: 1, maximum: 31, description: Required when start_kind = custom. }
+                cutoff_day: { type: integer, minimum: 1, maximum: 31 }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                valid_to: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '201':
+          description: Cycle created (or pending approval).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttendanceCycle' }
+        <<: *write
+      x-permission: PER-01
+      x-module: C12
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/period/settings:
+    get:
+      operationId: periodGetSettings
+      summary: Get period settings PL-03..PL-07
+      description: Current period settings with ETag. Whether organisation settings are effective-dated is DP-10.
+      tags: [Cycles and settings]
+      responses:
+        '200':
+          description: Settings.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PeriodSettings' }
+        <<: *read
+      x-permission: PER-01
+      x-module: C12
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+    patch:
+      operationId: periodUpdateSettings
+      summary: Change period settings PL-03..PL-07
+      description: |
+        US-C12-02, PL-03..PL-07. History records who, when, old, new and reason (G9). Under AC-04 with approval the
+        change waits for Organisation Admin approval (G-08); `pending_approval` is then true. Effective dating is
+        DP-10. Settings stored in organisation settings; if the organisation-settings contract exposes the same keys,
+        this operation is the C12 view of them.
+      tags: [Cycles and settings]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                after_cutoff_days: { type: string, enum: [assumed_present, held_until_actuals], description: PL-03 }
+                lock_mode: { type: string, enum: [manual, automatic], description: PL-04 }
+                auto_lock_day: { type: integer, minimum: 1, maximum: 31, description: PL-04 date when automatic. }
+                pending_at_lock: { type: string, enum: [block, allow_as_absent, allow_as_present], description: PL-05 }
+                unlock: { type: string, enum: [never, with_org_admin_approval], description: PL-06 }
+                adjustment_past_periods: { type: integer, minimum: 0, maximum: 24, description: PL-07 }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Settings saved (or pending approval).
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PeriodSettings' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        <<: *write
+      x-permission: PER-01
+      x-module: C12
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+
+  /v1/periods:
+    get:
+      operationId: periodListPeriods
+      summary: List attendance periods
+      description: |
+        Periods of the organisation with state (SM-PERIOD), newest first (AC-C12-01.4). Filters after scope.
+        Read grant PER-08 (OA/PO/AUD reads: G-14).
+      tags: [Periods]
+      parameters:
+        - { name: cycle_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: state, in: query, schema: { $ref: '#/components/schemas/PeriodState' } }
+        - { name: contains_date, in: query, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of periods.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AttendancePeriod' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: PER-08
+      x-module: C12
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/periods/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: periodGetPeriod
+      summary: Get a period with its state history
+      description: Period detail, state, lock record and state history (SM-PERIOD, §16).
+      tags: [Periods]
+      responses:
+        '200':
+          description: The period.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttendancePeriod' }
+        <<: *read
+      x-permission: PER-08
+      x-module: C12
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/periods/{id}/checklist:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: periodGetChecklist
+      summary: Pre-lock checklist
+      description: |
+        PL-R2 (US-C12-03): pending requests, flagged days and unresolved missed punches, each with employee and date
+        (AC-C12-03.1), only for employees in the caller's scope (AC-C12-03.3). Computed view refreshed by J7; each
+        item appears once (AC-C12-03.4); resolved items disappear (AC-C12-03.2). For a Locked period the snapshot
+        stored at lock is returned. HR access is G-29 (OQ-C12-05).
+      tags: [Lock and unlock]
+      parameters:
+        - { name: kind, in: query, schema: { $ref: '#/components/schemas/ChecklistKind' } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Checklist page.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [period_id, generated_at, counts, items, next_cursor]
+                properties:
+                  period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                  generated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                  is_snapshot: { type: boolean }
+                  counts:
+                    type: object
+                    properties:
+                      pending_request: { type: integer, minimum: 0 }
+                      flagged_day: { type: integer, minimum: 0 }
+                      unresolved_missed_punch: { type: integer, minimum: 0 }
+                  items: { type: array, items: { $ref: '#/components/schemas/ChecklistItem' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: PER-02
+      x-module: C12
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/periods/{id}/lock:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: periodLock
+      summary: Lock an attendance period
+      description: |
+        SM-PERIOD P5 / P8 (PL-R3, PL-04 manual, US-C12-04). From awaiting_lock or unlocked. With PL-05 = block and a
+        non-empty checklist -> 409 PENDING_ITEMS_BLOCK_LOCK, the items listed in `errors` (AC-C12-04.2). With PL-05 =
+        allow, pending days are treated as absent / present per the setting (AC-C12-04.3/04.4). Effects: checklist
+        snapshot stored, PeriodTotals frozen, every day -> Locked (SM-DAY A8), audit with user and time
+        (AC-C12-04.1). Lock on locked -> 200 with the lock record, no second effect (P6). Lock before period end is
+        GAP-SM-12 and lock order OQ-C12-09: until answered, open / past_cut_off -> ILLEGAL_TRANSITION. Requests still
+        pending at lock: OQ-C12-03. Automatic lock (PL-04) is a system job, not this operation. HR: G-29.
+      tags: [Lock and unlock]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                comment: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Period locked (or already locked).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttendancePeriod' }
+        <<: *write
+      x-permission: PER-03
+      x-module: C12
+      x-scope: org
+      x-audit: true
+      x-events: [PeriodLocked]
+      x-idempotent: key
+
+  /v1/periods/{id}/unlock-requests:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: periodRequestUnlock
+      summary: Request a period unlock
+      description: |
+        SM-PERIOD P7 request side (PL-06, US-C12-05). PL-06 = never -> UNLOCK_NOT_ALLOWED (AC-C12-05.1). Reason
+        mandatory (AC-C12-05.2). Period not locked -> ILLEGAL_TRANSITION. Routed to the Organisation Admin (approval
+        step type `period_unlock`). Who may request is G-30 (PER-04 cells open). One pending request per period
+        (a second -> ILLEGAL_TRANSITION).
+      tags: [Lock and unlock]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: Unlock request created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UnlockRequest' }
+        <<: *write
+      x-permission: PER-04
+      x-module: C12
+      x-scope: org
+      x-audit: true
+      x-events: [RequestSubmitted]
+      x-idempotent: key
+    get:
+      operationId: periodListUnlockRequests
+      summary: List unlock requests of a period
+      description: Unlock requests with their approval steps (§16).
+      tags: [Lock and unlock]
+      responses:
+        '200':
+          description: Requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/UnlockRequest' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: PER-08
+      x-module: C12
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/period/unlock-requests/{id}/approve:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: periodApproveUnlock
+      summary: Organisation Admin approves a period unlock
+      description: |
+        SM-PERIOD P7 (PL-06, AC-C12-05.3): request approved and period locked -> unlocked; days re-evaluated (SM-DAY
+        A9). SELF_APPROVAL_FORBIDDEN when the approver raised the request (BR-07, AC-C12-05.4), including when acting
+        as a delegate (AC-03). PL-06 changed to never meanwhile -> UNLOCK_NOT_ALLOWED. What happens to adjustments
+        already posted and exports already taken is OQ-C12-07. Approve on approved -> 200, no second effect.
+      tags: [Lock and unlock]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Current request state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UnlockRequest' }
+        <<: *write
+      x-permission: PER-05
+      x-module: C12
+      x-scope: org
+      x-audit: true
+      x-events: [RequestApproved, PeriodUnlocked]
+      x-idempotent: key
+
+  /v1/period/unlock-requests/{id}/reject:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: periodRejectUnlock
+      summary: Organisation Admin rejects a period unlock
+      description: |
+        Rejection with reason; the period stays locked. SELF_APPROVAL_FORBIDDEN (BR-07) for the requester, also via
+        delegation (AC-03). Reject on rejected -> 200; on approved -> ILLEGAL_TRANSITION.
+      tags: [Lock and unlock]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Current request state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UnlockRequest' }
+        <<: *write
+      x-permission: PER-05
+      x-module: C12
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/periods/{id}/totals:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: periodListTotals
+      summary: Period totals per employee
+      description: |
+        PeriodTotals (layer 5): payable days, deduction days by reason, late / early minutes, identified overtime
+        minutes, pay-hold flag, branch day counts (EM-08). Frozen at lock (`basis: frozen`); before lock the current
+        derived values are returned (`basis: provisional`). Each total carries its explanation (BR-08). Read grant
+        PER-08 (G-14).
+      tags: [Totals and adjustments]
+      parameters:
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of totals.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PeriodTotals' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: PER-08
+      x-module: C12
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/period/adjustments:
+    get:
+      operationId: periodListAdjustments
+      summary: List period adjustments
+      description: |
+        PeriodAdjustments (SM-ADJ, PL-R4, E15): original date, difference only, target open period, state, and the
+        explanation (AC-C12-06.6). Created by the system only (Q1); never edited or deleted. Measuring a second
+        change of the same date is OQ-C12-06.
+      tags: [Totals and adjustments]
+      parameters:
+        - { name: target_period_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: source_period_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: state, in: query, schema: { type: string, enum: [posted, frozen, exported] } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of adjustments.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PeriodAdjustment' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: PER-08
+      x-module: C12
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/periods/{id}/payroll-input-exports:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: periodProduceExport
+      summary: Produce the payroll input export (`PayrollInput v1`) as a job
+      description: |
+        MD-06 (US-C12-07). Produces an immutable PayrollInputExport (schema `PayrollInputV1`) for the employees in the
+        caller's scope (AC-C12-07.4): payable days, deduction days by reason line, late / early minutes, identified
+        overtime minutes, pay-hold flag, adjustments tagged with original date (AC-C12-07.2); no money, no advance /
+        loan recoveries (AC-C12-07.6). A locked period exported twice gives identical content (AC-C12-07.3); posted
+        adjustments become exported (SM-ADJ Q3). Whether an export may be taken before lock and whether it can be
+        re-produced are OQ-C12-11 / GAP-SM-12; if the answer is no, the server returns ILLEGAL_TRANSITION. Who
+        produces it is G-31. Allowed while the organisation is suspended (export, VC-R4). Job result: a short-lived
+        signed download link (TB-02, AC-C12-07.5).
+      tags: [Payroll input export]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                format: { type: string, enum: [json, xlsx], default: json, description: File layout is OQ-C12-11; content is PayrollInputV1 either way. }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: PER-06
+      x-module: C12
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+    get:
+      operationId: periodListExports
+      summary: List payroll input exports of a period
+      description: Existing exports (contract version, producer, time, checksum). G-31 for who may see them.
+      tags: [Payroll input export]
+      responses:
+        '200':
+          description: Exports.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PayrollInputExport' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: PER-07
+      x-module: C12
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/period/payroll-input-exports/{id}/download-link:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: periodGetExportDownloadLink
+      summary: Get a short-lived download link for an existing export
+      description: |
+        Issues a short-lived signed link after the access check (TB-02, AC-C12-07.5). Every download is audited
+        (DOMAIN_MODEL §10). Allowed while suspended (VC-R4). Auditor: read within scope.
+      tags: [Payroll input export]
+      responses:
+        '200':
+          description: Link.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DownloadLink' }
+        <<: *read
+      x-permission: PER-07
+      x-module: C12
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: n/a
+
+components:
+  securitySchemes:
+    userToken: { $ref: 'common.yaml#/components/securitySchemes/userToken' }
+  schemas:
+    OwnerKind:
+      type: string
+      enum: [organisation, branch, policy_set]
+      description: Cycle owner (DP-01, undecided). V2 adds payroll group.
+    PeriodState:
+      type: string
+      enum: [open, past_cut_off, awaiting_lock, locked, unlocked]
+    ChecklistKind:
+      type: string
+      enum: [pending_request, flagged_day, unresolved_missed_punch]
+    AttendanceCycle:
+      type: object
+      required: [id, owner_kind, owner_id, frequency, start_kind, valid_from]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        owner_kind: { $ref: '#/components/schemas/OwnerKind' }
+        owner_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        frequency: { type: string, enum: [daily, weekly, bi_weekly, monthly] }
+        start_kind: { type: string, enum: [calendar, custom] }
+        custom_start_day: { type: [integer, 'null'], minimum: 1, maximum: 31 }
+        cutoff_day: { type: [integer, 'null'], minimum: 1, maximum: 31 }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+        pending_approval: { type: boolean }
+    PeriodSettings:
+      type: object
+      required: [after_cutoff_days, lock_mode, pending_at_lock, unlock, adjustment_past_periods]
+      properties:
+        after_cutoff_days: { type: string, enum: [assumed_present, held_until_actuals] }
+        lock_mode: { type: string, enum: [manual, automatic] }
+        auto_lock_day: { type: [integer, 'null'], minimum: 1, maximum: 31 }
+        pending_at_lock: { type: string, enum: [block, allow_as_absent, allow_as_present] }
+        unlock: { type: string, enum: [never, with_org_admin_approval] }
+        adjustment_past_periods: { type: integer, minimum: 0 }
+        pending_approval: { type: boolean }
+    StateChange:
+      type: object
+      required: [to_state, created_at]
+      properties:
+        from_state: { oneOf: [ { $ref: '#/components/schemas/PeriodState' }, { type: 'null' } ] }
+        to_state: { $ref: '#/components/schemas/PeriodState' }
+        changed_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ], description: Null when done by the system. }
+        approved_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        reason: { type: [string, 'null'] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    AttendancePeriod:
+      type: object
+      required: [id, cycle_id, period_start, period_end, state]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        cycle_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        period_start: { $ref: 'common.yaml#/components/schemas/Date' }
+        period_end: { $ref: 'common.yaml#/components/schemas/Date' }
+        cutoff_date: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+        state: { $ref: '#/components/schemas/PeriodState' }
+        locked_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        locked_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ], description: Null for an automatic lock (PL-04). }
+        state_history: { type: array, items: { $ref: '#/components/schemas/StateChange' } }
+    ChecklistItem:
+      type: object
+      required: [kind, employee_id, date]
+      properties:
+        kind: { $ref: '#/components/schemas/ChecklistKind' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string }
+        date: { $ref: 'common.yaml#/components/schemas/Date' }
+        request_type: { type: [string, 'null'], enum: [leave, permission, on_duty, regularisation, comp_off, shift_change, punch_flag, null] }
+        request_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    UnlockRequest:
+      allOf:
+        - $ref: 'common.yaml#/components/schemas/RequestSummary'
+        - type: object
+          required: [id, period_id, reason, requested_by_user_id]
+          properties:
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+            period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            reason: { type: string }
+            requested_by_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            approval_steps: { type: array, items: { $ref: 'common.yaml#/components/schemas/ApprovalStep' } }
+    DeductionReason:
+      type: string
+      enum: [lop, uninformed_absence_extra_cut, excess_informed, excess_uninformed, late_early_penalty]
+      description: DOMAIN_MODEL §7 reason lines. "unearned weekly off" is V2 and will be added as a new value.
+    DeductionLine:
+      type: object
+      required: [reason, days]
+      properties:
+        reason: { $ref: '#/components/schemas/DeductionReason' }
+        days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        explanation_refs: { type: array, items: { type: string }, description: Day result / penalty ids the line is built from (BR-08). }
+    BranchDays:
+      type: object
+      required: [branch_id, days]
+      properties:
+        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+    PeriodTotals:
+      type: object
+      required: [employee_id, period_id, basis, payable_days, deduction_days, deduction_lines, late_minutes, early_minutes, overtime_identified_minutes, pay_hold]
+      properties:
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        basis: { type: string, enum: [frozen, provisional] }
+        payable_days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        deduction_days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        deduction_lines: { type: array, items: { $ref: '#/components/schemas/DeductionLine' } }
+        late_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        early_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        overtime_identified_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        pay_hold: { type: boolean }
+        branch_days: { type: array, items: { $ref: '#/components/schemas/BranchDays' } }
+        frozen_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        explanation: { type: array, items: { $ref: 'common.yaml#/components/schemas/ExplanationStep' } }
+    PeriodAdjustment:
+      type: object
+      required: [id, employee_id, original_date, source_period_id, target_period_id, locked_result_id, new_result_id, days, difference, state, created_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        original_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        source_period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        target_period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        locked_result_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        new_result_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        days: { $ref: 'common.yaml#/components/schemas/DayQuantity', description: Signed difference in days (e.g. "1.00" arrear in E15). }
+        difference: { type: object, additionalProperties: true, description: Field-by-field difference (status, minutes, deduction lines). No money. }
+        state: { type: string, enum: [posted, frozen, exported] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        explanation: { type: array, items: { $ref: 'common.yaml#/components/schemas/ExplanationStep' } }
+    PayrollInputExport:
+      type: object
+      required: [id, period_id, contract_version, produced_at, checksum]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        contract_version: { type: string, const: PayrollInput v1 }
+        produced_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        produced_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        checksum: { type: string }
+        adjustment_ids: { type: array, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+    DownloadLink:
+      type: object
+      required: [url, expires_at]
+      properties:
+        url: { type: string, format: uri }
+        expires_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    PayrollInputV1:
+      type: object
+      description: |
+        `PayrollInput v1` (DOMAIN_MODEL §7, API_CONVENTIONS §10): the only contract by which Payroll (V2) or an
+        external payroll (MD-06) reads attendance. Additive changes keep the version; breaking changes need v2.
+        Days and minutes only; no money (BRX-02). Comp-off expiries due for payout and advance / loan recoveries are
+        V2 and absent here.
+      additionalProperties: false
+      required: [contract_version, export_id, period, produced_at, employees]
+      properties:
+        contract_version: { type: string, const: PayrollInput v1 }
+        export_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        period:
+          type: object
+          additionalProperties: false
+          required: [id, period_start, period_end]
+          properties:
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+            period_start: { $ref: 'common.yaml#/components/schemas/Date' }
+            period_end: { $ref: 'common.yaml#/components/schemas/Date' }
+        produced_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        employees:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [employee_id, employee_code, payable_days, deduction_days, deduction_lines, late_minutes, early_minutes, overtime_identified_minutes, pay_hold, branch_days, adjustments]
+            properties:
+              employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+              employee_code: { type: string }
+              payable_days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+              deduction_days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+              deduction_lines: { type: array, items: { $ref: '#/components/schemas/DeductionLine' } }
+              late_minutes: { $ref: 'common.yaml#/components/schemas/Minutes', description: After grace and waivers (PD-07). }
+              early_minutes: { $ref: 'common.yaml#/components/schemas/Minutes', description: After grace and waivers (PD-07). }
+              overtime_identified_minutes: { $ref: 'common.yaml#/components/schemas/Minutes', description: Computed only (OT-R2). }
+              pay_hold: { type: boolean, description: Absconding pay hold (LM-31). }
+              branch_days: { type: array, items: { $ref: '#/components/schemas/BranchDays' }, description: Branch-costed day counts (EM-08). }
+              adjustments:
+                type: array
+                description: Adjustments posted into this period from earlier locked periods (PL-R4, E15).
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [adjustment_id, original_date, source_period_id, days]
+                  properties:
+                    adjustment_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                    original_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                    source_period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                    days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+                    deduction_lines: { type: array, items: { $ref: '#/components/schemas/DeductionLine' } }
+                    late_minutes: { type: integer, description: Signed difference. }
+                    early_minutes: { type: integer, description: Signed difference. }
+                    explanation_refs: { type: array, items: { type: string } }
+              explanation_refs: { type: array, items: { type: string } }

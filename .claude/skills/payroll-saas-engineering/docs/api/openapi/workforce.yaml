@@ -1,0 +1,1104 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Workforce
+  version: 1.0.0-draft
+  description: |
+    Workforce context (BRD C02 Employee master: EM-R1..EM-R10, EM-01..EM-09; VC-01 employee limit; SM-EMP).
+    Organisation always comes from the token (TB-01). Who maintains the employee master is G-13 (matrix † cells).
+    Dated assignment rows (daterange) are exposed as `valid_from` (inclusive) / `valid_to` (exclusive, null = open).
+    Locked periods (all dated commands below): a change dated inside a locked period leaves the locked period unchanged
+    and the difference posts to the next open period tagged with the original date (SM-ADJ, BR-06, AC-C02-05.4); older
+    than PL-07 allows → ADJUSTMENT_WINDOW_EXCEEDED (outcome OQ-C12-04); whether back-dating into a locked period is
+    allowed at all is OQ-C02-08 (if refused, PERIOD_LOCKED).
+security:
+  - userToken: []
+tags:
+  - name: Employees
+  - name: Assignments
+  - name: Employment status
+  - name: Custom fields
+  - name: Contact changes
+x-exempt-permissions: {}
+paths:
+  /v1/employees:
+    get:
+      operationId: workforceListEmployees
+      summary: List employees in scope
+      description: |
+        Employees after AC-07 scope (AC-C02-01.6, AC-C03-03.1; UM-R2, TB-01). Non-sensitive fields only (§4). Who besides HR
+        may read: G-14.
+      tags: [Employees]
+      x-permission: WRK-08
+      x-module: C02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - name: employment_status
+          in: query
+          schema: { $ref: '#/components/schemas/EmploymentStatus' }
+        - name: contractor_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: q
+          in: query
+          description: Name, code or mobile contains.
+          schema: { type: string, maxLength: 100 }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [employee_code, -employee_code, full_name, -full_name, joining_date, -joining_date] }
+      responses:
+        '200':
+          description: Page of employees.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/EmployeeSummary' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: workforceCreateEmployee
+      summary: Create an employee
+      description: |
+        SM-EMP E1 (EM-R1, EM-R2, EM-R9; AC-C02-01.1..01.9). Code generated with the branch prefix under EM-01 = automatic,
+        entered and unique per organisation under EM-01 = manual (AC-C02-01.2, 01.3, 01.4). Mandatory fields per EM-02 →
+        VALIDATION_FAILED naming the field (AC-C02-01.5). Master branch must be in the caller's scope, else NOT_FOUND
+        (AC-C02-01.6). Initial state on_probation or active is given by the caller (relation to employee type "probation":
+        OQ-C01-05). Employee limit (VC-01, AC-C02-01.8): `block` at the limit → 409 EMPLOYEE_LIMIT_REACHED
+        (AC-V01-05.3); `allow_and_alert` → created and `EmployeeLimitExceeded` raised to the vendor (AC-V01-05.2). Which
+        statuses count: OQ-V01-06. Reporting manager rules: OQ-C02-01. Pay details: OQ-C02-05 (not held). Audited (AC-C02-01.9).
+      tags: [Employees]
+      x-permission: WRK-01
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: [EmployeeCreated, EmployeeLimitExceeded]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmployeeCreate' }
+      responses:
+        '201':
+          description: Employee created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Employee' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/uploads:
+    post:
+      operationId: workforceUploadEmployees
+      summary: Create and update employees from a spreadsheet (job)
+      description: |
+        EM-R7 bulk create and update (AC-C02-09.1..09.6). Upload the file through a signed upload link first, then pass its
+        reference. Returns 202 with a Job; the finished job reports counts and an `error_report_url` naming each refused row
+        and field (AC-C02-09.2, 09.3). Rows updating dated fields are dated like screen changes (AC-C02-09.4; WRK-03 checked
+        per row). Rows outside the caller's scope are refused and reported (AC-C02-09.5). Codes that exist only in another
+        organisation are never read and the report reveals nothing (AC-C02-09.6). VC-01 = block never leaves more active
+        employees than the limit; the rows not created appear in the error report (AC-V01-05.4). Whether good rows apply
+        when others fail, or the whole file is refused, is OQ-C02-04 (`mode` is not offered until decided). Bad file type
+        → FILE_TYPE_NOT_ALLOWED.
+      tags: [Employees]
+      x-permission: WRK-01
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: [EmployeeCreated, EmployeeAssignmentChanged, EmployeeLimitExceeded]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [file]
+              properties:
+                file: { $ref: 'common.yaml#/components/schemas/FileRef' }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/{employee_id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    get:
+      operationId: workforceGetEmployee
+      summary: Get an employee
+      description: |
+        Personal, contact, emergency and job details with current assignments and custom field values (EM-R1, EM-R2,
+        EM-R8). An Employee reads their own record only (WRK-08 Self). A record outside scope → NOT_FOUND
+        (AC-C02-01.6, AC-C03-03.2). After a transfer, a branch-scoped user sees only the dates inside their scope
+        (AC-C02-06.3). Pay fields of disabled modules are not returned (EM-R4, MD-03, AC-C02-03.1).
+      tags: [Employees]
+      x-permission: WRK-08
+      x-module: C02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Employee.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Employee' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    patch:
+      operationId: workforceUpdateEmployee
+      summary: Change personal, contact and custom field values
+      description: |
+        Plain edits of non-dated fields (EM-R1, EM-R8; WRK-02). Dated job fields (branch, department, manager …) are not
+        accepted here: use the assignment commands (EM-R6). Clearing a field marked mandatory under EM-02 →
+        VALIDATION_FAILED. Changing the mobile used for sign-in: OQ-C02-15. Old/new values audited (G9).
+      tags: [Employees]
+      x-permission: WRK-02
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                full_name: { type: string, minLength: 1, maxLength: 200 }
+                date_of_birth: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+                mobile: { type: [string, 'null'], pattern: '^\+[1-9][0-9]{6,14}$' }
+                email: { type: [string, 'null'], format: email, maxLength: 254 }
+                address: { type: [string, 'null'], maxLength: 500 }
+                emergency_contact: { oneOf: [ { $ref: '#/components/schemas/EmergencyContact' }, { type: 'null' } ] }
+                employee_code: { type: string, minLength: 1, maxLength: 30, description: 'EM-01 = manual only; code change on transfer OQ-C02-02.' }
+                custom_fields: { $ref: '#/components/schemas/CustomFieldValues' }
+      responses:
+        '200':
+          description: Employee changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Employee' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/{employee_id}/assignments:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    get:
+      operationId: workforceListEmployeeAssignments
+      summary: Dated assignment history
+      description: |
+        Every dated assignment row (EM-R6, AC-C02-05.1, 05.5, AC-C02-06.1): effective dates, who, when, reason. Rows are
+        never edited or deleted. Filter by kind and by date.
+      tags: [Assignments]
+      x-permission: WRK-08
+      x-module: C02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/AssignmentKind' }
+        - name: 'on'
+          in: query
+          description: Only rows valid on this date.
+          schema: { $ref: 'common.yaml#/components/schemas/Date' }
+      responses:
+        '200':
+          description: Assignment history.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Assignment' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+
+  /v1/employees/{employee_id}/transfer-master-branch:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    post:
+      operationId: workforceTransferMasterBranch
+      summary: Transfer an employee to a new master branch from a date
+      description: |
+        EM-09, EM-R6, EM-R9 (AC-C02-06.1..06.3). Ends the current master_branch row at `valid_from` and starts the new one;
+        there is always exactly one master branch (AC-C02-07.4). Days before belong to the old branch, days from
+        `valid_from` to the new one; open days are recalculated (BR-03). The response returns the employee's current shift,
+        policy set and payroll group for review (AC-C02-06.2); whether the transfer is blocked until each is confirmed is
+        OQ-C02-10, so `reviewed` is accepted but not required. Transfer to a branch outside the caller's scope: OQ-C02-09
+        (if refused, NOT_FOUND). Code change on transfer: OQ-C02-02. Locked dates: see info (SM-ADJ, OQ-C02-08).
+        Same branch and date again → 200 no-op.
+      tags: [Assignments]
+      x-permission: WRK-03
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: [EmployeeAssignmentChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [branch_id, valid_from, reason]
+              properties:
+                branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+                reviewed: { type: boolean, description: 'Caller confirms shift, policy set and payroll group were reviewed (EM-09; blocking or advisory OQ-C02-10).' }
+      responses:
+        '200':
+          description: Transfer recorded.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assignment, review]
+                properties:
+                  assignment: { $ref: '#/components/schemas/Assignment' }
+                  review:
+                    type: object
+                    description: Items to review at transfer (EM-09).
+                    properties:
+                      shift_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                      policy_set_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                      payroll_group: { type: [string, 'null'], description: Not held in V1 (OQ-C02-05). }
+                  adjustment_posted: { type: boolean, description: 'True when the date was in a locked period (SM-ADJ).' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/{employee_id}/change-assignment:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    post:
+      operationId: workforceChangeAssignment
+      summary: Change department, designation, category, type, reporting manager or contractor from a date
+      description: |
+        EM-R6, EM-R2 (AC-C02-05.1..05.5, AC-C01-04.3). Ends the current row of that kind at `valid_from` and starts the new
+        one; `value_id` null ends the assignment (allowed for `contractor` only; whether "contract" type must have a
+        contractor is OQ-C01-06). List entries must be of the matching kind and not retired. Reporting manager: not the
+        employee themselves (DB CHECK); exited or out-of-scope managers OQ-C02-01. Open days are recalculated (BR-03,
+        AC-C02-05.3); locked dates per info (AC-C02-05.4, OQ-C02-08). Master branch uses transfer-master-branch. Shift /
+        roster and policy-set assignment belong to the scheduling and policy contexts. Same value and date → 200 no-op.
+      tags: [Assignments]
+      x-permission: WRK-03
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: [EmployeeAssignmentChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [kind, value_id, valid_from, reason]
+              properties:
+                kind: { type: string, enum: [department, designation, category, employee_type, reporting_manager, contractor] }
+                value_id:
+                  oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ]
+                  description: 'List entry id, manager employee id or contractor id.'
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Assignment recorded.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assignment]
+                properties:
+                  assignment: { $ref: '#/components/schemas/Assignment' }
+                  adjustment_posted: { type: boolean }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/{employee_id}/allowed-branches:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    get:
+      operationId: workforceGetAllowedBranches
+      summary: Allowed branches and their history
+      description: |
+        EM-R9, EM-06 (AC-C02-07.2, 07.3, 07.6). Under EM-06 = all branches every branch counts and `mode` says so (no rows).
+      tags: [Assignments]
+      x-permission: WRK-08
+      x-module: C02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Allowed branches.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mode, items]
+                properties:
+                  mode: { type: string, enum: [master_only, chosen_branches, all_branches] }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [branch_id, valid_from, valid_to]
+                      properties:
+                        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+                        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+
+  /v1/employees/{employee_id}/allowed-branches/change:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    post:
+      operationId: workforceChangeAllowedBranches
+      summary: Set allowed branches from a date
+      description: |
+        EM-06 = chosen branches only; under master_only or all_branches → FORBIDDEN (not available, AC-C02-07.1, matrix
+        Cfg). The master branch stays the master and is not listed (AC-C02-07.2, EM-R9). The list replaces the current one
+        from `valid_from` (dated, EM-R6, AC-C02-07.6). Whether EM-06 is per employee: OQ-C02-11. Locked dates per info.
+      tags: [Assignments]
+      x-permission: WRK-03
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: [EmployeeAssignmentChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [branch_ids, valid_from, reason]
+              properties:
+                branch_ids: { type: array, uniqueItems: true, maxItems: 500, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Allowed branches recorded.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/{employee_id}/status-history:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    get:
+      operationId: workforceListStatusHistory
+      summary: Employment status history
+      description: Every SM-EMP transition with effective date, who, when, old and new status (EM-R5, AC-C02-04.1, 04.3).
+      tags: [Employment status]
+      x-permission: WRK-08
+      x-module: C02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: History.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, to_status, effective_on, created_at]
+                      properties:
+                        id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        from_status: { oneOf: [ { $ref: '#/components/schemas/EmploymentStatus' }, { type: 'null' } ] }
+                        to_status: { $ref: '#/components/schemas/EmploymentStatus' }
+                        effective_on: { $ref: 'common.yaml#/components/schemas/Date' }
+                        reason: { type: [string, 'null'] }
+                        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+
+  /v1/employees/{employee_id}/confirm-probation:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    post:
+      operationId: workforceConfirmProbation
+      summary: Confirm an employee after probation
+      description: |
+        SM-EMP E2: on_probation → active from `effective_on` (EM-R5, EM-04, AC-C02-04.1). Eligibility "after probation"
+        (LM-01, PM-25) is re-evaluated from that date. Automatic confirmation: OQ-C02-06; effect on employee type
+        "probation": OQ-C01-05. Already active with the same date → 200; any other state → ILLEGAL_TRANSITION.
+        Locked dates per info.
+      tags: [Employment status]
+      x-permission: WRK-04
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusChangeInput' }
+      responses:
+        '200': { $ref: '#/components/responses/EmployeeChanged' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/{employee_id}/start-notice:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    post:
+      operationId: workforceStartNotice
+      summary: Put an employee on notice
+      description: |
+        SM-EMP E3: active → on_notice from `effective_on` (EM-R5). LM-15 applies to leave from that date. What triggers
+        notice in V1 and whether on_probation may go straight to notice (E4) are GAP-SM-03: the server accepts both
+        sources until decided. Withdrawing notice is not offered (GAP-SM-03). Already on_notice with the same date → 200;
+        exited → ILLEGAL_TRANSITION. Locked dates per info.
+      tags: [Employment status]
+      x-permission: WRK-04
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/StatusChangeInput'
+                - type: object
+                  properties:
+                    notice_end_date: { $ref: 'common.yaml#/components/schemas/Date' }
+      responses:
+        '200': { $ref: '#/components/responses/EmployeeChanged' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/{employee_id}/exit:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    post:
+      operationId: workforceExitEmployee
+      summary: Record an employee's exit
+      description: |
+        SM-EMP E5/E6: on_notice, active or on_probation → exited at `effective_on` = exit date (≥ joining date, DB CHECK).
+        Assignments end at the exit date; leaver pro-rating follows (LM-04, PM-24). Punches after exit: OQ-C02-07; user access
+        at exit: OQ-C03-12; limit count: OQ-V01-06. Already exited with the same date → 200; different date →
+        ILLEGAL_TRANSITION. Locked dates per info.
+      tags: [Employment status]
+      x-permission: WRK-04
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: [EmployeeExited]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StatusChangeInput' }
+      responses:
+        '200': { $ref: '#/components/responses/EmployeeChanged' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employees/{employee_id}/rejoin:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/EmployeeId'
+    post:
+      operationId: workforceRejoinEmployee
+      summary: Rejoin an exited employee
+      description: |
+        SM-EMP E8 (EM-05, AC-C02-11.1..11.3). Code per EM-05 (reuse old / new under EM-01). Whether the old record is
+        reopened or a new record (with `rejoin_of_employee_id`) is created is OQ-C02-14: the response returns the employee
+        record that is now employed, whichever it is. Earlier employment history stays unchanged (AC-C02-11.3). Employee
+        limit applies as for create (VC-01 → EMPLOYEE_LIMIT_REACHED; OQ-V01-06). Not exited → ILLEGAL_TRANSITION.
+      tags: [Employment status]
+      x-permission: WRK-04
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: [EmployeeCreated, EmployeeLimitExceeded]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [joining_date, employment_status, master_branch_id, reason]
+              properties:
+                joining_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                employment_status: { type: string, enum: [on_probation, active] }
+                probation_end_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                master_branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200': { $ref: '#/components/responses/EmployeeChanged' }
+        '201':
+          description: New employee record created for the rejoin (if OQ-C02-14 says new record).
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Employee' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/custom-fields:
+    get:
+      operationId: workforceListCustomFields
+      summary: List employee custom fields
+      description: Organisation-defined fields (EM-R8, AC-C02-10.1, 10.3). Retired hidden unless `include_retired=true`.
+      tags: [Custom fields]
+      x-permission: WRK-08
+      x-module: C02
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - name: include_retired
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Fields.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/CustomFieldDef' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: workforceCreateCustomField
+      summary: Define an employee custom field
+      description: |
+        EM-R8 (AC-C02-10.1, 10.2). `choice` fields need `choices`. Names unique per organisation. Offered in the EM-02
+        mandatory list. Matrix Cfg(AC-04): under AC-04 = with approval, approval path is neutral here (OQ-C03-11 / G-08:
+        whether AC-04 covers field definitions). Audited.
+      tags: [Custom fields]
+      x-permission: WRK-05
+      x-module: C02
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, data_type, mandatory]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+                data_type: { type: string, enum: [text, number, date, boolean, choice] }
+                choices: { type: array, minItems: 1, maxItems: 100, uniqueItems: true, items: { type: string, maxLength: 80 } }
+                mandatory: { type: boolean }
+      responses:
+        '201':
+          description: Field defined.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomFieldDef' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/custom-fields/{id}/retire:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: workforceRetireCustomField
+      summary: Retire a custom field
+      description: |
+        Sets `retired_at`; the field is no longer shown for entry. Stored values are kept (no delete). Whether a field holding
+        data may be removed and its data kept is OQ-C02-13. Already retired → 200.
+      tags: [Custom fields]
+      x-permission: WRK-05
+      x-module: C02
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Field retired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomFieldDef' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/me/contact-change-requests:
+    get:
+      operationId: workforceListMyContactChangeRequests
+      summary: List my contact-detail change requests
+      description: Own requests and their outcome, including rejections (EM-03, AC-C02-12.2).
+      tags: [Contact changes]
+      x-permission: WRK-06
+      x-module: C02
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ContactChangeRequest' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: workforceRequestMyContactChange
+      summary: Change my own contact details
+      description: |
+        EM-03 (US-C02-12). Contact fields only; any other field → VALIDATION_FAILED (AC-C02-12.5). EM-03 = off → FORBIDDEN
+        (AC-C02-12.4). On without approval → applied at once and logged, 200 (AC-C02-12.3). On with approval → 202 pending;
+        the old values stay in use until approved (AC-C02-12.1). The approval path (approver routing, levels) is not
+        decided by the BRD beyond "HR approval": this contract keeps a single pending step. When a new sign-in mobile takes
+        effect and whether old sessions end: OQ-C02-15.
+      tags: [Contact changes]
+      x-permission: WRK-06
+      x-module: C02
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContactDetails' }
+      responses:
+        '200':
+          description: Applied at once (EM-03 = on, without approval).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContactChangeRequest' }
+        '202':
+          description: Pending HR approval (EM-03 = on, with approval).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContactChangeRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/contact-change-requests:
+    get:
+      operationId: workforceListContactChangeRequests
+      summary: List employees' contact-detail change requests
+      description: Pending and decided EM-03 requests within scope, for the HR approver (AC-C02-12.1, 12.2).
+      tags: [Contact changes]
+      x-permission: WRK-07
+      x-module: C02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/ContactChangeState' }
+      responses:
+        '200':
+          description: Page of requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ContactChangeRequest' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/contact-change-requests/{id}/approve:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: workforceApproveContactChange
+      summary: Approve a contact-detail change
+      description: |
+        EM-03 with HR approval: the new values replace the old ones (AC-C02-12.1). BR-07: an approver may not approve a
+        change to their own contact details, including when acting as a delegate under AC-03 → SELF_APPROVAL_FORBIDDEN
+        (AC-C02-12.6). Already approved → 200; rejected or cancelled → ILLEGAL_TRANSITION.
+      tags: [Contact changes]
+      x-permission: WRK-07
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Approved and applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContactChangeRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/contact-change-requests/{id}/reject:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: workforceRejectContactChange
+      summary: Reject a contact-detail change
+      description: |
+        Old values stay and the employee sees the rejection with its reason (AC-C02-12.2). BR-07 and the AC-03 delegation
+        case as for approve → SELF_APPROVAL_FORBIDDEN (AC-C02-12.6). Already rejected → 200; approved → ILLEGAL_TRANSITION.
+      tags: [Contact changes]
+      x-permission: WRK-07
+      x-module: C02
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ContactChangeRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+components:
+  responses:
+    EmployeeChanged:
+      description: Status changed (or already in that state).
+      headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Employee'
+              - type: object
+                properties:
+                  adjustment_posted: { type: boolean, description: 'True when the date was in a locked period (SM-ADJ).' }
+  schemas:
+    EmploymentStatus:
+      type: string
+      enum: [on_probation, active, on_notice, exited]
+    AssignmentKind:
+      type: string
+      enum: [master_branch, department, designation, category, employee_type, reporting_manager, contractor]
+    EmergencyContact:
+      type: object
+      additionalProperties: false
+      required: [name, phone]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        relation: { type: string, maxLength: 50 }
+        phone: { type: string, maxLength: 20 }
+    CustomFieldValues:
+      type: object
+      description: 'Custom field values keyed by custom_field_def id; value type follows data_type (EM-R8).'
+      propertyNames: { format: uuid }
+      additionalProperties: { type: [string, number, boolean, 'null'] }
+    StatusChangeInput:
+      type: object
+      additionalProperties: false
+      required: [effective_on, reason]
+      properties:
+        effective_on: { $ref: 'common.yaml#/components/schemas/Date' }
+        reason: { type: string, minLength: 1, maxLength: 1000 }
+    EmployeeCreate:
+      type: object
+      additionalProperties: false
+      required: [full_name, joining_date, employment_status, master_branch_id]
+      properties:
+        employee_code: { type: string, minLength: 1, maxLength: 30, description: Required when EM-01 = manual; refused when automatic. }
+        full_name: { type: string, minLength: 1, maxLength: 200 }
+        date_of_birth: { $ref: 'common.yaml#/components/schemas/Date' }
+        mobile: { type: string, pattern: '^\+[1-9][0-9]{6,14}$' }
+        email: { type: string, format: email, maxLength: 254 }
+        address: { type: string, maxLength: 500 }
+        emergency_contact: { $ref: '#/components/schemas/EmergencyContact' }
+        joining_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        employment_status: { type: string, enum: [on_probation, active], description: 'Initial SM-EMP state (OQ-C01-05).' }
+        probation_end_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        master_branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        allowed_branch_ids: { type: array, uniqueItems: true, maxItems: 500, items: { $ref: 'common.yaml#/components/schemas/Id' }, description: EM-06 = chosen branches only. }
+        department_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        designation_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        category_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        reporting_manager_employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        contractor_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        custom_fields: { $ref: '#/components/schemas/CustomFieldValues' }
+    EmployeeSummary:
+      type: object
+      required: [id, employee_code, full_name, employment_status, master_branch_id]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string }
+        full_name: { type: string }
+        employment_status: { $ref: '#/components/schemas/EmploymentStatus' }
+        master_branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        department_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        designation_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    Employee:
+      type: object
+      required: [id, employee_code, full_name, joining_date, employment_status, current, created_at, updated_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string }
+        full_name: { type: string }
+        date_of_birth: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+        mobile: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+        address: { type: [string, 'null'] }
+        emergency_contact: { oneOf: [ { $ref: '#/components/schemas/EmergencyContact' }, { type: 'null' } ] }
+        joining_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        probation_end_date: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+        exit_date: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+        employment_status: { $ref: '#/components/schemas/EmploymentStatus' }
+        rejoin_of_employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        current:
+          type: object
+          description: Assignments valid today.
+          properties:
+            master_branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            department_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            designation_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            category_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            employee_type_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            reporting_manager_employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            contractor_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        custom_fields: { $ref: '#/components/schemas/CustomFieldValues' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    Assignment:
+      type: object
+      required: [id, kind, valid_from, valid_to, created_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        kind: { $ref: '#/components/schemas/AssignmentKind' }
+        branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        list_entry_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        list_kind: { type: [string, 'null'], enum: [department, designation, category, employee_type, null] }
+        manager_employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        contractor_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+        reason: { type: [string, 'null'] }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    CustomFieldDef:
+      type: object
+      required: [id, name, data_type, mandatory, retired_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        name: { type: string }
+        data_type: { type: string, enum: [text, number, date, boolean, choice] }
+        choices: { type: [array, 'null'], items: { type: string } }
+        mandatory: { type: boolean }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+    ContactDetails:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: EM-03 contact fields only.
+      properties:
+        mobile: { type: string, pattern: '^\+[1-9][0-9]{6,14}$' }
+        email: { type: [string, 'null'], format: email, maxLength: 254 }
+        address: { type: [string, 'null'], maxLength: 500 }
+        emergency_contact: { oneOf: [ { $ref: '#/components/schemas/EmergencyContact' }, { type: 'null' } ] }
+    ContactChangeState:
+      type: string
+      enum: [pending, approved, rejected, applied]
+      description: 'Local enum: no table or state machine exists yet for EM-03 requests (not an SM-REQ type). applied = EM-03 without approval.'
+    ContactChangeRequest:
+      type: object
+      required: [id, employee_id, state, new_values, submitted_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        state: { $ref: '#/components/schemas/ContactChangeState' }
+        old_values: { $ref: '#/components/schemas/ContactDetails' }
+        new_values: { $ref: '#/components/schemas/ContactDetails' }
+        submitted_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        decided_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        on_behalf_of_user_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        decided_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        rejection_reason: { type: [string, 'null'] }

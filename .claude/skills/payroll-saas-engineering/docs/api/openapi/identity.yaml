@@ -1,0 +1,1442 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Identity & Access
+  version: 1.0.0-draft
+  description: |
+    Identity & Access context (BRD C03 User access: UM-R1..UM-R4, AC-01..AC-08; MD-03 module visibility; VC-03/VC-R6
+    support-access decisions by the Organisation Admin). Organisation always comes from the token (TB-01); sign-in routes
+    never take an organisation id. Dated rows are exposed as `valid_from` (inclusive) / `valid_to` (exclusive, null = open).
+security:
+  - userToken: []
+tags:
+  - name: Sign-in
+  - name: Me
+  - name: Users
+  - name: Roles
+  - name: Approval routing
+  - name: Access settings
+  - name: Support access
+x-exempt-permissions:
+  IAM-10: 'Acting as a delegate has no route of its own: it is exercised on each request type''s approve / reject routes, which record on_behalf_of_user_id (AC-03, BR-07).'
+paths:
+  /v1/auth/otp/request:
+    post:
+      operationId: identityRequestOtp
+      summary: Request a one-time code for a mobile number
+      description: |
+        Employee sign-in step 1 (UM-R3, AC-C03-04.1). Always answers 202 with the same body whether or not the number is
+        on an employee record, so the API never confirms a number exists (AC-C03-04.3, TB-01). Code life, attempts and
+        lock-out are OQ-C03-05. Sign-in on the web when the plan excludes the app: OQ-C03-05 / MD-02.
+      tags: [Sign-in]
+      security: []
+      x-permission: SELF-AUTH
+      x-module: C03
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [mobile]
+              properties:
+                mobile: { type: string, pattern: '^\+[1-9][0-9]{6,14}$', description: E.164 mobile number. }
+      responses:
+        '202':
+          description: If the number is known a code has been sent.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challenge_token, expires_at]
+                properties:
+                  challenge_token: { type: string, description: Opaque; send back with the code. }
+                  expires_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
+
+  /v1/auth/otp/verify:
+    post:
+      operationId: identityVerifyOtp
+      summary: Verify the one-time code and sign in
+      description: |
+        Employee sign-in step 2 (UM-R3). Wrong or expired code → 400 OTP_INVALID (AC-C03-04.2). When the mobile number is on
+        employee records in more than one organisation, 409 ORGANISATION_CHOICE_REQUIRED returns the candidate organisation
+        names with opaque references, and the client completes with `/v1/auth/organisation-choice`. Whether this choice step
+        is the final behaviour is OQ-C03-05; the contract stays neutral. Inactive user → 401 (AC-C03-03.7).
+      tags: [Sign-in]
+      security: []
+      x-permission: SELF-AUTH
+      x-module: C03
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [challenge_token, code]
+              properties:
+                challenge_token: { type: string, maxLength: 2000 }
+                code: { type: string, pattern: '^[0-9]{4,8}$' }
+                device_label: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '400': { $ref: 'common.yaml#/components/responses/BadRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '409': { $ref: '#/components/responses/OrganisationChoiceRequired' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
+
+  /v1/auth/password/sign-in:
+    post:
+      operationId: identityPasswordSignIn
+      summary: Admin sign-in with email and password
+      description: |
+        Admin users sign in with password (UM-R3). Wrong password → 401 UNAUTHENTICATED (AC-C03-05.4). With AC-08 = on,
+        a correct password returns 401 SECOND_FACTOR_REQUIRED with a `challenge_token` and no tokens (AC-C03-05.1);
+        with AC-08 = off tokens are returned (AC-C03-05.3). Which roles are "admin users", password rules and lock-out:
+        OQ-C03-06. Same email in two organisations → ORGANISATION_CHOICE_REQUIRED (OQ-C03-05). Vendor users are refused
+        here (AC-V01-13.3).
+      tags: [Sign-in]
+      security: []
+      x-permission: SELF-AUTH
+      x-module: C03
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, maxLength: 254 }
+                password: { type: string, minLength: 1, maxLength: 200 }
+                device_label: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Signed in (AC-08 = off).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/SecondFactorOrUnauthenticated' }
+        '409': { $ref: '#/components/responses/OrganisationChoiceRequired' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
+
+  /v1/auth/second-factor/verify:
+    post:
+      operationId: identityVerifySecondFactor
+      summary: Complete the admin second step
+      description: |
+        AC-08 second step (UM-R3). Failure → 400 OTP_INVALID and no sign-in (AC-C03-05.2). Method of the second step
+        (authenticator code per `mfa_secret_enc`) and lock-out: OQ-C03-06.
+      tags: [Sign-in]
+      security: []
+      x-permission: SELF-AUTH
+      x-module: C03
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [challenge_token, code]
+              properties:
+                challenge_token: { type: string, maxLength: 2000 }
+                code: { type: string, pattern: '^[0-9]{6,8}$' }
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '400': { $ref: 'common.yaml#/components/responses/BadRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
+
+  /v1/auth/organisation-choice:
+    post:
+      operationId: identityChooseOrganisation
+      summary: Complete sign-in by choosing one organisation
+      description: |
+        Neutral organisation-choice step after ORGANISATION_CHOICE_REQUIRED (API_CONVENTIONS §3, OQ-C03-05). The body names
+        an opaque `candidate_ref` from that response, never an organisation id (TB-01). If the chosen organisation needs the
+        AC-08 second step → 401 SECOND_FACTOR_REQUIRED.
+      tags: [Sign-in]
+      security: []
+      x-permission: SELF-AUTH
+      x-module: C03
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [choice_token, candidate_ref]
+              properties:
+                choice_token: { type: string, maxLength: 2000 }
+                candidate_ref: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: Signed in to the chosen organisation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: '#/components/responses/SecondFactorOrUnauthenticated' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
+
+  /v1/auth/refresh:
+    post:
+      operationId: identityRefreshToken
+      summary: Exchange a refresh token for a new token pair
+      description: |
+        Rotates the refresh token (TSD §8). Revoked, expired or deactivated user → 401 (AC-C03-03.7). Plan without the
+        mobile app → 401 for app clients (MD-02, AC-V01-02.2).
+      tags: [Sign-in]
+      security: []
+      x-permission: SELF-AUTH
+      x-module: C03
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string, maxLength: 2000 }
+      responses:
+        '200':
+          description: New tokens.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
+
+  /v1/auth/sign-out:
+    post:
+      operationId: identitySignOut
+      summary: Sign out (revoke this session)
+      description: Revokes the current session's refresh token (TSD §8). Repeat is harmless.
+      tags: [Sign-in]
+      x-permission: AUTHENTICATED
+      x-module: C03
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      responses:
+        '204': { $ref: 'common.yaml#/components/responses/NoContent' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+
+  /v1/me:
+    get:
+      operationId: identityGetMe
+      summary: Get my profile, roles, grants and scope
+      description: |
+        Own user account, language, roles, effective operation grants and scope, used by clients to build menus
+        (UM-R1, AC-01). Grants of disabled modules are left out (MD-03). Employee link if any.
+      tags: [Me]
+      x-permission: AUTHENTICATED
+      x-module: C03
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Me.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/UserAccount'
+                  - type: object
+                    required: [grants, offered_languages]
+                    properties:
+                      grants: { type: array, items: { $ref: '#/components/schemas/RoleGrant' } }
+                      offered_languages: { type: array, items: { $ref: 'common.yaml#/components/schemas/Language' }, description: OR-03 }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+
+  /v1/me/language:
+    patch:
+      operationId: identityChangeMyLanguage
+      summary: Choose my language
+      description: |
+        UM-R4, OR-03 (AC-C03-06.1..06.3). Only languages switched on in OR-03 are accepted, else VALIDATION_FAILED
+        (AC-C03-06.2). What users see when their language is later switched off: OQ-C03-07. While the organisation is suspended
+        this is a write, so ORG_SUSPENDED applies (VC-R4).
+      tags: [Me]
+      x-permission: IAM-11
+      x-module: C03
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [language]
+              properties:
+                language: { $ref: 'common.yaml#/components/schemas/Language' }
+      responses:
+        '200':
+          description: Language changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAccount' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/me/modules:
+    get:
+      operationId: identityListMyModules
+      summary: List modules enabled for my organisation today
+      description: |
+        Module entitlements in force today, read for menus, reports and dashboards (MD-03, AT13, AC-C03-03.5,
+        AC-V01-03.1). Read-only for organisation users; switching is vendor-only (MD-01, AC-V01-03.8).
+      tags: [Me]
+      x-permission: AUTHENTICATED
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Enabled modules.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, mobile_app]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [module_code, enabled]
+                      properties:
+                        module_code: { type: string, pattern: '^(V01|C[0-9]{2}|M[0-9]{2})$' }
+                        enabled: { type: boolean }
+                  mobile_app: { type: boolean, description: 'Plan includes the Android/iOS app (MD-02).' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+
+  /v1/users:
+    get:
+      operationId: identityListUsers
+      summary: List user accounts
+      description: User accounts with roles and scope (UM-R1, AC-07). Read carries IAM-01 (no separate view row exists).
+      tags: [Users]
+      x-permission: IAM-01
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: role_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: active
+          in: query
+          schema: { type: boolean }
+        - name: q
+          in: query
+          description: Email, mobile or name contains.
+          schema: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Page of users.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/UserAccount' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: identityCreateUser
+      summary: Create a user account
+      description: |
+        Creates a user with login kind, role(s) and scope (UM-R1, UM-R2, UM-R3, AC-07; AC-C03-03.1..03.4).
+        `mobile_otp` needs `mobile`; `password` needs `email` and an initial password (DB CHECK). Whether Employee users are
+        created automatically for every employee and whether HR may create users: OQ-C03-12 / G-07. Role combinations:
+        OQ-C03-03. Combined branch + department scope: OQ-C03-04. Audited (AC-C03-03.6).
+      tags: [Users]
+      x-permission: IAM-01
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [login_kind, role_ids, scopes]
+              properties:
+                login_kind: { type: string, enum: [mobile_otp, password] }
+                mobile: { type: string, pattern: '^\+[1-9][0-9]{6,14}$' }
+                email: { type: string, format: email, maxLength: 254 }
+                initial_password: { type: string, minLength: 8, maxLength: 200, description: 'Password rules OQ-C03-06.' }
+                employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                language: { $ref: 'common.yaml#/components/schemas/Language' }
+                role_ids: { type: array, minItems: 1, uniqueItems: true, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+                scopes: { type: array, minItems: 1, items: { $ref: '#/components/schemas/UserScopeInput' } }
+      responses:
+        '201':
+          description: User created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAccount' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/users/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: identityGetUser
+      summary: Get a user account
+      description: User with roles and scope (UM-R1, AC-07). IAM-01 read.
+      tags: [Users]
+      x-permission: IAM-01
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: User.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAccount' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+
+  /v1/users/{id}/deactivate:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: identityDeactivateUser
+      summary: Deactivate a user account
+      description: |
+        Removes access; sign-in and existing sessions are refused from then on (all sessions revoked) (UM-R1, N5,
+        AC-C03-03.7). What happens automatically at employee exit: OQ-C03-12. Already inactive → 200.
+      tags: [Users]
+      x-permission: IAM-01
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Inactive.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAccount' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/users/{id}/reactivate:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: identityReactivateUser
+      summary: Reactivate a user account
+      description: Restores sign-in (UM-R1). Already active → 200. Audited.
+      tags: [Users]
+      x-permission: IAM-01
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Active.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAccount' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/users/{id}/change-access:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: identityChangeUserAccess
+      summary: Replace a user's roles and access scope
+      description: |
+        Assigns roles and AC-07 scope (UM-R2, AC-07; AC-C03-03.1..03.4). Takes effect on the user's next request
+        (scope comes from the token: refresh is forced). Old and new values audited (AC-C03-03.6). HR as actor: G-07.
+        Combined scopes: OQ-C03-04. Several roles per person: OQ-C03-03.
+      tags: [Users]
+      x-permission: IAM-02
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [role_ids, scopes, reason]
+              properties:
+                role_ids: { type: array, minItems: 1, uniqueItems: true, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+                scopes: { type: array, minItems: 1, items: { $ref: '#/components/schemas/UserScopeInput' } }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Access changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserAccount' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/roles:
+    get:
+      operationId: identityListRoles
+      summary: List roles
+      description: System roles (§5, AC-C03-01.1) and custom roles (AC-06) of the organisation only (AC-C03-02.3). IAM-03 read.
+      tags: [Roles]
+      x-permission: IAM-03
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of roles.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Role' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: identityCreateRole
+      summary: Create a custom role
+      description: |
+        AC-06 = on (AC-C03-02.1). With AC-06 = off the action is not available → FORBIDDEN (AC-C03-02.2, matrix Cfg(AC-06)).
+        A new role starts with no grants (P9). Names unique per organisation. Custom roles left when AC-06 is later
+        switched off: OQ-C03-02. Audited.
+      tags: [Roles]
+      x-permission: IAM-04
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        '201':
+          description: Role created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/roles/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: identityGetRole
+      summary: Get a role with its grants
+      description: Grants per operation code (AC-01). Operations of disabled modules are not listed (AC-C03-01.5, MD-03).
+      tags: [Roles]
+      x-permission: IAM-03
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Role.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    patch:
+      operationId: identityRenameRole
+      summary: Rename a custom role
+      description: Custom roles only (AC-06). Whether system roles may be renamed is OQ-C03-01 (not decided here). Audited.
+      tags: [Roles]
+      x-permission: IAM-04
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        '200':
+          description: Role renamed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/roles/{id}/change-grants:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: identityChangeRoleGrants
+      summary: Replace a role's grants (view / edit / approve per operation)
+      description: |
+        AC-01, UM-R1 (AC-C03-01.2..01.4, AC-C03-01.7). Each grant is a PERMISSION_MATRIX operation code with
+        `grant_kind` all / scoped / self / approve and an optional `setting_ref` condition. Codes of vendor-only operations
+        (PLT-) and fixed denials (P10) are refused → VALIDATION_FAILED. Editing system roles beyond §5: OQ-C03-01 / G-09.
+        Whether AC-04 approval covers role rights: OQ-C03-11 (contract neutral: applied directly). Old/new values and reason
+        in the settings history (AC-C03-01.6, G9).
+      tags: [Roles]
+      x-permission: IAM-03
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [grants, reason]
+              properties:
+                grants: { type: array, maxItems: 500, items: { $ref: '#/components/schemas/RoleGrant' } }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Grants replaced.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/approver-rules:
+    get:
+      operationId: identityListApproverRules
+      summary: List approver rules per request type
+      description: AC-02 routing for each request type and level (US-C03-07). IAM-05 read.
+      tags: [Approval routing]
+      x-permission: IAM-05
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Rules.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ApproverRule' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/approver-rules/change:
+    post:
+      operationId: identityChangeApproverRules
+      summary: Set the approver for a request type
+      description: |
+        AC-02: reporting manager / named person / department head / HR per request type and level (AC-C03-07.1..07.3).
+        `named_user_id` is required exactly when `source` = named_user. Routing never lets a requester approve their own
+        request (BR-07, AC-C03-07.4, 07.5); where it goes instead is OQ-C03-08. How a department head is identified:
+        OQ-C03-09. Actor (HR, OA): G-08. Matrix Cfg(AC-04): under AC-04 = with approval → 202 pending settings change.
+        Audited (G9).
+      tags: [Approval routing]
+      x-permission: IAM-05
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [request_type, levels, reason]
+              properties:
+                request_type: { $ref: '#/components/schemas/RequestType' }
+                levels:
+                  type: array
+                  minItems: 1
+                  maxItems: 2
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [level, source]
+                    properties:
+                      level: { type: integer, enum: [1, 2] }
+                      source: { type: string, enum: [reporting_manager, named_user, department_head, hr] }
+                      named_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Rules applied.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ApproverRule' } }
+        '202':
+          description: Pending Organisation Admin approval (AC-04).
+          content:
+            application/json:
+              schema: { $ref: 'organisation.yaml#/components/schemas/SettingsChange' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/delegations:
+    get:
+      operationId: identityListDelegations
+      summary: List delegations
+      description: AC-03 delegations (US-C03-08). Filter by approver or delegate. IAM-09 read.
+      tags: [Approval routing]
+      x-permission: IAM-09
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: approver_user_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: delegate_user_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: active_on
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Instant' }
+      responses:
+        '200':
+          description: Page of delegations.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Delegation' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: identityCreateDelegation
+      summary: Delegate an approver's approvals for a time window
+      description: |
+        AC-03 = on (AC-C03-08.1, 08.2); AC-03 = off → FORBIDDEN (AC-C03-08.3). Delegate ≠ approver (DB CHECK); windows of
+        one approver may not overlap → 409 CONFLICTING_SETTINGS. Who may set a delegation and whether the delegate's scope
+        must cover the approver's team: OQ-C03-10 / G-10. BR-07 is checked per request, never here (AC-C03-08.4).
+      tags: [Approval routing]
+      x-permission: IAM-09
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [approver_user_id, delegate_user_id, valid_from, valid_to]
+              properties:
+                approver_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                delegate_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Instant' }
+                valid_to: { $ref: 'common.yaml#/components/schemas/Instant' }
+      responses:
+        '201':
+          description: Delegation created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Delegation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/delegations/{id}/end:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: identityEndDelegation
+      summary: End a delegation now
+      description: |
+        Shortens the window to now (AC-03). Requests still pending with the delegate afterwards: OQ-C03-10. Already ended
+        → 200 with current state.
+      tags: [Approval routing]
+      x-permission: IAM-09
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Delegation ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Delegation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/access-settings:
+    get:
+      operationId: identityGetAccessSettings
+      summary: Get access settings AC-03, AC-04, AC-05, AC-06, AC-08
+      description: Current access settings (US-C03-08..10, US-C03-05). Read carries ORG-07 (settings view).
+      tags: [Access settings]
+      x-permission: ORG-07
+      x-module: C03
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Access settings.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccessSettings' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/access-settings/change:
+    post:
+      operationId: identityChangeAccessSettings
+      summary: Change AC-03, AC-04, AC-06 or AC-08
+      description: |
+        Who may change these is G-08 / OQ-C03-11 (BRD names no actor). Whether AC-04 approval covers changes to AC-04 itself:
+        OQ-C03-11; the contract returns 200 (applied) or 202 (pending) and does not decide which. Effective from
+        `effective_from`; old/new/reason in the settings history (AC-C03-05.5, AC-C03-09.5, G9).
+      tags: [Access settings]
+      x-permission: IAM-06
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [effective_from, reason]
+              minProperties: 3
+              properties:
+                delegation_enabled: { type: boolean, description: AC-03 }
+                settings_change_mode: { type: string, enum: [hr_only, hr_with_org_admin_approval], description: AC-04 }
+                custom_roles_enabled: { type: boolean, description: AC-06 }
+                admin_second_step: { type: boolean, description: AC-08 }
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Applied.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccessSettings' }
+        '202':
+          description: Pending Organisation Admin approval (AC-04).
+          content:
+            application/json:
+              schema: { $ref: 'organisation.yaml#/components/schemas/SettingsChange' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/access-settings/employee-visibility/change:
+    post:
+      operationId: identityChangeEmployeeVisibility
+      summary: Set what employees can see about themselves (AC-05)
+      description: |
+        Each AC-05 item on/off (US-C03-10, AC-C03-10.1..10.4). Defaults: OQ-C03-13. Hidden items are also refused on direct
+        request (AC-C03-10.2). Under AC-04 = with approval → 202 pending (AC-C03-09.3). Audited (G9).
+      tags: [Access settings]
+      x-permission: IAM-07
+      x-module: C03
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [employee_visibility, effective_from, reason]
+              properties:
+                employee_visibility: { $ref: '#/components/schemas/EmployeeVisibility' }
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Applied.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccessSettings' }
+        '202':
+          description: Pending Organisation Admin approval (AC-04).
+          content:
+            application/json:
+              schema: { $ref: 'organisation.yaml#/components/schemas/SettingsChange' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/support-access-grants:
+    get:
+      operationId: identityListSupportAccessGrants
+      summary: List vendor support-access grants for my organisation
+      description: |
+        Requested, active and past grants (VC-R6, VC-03, SM-SUPPORT). Shown to the Organisation Admin who decides them.
+      tags: [Support access]
+      x-permission: PLT-14
+      x-module: V01
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/SupportAccessState' }
+      responses:
+        '200':
+          description: Page of grants.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/SupportAccessGrant' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/support-access-grants/{id}/approve:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: identityApproveSupportAccess
+      summary: Approve a vendor support-access request
+      description: |
+        SM-SUPPORT S3: Requested → Active (VC-03 = on; AC-V01-09.1). Window start/end are set here; the window length and
+        who sets it are OQ-V01-13, so `window_end` is optional and the server default applies when absent. Only an
+        Organisation Admin of this organisation, never a vendor user. BR-07 / P5: the approver may not be the requester,
+        including via an AC-03 delegation → SELF_APPROVAL_FORBIDDEN. Already Active → 200; Rejected / Expired / Ended →
+        ILLEGAL_TRANSITION. A request left unanswered: GAP-SM-02. Read-only vs write under the grant: OQ-V01-12.
+      tags: [Support access]
+      x-permission: PLT-14
+      x-module: V01
+      x-scope: org
+      x-audit: true
+      x-events: [SupportAccessGranted]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                window_end: { $ref: 'common.yaml#/components/schemas/Instant' }
+                comment: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Grant active.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupportAccessGrant' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/support-access-grants/{id}/reject:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: identityRejectSupportAccess
+      summary: Reject a vendor support-access request
+      description: |
+        SM-SUPPORT S4: Requested → Rejected; vendor access then refused (AC-V01-09.2). BR-07 / AC-03 delegation case as for
+        approve → SELF_APPROVAL_FORBIDDEN. Already Rejected → 200; Active / Expired / Ended → ILLEGAL_TRANSITION.
+      tags: [Support access]
+      x-permission: PLT-14
+      x-module: V01
+      x-scope: org
+      x-audit: true
+      x-events: [SupportAccessRejected]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Grant rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupportAccessGrant' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/support-access-grants/{id}/end:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: identityEndSupportAccess
+      summary: End an active support-access grant early
+      description: |
+        SM-SUPPORT S6: Active → Ended; vendor access refused from then on. Whether the Organisation Admin (or the vendor)
+        may end early is OQ-V01-13 / G-03; the route exists and its grant is configurable (PLT-15 cells are "?").
+        Already Ended → 200; Requested / Rejected / Expired → ILLEGAL_TRANSITION.
+      tags: [Support access]
+      x-permission: PLT-15
+      x-module: V01
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Grant ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupportAccessGrant' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/support-access-grants/{id}/actions:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: identityListSupportAccessActions
+      summary: List actions taken by the vendor under a grant
+      description: |
+        Every action under the grant, with vendor user, time and action, visible to the Organisation Admin
+        (VC-R6, AC-V01-09.6, AC-V01-09.8, AC-C03-12.7). Auditor reads within scope (PLT-18 AUD = S).
+      tags: [Support access]
+      x-permission: PLT-18
+      x-module: V01
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of logged actions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [occurred_at, vendor_user_id, action]
+                      properties:
+                        occurred_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                        vendor_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        vendor_user_name: { type: string }
+                        action: { type: string }
+                        target: { type: [string, 'null'] }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+
+components:
+  responses:
+    OrganisationChoiceRequired:
+      description: ORGANISATION_CHOICE_REQUIRED (OQ-C03-05). Candidates carry names and opaque references only.
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: 'common.yaml#/components/schemas/Problem'
+              - type: object
+                required: [choice_token, candidates]
+                properties:
+                  choice_token: { type: string }
+                  candidates:
+                    type: array
+                    minItems: 2
+                    items:
+                      type: object
+                      required: [candidate_ref, display_name]
+                      properties:
+                        candidate_ref: { type: string }
+                        display_name: { type: string }
+    SecondFactorOrUnauthenticated:
+      description: UNAUTHENTICATED (wrong credentials) or SECOND_FACTOR_REQUIRED (AC-08) with a challenge token.
+      content:
+        application/problem+json:
+          schema:
+            allOf:
+              - $ref: 'common.yaml#/components/schemas/Problem'
+              - type: object
+                properties:
+                  challenge_token: { type: string, description: Present only with SECOND_FACTOR_REQUIRED. }
+  schemas:
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer, description: Access token life in seconds. }
+        token_type: { type: string, enum: [Bearer] }
+    UserScopeInput:
+      type: object
+      additionalProperties: false
+      required: [scope_kind]
+      description: 'AC-07. all → no ids; branch → branch_id; department → department_id (+ department_kind).'
+      properties:
+        scope_kind: { type: string, enum: [all, branch, department] }
+        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        department_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        department_kind: { type: string, maxLength: 40 }
+    UserScope:
+      type: object
+      required: [scope_kind]
+      properties:
+        scope_kind: { type: string, enum: [all, branch, department] }
+        branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        department_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        department_kind: { type: [string, 'null'] }
+    UserAccount:
+      type: object
+      required: [id, login_kind, language, active, roles, scopes]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        login_kind: { type: string, enum: [mobile_otp, password] }
+        mobile: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+        employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        language: { $ref: 'common.yaml#/components/schemas/Language' }
+        active: { type: boolean }
+        last_sign_in_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        roles:
+          type: array
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id: { $ref: 'common.yaml#/components/schemas/Id' }
+              name: { type: string }
+              system_code: { type: [string, 'null'] }
+        scopes: { type: array, items: { $ref: '#/components/schemas/UserScope' } }
+    RoleGrant:
+      type: object
+      additionalProperties: false
+      required: [operation_code, grant_kind]
+      properties:
+        operation_code: { type: string, pattern: '^[A-Z]{3}-[0-9]{2}[a-z]?$', description: PERMISSION_MATRIX code. }
+        grant_kind: { type: string, enum: [all, scoped, self, approve] }
+        setting_ref: { type: [string, 'null'], maxLength: 20, description: 'Cfg(X) condition, e.g. AC-04.' }
+    Role:
+      type: object
+      required: [id, name, system_code]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        name: { type: string }
+        system_code: { type: [string, 'null'], enum: [org_admin, hr_manager, payroll_officer, manager, supervisor, employee, auditor, null] }
+        grants: { type: array, items: { $ref: '#/components/schemas/RoleGrant' } }
+    RequestType:
+      type: string
+      enum: [leave, permission, on_duty, regularisation, comp_off, shift_change, punch_flag, period_unlock, settings_change, opening_balance]
+    ApproverRule:
+      type: object
+      required: [request_type, level, source]
+      properties:
+        request_type: { $ref: '#/components/schemas/RequestType' }
+        level: { type: integer, enum: [1, 2] }
+        source: { type: string, enum: [reporting_manager, named_user, department_head, hr] }
+        named_user_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    Delegation:
+      type: object
+      required: [id, approver_user_id, delegate_user_id, valid_from, valid_to]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        approver_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        delegate_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Instant' }
+        valid_to: { $ref: 'common.yaml#/components/schemas/Instant' }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    EmployeeVisibility:
+      type: object
+      additionalProperties: false
+      required: [own_punches, day_status, counters, permission_balance, deduction_reason]
+      description: AC-05 items.
+      properties:
+        own_punches: { type: boolean }
+        day_status: { type: boolean }
+        counters: { type: boolean }
+        permission_balance: { type: boolean }
+        deduction_reason: { type: boolean }
+    AccessSettings:
+      type: object
+      required: [delegation_enabled, settings_change_mode, custom_roles_enabled, admin_second_step, employee_visibility]
+      description: 'Stored with organisation settings versions (no dedicated table); keys defined here.'
+      properties:
+        delegation_enabled: { type: boolean, description: AC-03 }
+        settings_change_mode: { type: string, enum: [hr_only, hr_with_org_admin_approval], description: AC-04 }
+        custom_roles_enabled: { type: boolean, description: AC-06 }
+        admin_second_step: { type: boolean, description: AC-08 }
+        employee_visibility: { $ref: '#/components/schemas/EmployeeVisibility' }
+    SupportAccessState:
+      type: string
+      enum: [requested, active, rejected, expired, ended]
+    SupportAccessGrant:
+      type: object
+      required: [id, state, vendor_user_id, reason, requested_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        state: { $ref: '#/components/schemas/SupportAccessState' }
+        vendor_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        vendor_user_name: { type: string }
+        reason: { type: string }
+        requested_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        decided_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        decided_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        window_start: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        window_end: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        ended_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }

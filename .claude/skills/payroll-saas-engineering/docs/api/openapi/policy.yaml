@@ -1,0 +1,815 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Policy (policy sets, versions, rule groups, assignments, exemptions)
+  version: 1.0.0-draft
+  description: >-
+    Policy context (DOMAIN_MODEL §3.7): organisation rules as versioned data. BRD G2 master switch, G3 policy sets and levels,
+    G5 effective-dated versions, G7 exemptions, G8 preview, G9 settings history, AC-04 approval, BR-05, BR-06, BR-14, MD-05.
+    Settings of the rule groups PR, BK, LA, EC, EA, MP, DS, RD, RG (C06), LM, LV (C08), PM, OD (C09), HW (M02) and PC (C04)
+    live here as one settings document per rule group per version, validated against the settings schema (TSD §5.4).
+    Versions follow SM-POLICYVER. Vendor users never call these routes (G1, P10).
+security:
+  - userToken: []
+tags:
+  - name: Policy sets
+    description: Named policy sets and their versions (G3, G5, SM-POLICYVER).
+  - name: Rule groups
+    description: Settings documents and master switches per rule group (G2, TSD §5.4).
+  - name: Preview
+    description: Run a draft version against the last period without storing results (G8).
+  - name: Assignments
+    description: Dated assignment of a policy set at a level (G3).
+  - name: Exemptions
+    description: Rule-group exemptions (G7, LA-22).
+paths:
+  /v1/policy-sets:
+    post:
+      operationId: policyCreatePolicySet
+      tags: [Policy sets]
+      summary: Create a policy set with a first draft version
+      description: >-
+        G3: a named policy set (name unique in the organisation). A first draft version is created with effective_from, holding every
+        rule group at its BRD default (G6, AC-C06-01.1) or copied from copy_from_version_id. Satisfies AC-C06-01.1, AC-C06-01.5, AC-C06-01.8.
+      x-permission: POL-01
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, effective_from]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                copy_from_version_id: { $ref: 'common.yaml#/components/schemas/Id' }
+      responses:
+        '201':
+          description: Set created with a draft version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicySet' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: policyListPolicySets
+      tags: [Policy sets]
+      summary: List policy sets
+      description: Policy sets with their version summaries (G3, G5). OA/PO read rights G-34. Satisfies AC-C06-01.5 (Auditor read), AC-C06-01.8.
+      x-permission: POL-07
+      x-module: C06
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: include_retired, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: Page of policy sets.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PolicySet' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/policy-sets/{id}:
+    get:
+      operationId: policyGetPolicySet
+      tags: [Policy sets]
+      summary: Get a policy set with its versions
+      description: All versions with state, effective date, who submitted and approved, and reason (G5, G9, R26 history). Satisfies AC-C06-01.3 (read side).
+      x-permission: POL-07
+      x-module: C06
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The policy set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicySet' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+  /v1/policy-sets/{id}/versions:
+    post:
+      operationId: policyCreateDraftVersion
+      tags: [Policy sets]
+      summary: Start a new draft version
+      description: >-
+        SM-POLICYVER V1 CreateDraft (copy of current): copies the rule-group documents of the version in force (or copy_from_version_id)
+        into a new draft with its own effective_from. A version in use is never edited; changes go through a new version (G5, AC-C06-01.2).
+        Satisfies AC-C06-01.2.
+      x-permission: POL-01
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [effective_from]
+              properties:
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                copy_from_version_id: { $ref: 'common.yaml#/components/schemas/Id' }
+      responses:
+        '201':
+          description: Draft created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/policy-versions/{id}:
+    get:
+      operationId: policyGetVersion
+      tags: [Policy sets]
+      summary: Get a policy version with its rule groups
+      description: Version state, effective date, submitter, approver, reason and every rule-group document (G2, G5, G9). Returns ETag.
+      x-permission: POL-07
+      x-module: C06
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The version.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    patch:
+      operationId: policyUpdateDraftVersion
+      tags: [Policy sets]
+      summary: Change a draft version's effective date or reason
+      description: >-
+        Draft only. Any other state → VERSION_FROZEN (G5; editing a scheduled version is GAP-SM-16). Satisfies AC-C06-01.2.
+      x-permission: POL-01
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Updated draft.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/policy-versions/{id}/rule-groups/{rule_group}:
+    get:
+      operationId: policyGetRuleGroup
+      tags: [Rule groups]
+      summary: Get one rule-group settings document
+      description: Settings document, schema version and master switch of one rule group in a version (G2, TSD §5.4).
+      x-permission: POL-07
+      x-module: C06
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: '#/components/parameters/RuleGroup'
+      responses:
+        '200':
+          description: The rule-group document.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleGroupDocument' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    put:
+      operationId: policyPutRuleGroup
+      tags: [Rule groups]
+      summary: Replace a rule-group settings document in a draft
+      description: >-
+        Replaces the settings document of one rule group in a draft version. The document is validated against the settings schema
+        for schema_version (TSD §5.4): failures return 422 VALIDATION_FAILED with one field error per setting (errors[].field is the
+        JSON path, e.g. settings.LA-03). Conflicts the BRD requires to be refused → CONFLICTING_SETTINGS (K4); saved with warnings →
+        200 with `warnings` (SETTINGS_WARNING, e.g. §10.3.4). Version not draft → VERSION_FROZEN (G5). The rule group's module must be
+        enabled (LM/LV → C08, PM/OD → C09, HW → M02, PC → C04), else MODULE_DISABLED (MD-03). For rule_group = PC the caller also needs
+        TCP-11 (punch settings PC-01..PC-17); for rule_group = HW, CMP-01 (comp-off settings HW-01..HW-06). If-Match carries the version ETag (one ETag guards the whole draft). Nothing takes effect
+        until the version is published (V3/V4). Satisfies AC-C06-01.1..01.3, AC-C06-01.5, AC-C04-17.3.
+      x-permission: POL-01
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: '#/components/parameters/RuleGroup'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schema_version, settings]
+              properties:
+                schema_version: { type: integer, minimum: 1 }
+                settings:
+                  type: object
+                  additionalProperties: true
+                  description: 'Setting id → value, e.g. {"LA-03": 10}. Validated server-side against the settings schema.'
+      responses:
+        '200':
+          description: Saved, possibly with warnings.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleGroupSaveResult' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/policy-versions/{id}/rule-groups/{rule_group}/switch:
+    post:
+      operationId: policySwitchRuleGroup
+      tags: [Rule groups]
+      summary: Switch a rule group on or off in a draft
+      description: >-
+        G2 / MD-05 master switch. Sets `enabled` for one rule group in a draft version; it takes effect from the version's
+        effective_from when published, so earlier days keep their results (AC-C06-01.6, BR-14). Never changes locked results (BR-06);
+        back-dated versions are GAP-SM-16. In-flight items of a group switched off (pending requests, raised flags): GAP-SM-17.
+        Version not draft → VERSION_FROZEN. For PC also needs TCP-11; for HW, CMP-01. Setting the current value again → 200. Satisfies AC-C06-01.6.
+      x-permission: POL-06
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: '#/components/parameters/RuleGroup'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: Switch set.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleGroupDocument' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/policy-versions/{id}/publish:
+    post:
+      operationId: policyPublishVersion
+      tags: [Policy sets]
+      summary: Publish (save) or submit a draft version
+      description: >-
+        SM-POLICYVER. AC-04 = HR Manager only: V3 Draft → scheduled (future effective_from) or in_force (date reached), settings change
+        recorded with old/new, who, when and reason (G9); in force on open dates → bulk recalculation (BR-03) and PolicyVersionActivated.
+        AC-04 = with Organisation Admin approval: V4 Draft → pending_approval, and the old version stays in force until approved
+        (AC-C06-01.4, AC-C03-09.3). Reason required (G9). Refused: schema-invalid document (422); another non-draft version of the set
+        with the same effective_from, or not draft (ILLEGAL_TRANSITION; repeat on an already published version returns 200 with current
+        state). Saving content identical to the version in force: refused or no-op (SM-POLICYVER idempotency, neutral).
+        Back-dated into a locked period and the "in use" definition: GAP-SM-16 (neutral; locked results never change, BR-06).
+        Vendor users denied (G1). Satisfies AC-C06-01.2..01.4, AC-C03-09.1, AC-C03-09.3, AC-C03-09.5.
+      x-permission: POL-02
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: [PolicyVersionActivated]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Version scheduled, in force, or pending approval.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/policy-versions/{id}/approve:
+    post:
+      operationId: policyApproveVersion
+      tags: [Policy sets]
+      summary: Approve a version pending AC-04 approval
+      description: >-
+        SM-POLICYVER V5: pending_approval → scheduled or in_force by date (AC-04). Organisation Admin by default (POL-02 A cell).
+        SELF_APPROVAL_FORBIDDEN (403) when the approver submitted the version, including when acting as an AC-03 delegate (BR-07, P5);
+        one person holding both roles is OQ-C03-11. Approve on scheduled/in_force → 200 with current state; from draft/superseded →
+        ILLEGAL_TRANSITION. Side effects as publish V3 (G9 record with approver, recalculation). Satisfies AC-C06-01.4, AC-C03-09.3, AC-C03-09.5.
+      x-permission: POL-02
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: [PolicyVersionActivated]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Version approved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/policy-versions/{id}/reject:
+    post:
+      operationId: policyRejectVersion
+      tags: [Policy sets]
+      summary: Reject a version pending AC-04 approval
+      description: >-
+        SM-POLICYVER V6 with a reason: the version in force stays in force and the submitter sees the rejection (AC-C03-09.4).
+        The state the rejected version moves to is GAP-SM-16 (neutral: the response shows the state the server records).
+        Same BR-07 / AC-03 delegation rule as policyApproveVersion. Satisfies AC-C03-09.4.
+      x-permission: POL-02
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Version rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/policy-versions/{id}/preview:
+    post:
+      operationId: policyPreviewVersion
+      tags: [Preview]
+      summary: Preview a draft against the last period (job)
+      description: >-
+        G8 / SM-POLICYVER V2: runs the draft version on the last period's inputs for the employees the set is assigned to, and produces
+        a difference report (per employee and date: old vs new status, minutes, marks, deduction days, with a plain-language summary of the
+        changed settings). Stores no results, changes no state and emits no events. Asynchronous: 202 with a Job; the finished job's
+        download_url is the report (API_CONVENTIONS §7, TB-02). Draft only, else ILLEGAL_TRANSITION. "Last period" = the most recent
+        completed attendance period.
+      x-permission: POL-03
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/policy-assignments:
+    post:
+      operationId: policyCreateAssignment
+      tags: [Assignments]
+      summary: Assign a policy set at a level from a date
+      description: >-
+        G3: assigns a set at organisation, branch, department, category, shift or employee level for a date range. Exactly the target
+        field of the level is given (branch_id; list_entry_id for department/category; shift_id; employee_id; none for organisation);
+        otherwise 422. The same level and target overlapping in time → 422 field `valid_from` code `overlaps`. Ranking between levels
+        is resolver logic (DP-03); shift as a level vs own shift: OQ-C05-07. Open dates recalculated (BR-03); dates in a locked period
+        never change: differences post to the next open period (SM-ADJ), older than PL-07 → ADJUSTMENT_WINDOW_EXCEEDED (OQ-C12-04).
+        AC-04 approval for assignments (matrix POL-04 OA = A Cfg(AC-04)) has no pending state in the BRD or schema (G-08 / OQ-C03-11):
+        kept neutral, an approval step would be additive. Satisfies AC-C06-02.2 (input), AC-C06-02.4.
+      x-permission: POL-04
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [policy_set_id, level, valid_from, reason]
+              properties:
+                policy_set_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                level: { $ref: '#/components/schemas/AssignmentLevel' }
+                branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                list_entry_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                shift_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                valid_to: { $ref: 'common.yaml#/components/schemas/Date', description: Inclusive; omitted = open. }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: Assignment created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyAssignment' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: policyListAssignments
+      tags: [Assignments]
+      summary: List policy assignments
+      description: Dated assignments, filterable by set, level, target and date (G3).
+      x-permission: POL-07
+      x-module: C06
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: policy_set_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: level, in: query, schema: { $ref: '#/components/schemas/AssignmentLevel' } }
+        - { name: target_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: on_date, in: query, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+      responses:
+        '200':
+          description: Page of assignments.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/PolicyAssignment' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/policy-assignments/{id}/end:
+    post:
+      operationId: policyEndAssignment
+      tags: [Assignments]
+      summary: End a policy assignment
+      description: >-
+        Sets the last day (inclusive) of an assignment; never deletes it (history, G9). Recalculation / adjustment as
+        policyCreateAssignment (BR-03, SM-ADJ, OQ-C12-04). Same valid_to again → 200. AC-04 coverage neutral (G-08).
+      x-permission: POL-04
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EndRequest' }
+      responses:
+        '200':
+          description: Assignment ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyAssignment' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/policy-exemptions:
+    post:
+      operationId: policyCreateExemption
+      tags: [Exemptions]
+      summary: Exempt a scope from a rule group
+      description: >-
+        G7 / LA-22: a rule group is not applied to the chosen category, department, employee type, employee, or dates, for the date
+        range; the explanation names the exemption (AC-C06-01.7, BR-08). Target rules: list_entry_id for category/department/employee_type,
+        employee_id for employee, neither for date (the range is the exempt dates). Exemptions are organisation-wide, as in the schema
+        (per-set or organisation-wide is not stated in the BRD). Open dates recalculated; locked dates → adjustment (SM-ADJ, OQ-C12-04).
+        AC-04 approval coverage neutral (G-08 / OQ-C03-11). Satisfies AC-C06-01.7.
+      x-permission: POL-05
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [rule_group, scope_kind, valid_from, reason]
+              properties:
+                rule_group: { $ref: '#/components/schemas/RuleGroupCode' }
+                scope_kind: { type: string, enum: [category, department, employee_type, employee, date] }
+                list_entry_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                valid_to: { $ref: 'common.yaml#/components/schemas/Date', description: Inclusive; omitted = open. }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: Exemption created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Exemption' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: policyListExemptions
+      tags: [Exemptions]
+      summary: List exemptions
+      description: Exemptions by rule group, scope and date (G7).
+      x-permission: POL-07
+      x-module: C06
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: rule_group, in: query, schema: { $ref: '#/components/schemas/RuleGroupCode' } }
+        - { name: scope_kind, in: query, schema: { type: string, enum: [category, department, employee_type, employee, date] } }
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: on_date, in: query, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+      responses:
+        '200':
+          description: Page of exemptions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Exemption' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/policy-exemptions/{id}/end:
+    post:
+      operationId: policyEndExemption
+      tags: [Exemptions]
+      summary: End an exemption
+      description: Sets the last exempt day (inclusive); history kept (G9). Recalculation / adjustment as policyCreateExemption. Same valid_to again → 200.
+      x-permission: POL-05
+      x-module: C06
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EndRequest' }
+      responses:
+        '200':
+          description: Exemption ended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Exemption' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+components:
+  parameters:
+    RuleGroup:
+      name: rule_group
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/RuleGroupCode' }
+  schemas:
+    RuleGroupCode:
+      type: string
+      enum: [PR, BK, LA, EC, EA, MP, DS, RD, RG, LM, LV, PM, OD, HW, PC]
+      description: policy.rule_group_code. Whether HD, SH, OT also sit in policy sets is open (DOMAIN_MODEL §3.7 "…").
+    VersionState:
+      type: string
+      enum: [draft, pending_approval, scheduled, in_force, superseded]
+      description: SM-POLICYVER.
+    AssignmentLevel:
+      type: string
+      enum: [organisation, branch, department, category, shift, employee]
+    EndRequest:
+      type: object
+      additionalProperties: false
+      required: [valid_to, reason]
+      properties:
+        valid_to: { $ref: 'common.yaml#/components/schemas/Date' }
+        reason: { type: string, minLength: 1, maxLength: 1000 }
+    RuleGroupDocument:
+      type: object
+      required: [rule_group, enabled, schema_version, settings]
+      properties:
+        rule_group: { $ref: '#/components/schemas/RuleGroupCode' }
+        enabled: { type: boolean, description: G2 master switch. }
+        schema_version: { type: integer, minimum: 1 }
+        settings: { type: object, additionalProperties: true }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        updated_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    RuleGroupSaveResult:
+      type: object
+      required: [document, warnings]
+      properties:
+        document: { $ref: '#/components/schemas/RuleGroupDocument' }
+        warnings:
+          type: array
+          description: SETTINGS_WARNING items (K4); empty when none.
+          items:
+            type: object
+            required: [code, message]
+            properties:
+              code: { type: string, enum: [SETTINGS_WARNING] }
+              field: { type: string }
+              rule_ref: { type: string }
+              message: { type: string }
+    PolicyVersion:
+      type: object
+      required: [id, policy_set_id, effective_from, state]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        policy_set_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        state: { $ref: '#/components/schemas/VersionState' }
+        reason: { type: [string, 'null'] }
+        submitted_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        approved_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        approved_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        rule_groups: { type: array, items: { $ref: '#/components/schemas/RuleGroupDocument' }, description: Present on single-version reads. }
+    PolicySet:
+      type: object
+      required: [id, name]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        name: { type: string }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        versions: { type: array, items: { $ref: '#/components/schemas/PolicyVersion' }, description: Summaries without rule_groups. }
+    PolicyAssignment:
+      type: object
+      required: [id, policy_set_id, level, valid_from, valid_to]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        policy_set_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        level: { $ref: '#/components/schemas/AssignmentLevel' }
+        branch_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        list_entry_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        shift_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ], description: Inclusive; null = open. }
+        reason: { type: [string, 'null'] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    Exemption:
+      type: object
+      required: [id, rule_group, scope_kind, valid_from, valid_to]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        rule_group: { $ref: '#/components/schemas/RuleGroupCode' }
+        scope_kind: { type: string, enum: [category, department, employee_type, employee, date] }
+        list_entry_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ], description: Inclusive; null = open. }
+        reason: { type: [string, 'null'] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }

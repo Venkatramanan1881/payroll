@@ -66,7 +66,8 @@ Each context owns its aggregates' data. Other contexts:
 No distributed transactions. Cross-context consistency is eventual and converges through idempotent recalculation.
 
 ### Domain events (V1, internal)
-`PunchRecorded`, `PunchFlagDecided`, `RequestApproved` / `RequestCancelled` (by type), `WaiverChanged`, `PolicyVersionActivated`, `RosterChanged`, `HolidayCalendarChanged`, `EmployeeAssignmentChanged`, `OpeningBalanceConfirmed`, `DayResultChanged`, `PeriodLocked`, `PeriodUnlocked`, `AdjustmentPosted`.
+`PunchRecorded`, `PunchFlagged`, `PunchFlagDecided`, `DeviceRegistered`, `EnrolmentMapped`, `RequestSubmitted` / `RequestApproved` / `RequestRejected` / `RequestCancelled` (by type), `LeaveLedgerAdjusted`, `AbscondingCaseClosed`, `OpeningBalanceChanged`, `WaiverChanged`, `PolicyVersionActivated`, `RosterChanged`, `HolidayCalendarChanged`, `EmployeeAssignmentChanged`, `OpeningBalanceConfirmed`, `DayResultChanged`, `PeriodLocked`, `PeriodUnlocked`, `AdjustmentPosted`, `RequestApprovedAtLevel` (level 1 of 2), `EmployeeCreated`, `EmployeeExited`, `EmployeeLimitExceeded` (VC-01 alert), `OrganisationCreated`, `OrganisationSuspended`, `OrganisationReactivated`, `SupportAccessRequested`, `SupportAccessGranted`, `SupportAccessRejected`.
+Every `x-events` value in `docs/api/openapi` must appear in this list (checked at Gate 4).
 Each carries organisation, aggregate ID, the dates affected, and an event ID used for consumer idempotency.
 
 ## 5. Tenancy enforcement points

@@ -13,8 +13,9 @@ Location: `docs/database/migrations/` during design. In Phase 5 they **move** (n
 | 0003 timecap_sched_policy | `timecap`, `sched`, `policy`; `app.resolve_device_org`; FK `org.branch → sched.holiday_calendar` | 0002 |
 | 0004 leave_perm_notify | `leave`, `perm`, `notify`, `app.approval_step` | 0002 |
 | 0005 attendance_period_openbal | `attendance`, `period`, `openbal`; lock triggers | 0003, 0004 |
+| 0006 api_contract_gaps | Found in Phase 4: `workforce.contact_change_request`, `org.settings_change_request`, `period.unlock_request`, `notify.push_device`; columns `platform.organisation.support_access_needs_approval` (VC-03), `notify.notification.read_at`, `leave.comp_off_credit.employee_choice` (CO-R4), `sched.shift_change_request.decided_basis`; `contact_change` request type. **Gate 3 amendment, approval pending** | 0005 |
 
-Version order is apply order. Validated 2026-11-15 on a throwaway PostgreSQL 16 cluster: all up (94 tables, 15 schemas), RLS build check 0 rows, `tests/tenant_isolation.sql` passed, all down in reverse order, all up again.
+Version order is apply order. 0006 validated 2026-11-16 the same way (98 tables, isolation test passed, full down/up). Validated 2026-11-15 on a throwaway PostgreSQL 16 cluster: all up (94 tables, 15 schemas), RLS build check 0 rows, `tests/tenant_isolation.sql` passed, all down in reverse order, all up again.
 
 ## 2. Reversibility
 

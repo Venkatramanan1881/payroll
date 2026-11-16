@@ -1,0 +1,1469 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Scheduling (shifts, rosters, weekly offs, holidays)
+  version: 1.0.0-draft
+  description: >-
+    Scheduling context (DOMAIN_MODEL §3.6), BRD modules C05 Shifts and roster (SH-R1..SH-R4, SH-01..SH-12) and C07 Holidays and
+    weekly offs (HD-R1..HD-R3, HD-01, SH-09, SH-10), with G5, G9, BR-03, BR-05, BR-06, BR-07. Shifts are versioned (G5; shift
+    versions reuse the SM-POLICYVER states), rosters are dated entries, shift change and swap requests follow SM-REQ.
+    Changes touching dates in a locked period never change the locked result: the difference posts to the next open period
+    (SM-ADJ Q1); older than PL-07 is ADJUSTMENT_WINDOW_EXCEEDED (outcome OQ-C12-04).
+security:
+  - userToken: []
+tags:
+  - name: Shifts
+    description: Shifts and shift versions (SH-R1, SH-01..SH-08, SH-11, G5).
+  - name: Schedules
+    description: Employee schedule assignment (fixed shift or roster) and roster entries (SH-R2..SH-R4, EM-R3).
+  - name: Weekly offs
+    description: Weekly-off patterns (SH-09, HD-R2).
+  - name: Holidays
+    description: Holiday calendars, holidays and optional-holiday choices (HD-R1, HD-R3, SH-10, HD-01).
+  - name: Shift change requests
+    description: Shift change and swap requests (SH-12, SM-REQ).
+paths:
+  /v1/shifts:
+    post:
+      operationId: schedCreateShift
+      tags: [Shifts]
+      summary: Create a shift with its first draft version
+      description: >-
+        Creates a Shift (code unique in the organisation) and its first version in state draft (SH-R1, SH-01). Unset fields take the
+        BRD defaults: fixed 09:00-18:00, 480 required minutes per day, window 180 before / 360 after, half-day split at the middle
+        (SH-01..SH-03, SH-07, SH-11, AC-C05-01.1). Type rules are checked as field errors: flexible_core needs core_start/core_end
+        (AC-C05-01.2), open has no start/end and needs required_minutes (AC-C05-01.4), fixed/night need start/end, segments only for
+        split (shape OQ-C05-01), night marker OQ-C05-02. Publish with schedPublishShiftVersion. Satisfies AC-C05-01.1..01.5, AC-C05-01.8.
+      x-permission: SCH-01
+      x-module: C05
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, name, effective_from]
+              properties:
+                code: { type: string, minLength: 1, maxLength: 20 }
+                name: { type: string, minLength: 1, maxLength: 120 }
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                definition: { $ref: '#/components/schemas/ShiftDefinition' }
+      responses:
+        '201':
+          description: Shift created with a draft version.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Shift' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: schedListShifts
+      tags: [Shifts]
+      summary: List shifts
+      description: Shifts with the version in force on `on_date` (default today) (SH-R1, BR-05). Read by roster viewers (SCH-03).
+      x-permission: SCH-03
+      x-module: C05
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: on_date, in: query, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+        - { name: include_retired, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: Page of shifts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Shift' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/shifts/{id}:
+    get:
+      operationId: schedGetShift
+      tags: [Shifts]
+      summary: Get a shift with all its versions
+      description: Shift and its versions with states and effective dates (G5, G9 history). Satisfies AC-C05-01.7 (read side).
+      x-permission: SCH-03
+      x-module: C05
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The shift.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Shift' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+  /v1/shifts/{id}/versions:
+    post:
+      operationId: schedCreateShiftVersion
+      tags: [Shifts]
+      summary: Start a new draft version of a shift
+      description: >-
+        G5: a version in use is never edited; a change is a new draft version, copied from the version in force (or the latest)
+        and overlaid with the given fields, with its own effective_from (AC-C05-01.7). Satisfies AC-C05-01.7.
+      x-permission: SCH-01
+      x-module: C05
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [effective_from]
+              properties:
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                definition: { $ref: '#/components/schemas/ShiftDefinition' }
+      responses:
+        '201':
+          description: Draft version created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/shift-versions/{id}:
+    get:
+      operationId: schedGetShiftVersion
+      tags: [Shifts]
+      summary: Get a shift version
+      description: One shift version with its ETag (G5).
+      x-permission: SCH-03
+      x-module: C05
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The version.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    patch:
+      operationId: schedUpdateShiftVersion
+      tags: [Shifts]
+      summary: Edit a draft shift version
+      description: >-
+        Edits a draft only. A version in state pending_approval, scheduled, in_force or superseded returns VERSION_FROZEN (G5;
+        editing a scheduled version is GAP-SM-16). Same type rules as schedCreateShift. Satisfies AC-C05-01.2, AC-C05-01.7.
+      x-permission: SCH-01
+      x-module: C05
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                definition: { $ref: '#/components/schemas/ShiftDefinition' }
+      responses:
+        '200':
+          description: Updated draft.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/shift-versions/{id}/publish:
+    post:
+      operationId: schedPublishShiftVersion
+      tags: [Shifts]
+      summary: Publish a draft shift version
+      description: >-
+        Draft → scheduled or in_force by effective_from (SM-POLICYVER V3), or → pending_approval when AC-04 = with Organisation Admin
+        approval and AC-04 covers shifts (V4; coverage is G-08 / OQ-C03-11). Reason required (G9). Two non-draft versions of one
+        shift with the same effective_from → ILLEGAL_TRANSITION. In force on open dates → affected days recalculated (BR-03);
+        back-dated into a locked period → GAP-SM-16 (neutral; if allowed, differences post as adjustments, SM-ADJ).
+        Repeat on a published version → 200 with current state. Satisfies AC-C05-01.7, AC-C05-01.8.
+      x-permission: SCH-01
+      x-module: C05
+      x-scope: org
+      x-audit: true
+      x-events: [RosterChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Version published or submitted for approval.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/shift-versions/{id}/approve:
+    post:
+      operationId: schedApproveShiftVersion
+      tags: [Shifts]
+      summary: Approve a shift version pending AC-04 approval
+      description: >-
+        pending_approval → scheduled or in_force (SM-POLICYVER V5 applied to shifts). Only reachable when AC-04 covers shifts (G-08);
+        the approver role for shifts is not in the matrix (SCH-01 has no OA cell; G-08 / OQ-C03-11), so the grant is configured on SCH-01.
+        SELF_APPROVAL_FORBIDDEN when the approver submitted the version, also when acting as an AC-03 delegate (BR-07).
+        From any other state → ILLEGAL_TRANSITION; repeat → 200 with current state.
+      x-permission: SCH-01
+      x-module: C05
+      x-scope: org
+      x-audit: true
+      x-events: [RosterChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Version approved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/shift-versions/{id}/reject:
+    post:
+      operationId: schedRejectShiftVersion
+      tags: [Shifts]
+      summary: Reject a shift version pending AC-04 approval
+      description: >-
+        Rejects a pending_approval version with a reason; the version in force is unchanged (AC-C03-09.4). The resulting state of the
+        rejected version is GAP-SM-16 (the response shows whatever state the server records). Same approver and BR-07 / AC-03 rules as
+        schedApproveShiftVersion (G-08).
+      x-permission: SCH-01
+      x-module: C05
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Version rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftVersion' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/employee-schedules:
+    post:
+      operationId: schedAssignEmployeeSchedule
+      tags: [Schedules]
+      summary: Assign a fixed shift or roster to an employee from a date
+      description: >-
+        EM-R3: an employee follows a fixed shift or a roster, with a weekly-off pattern (SH-09), from valid_from. The current
+        assignment is ended the day before; history is kept with who and reason (EM-R6, G9, AC-C05-03.2). source = fixed_shift needs
+        shift_id; source = roster must not have one. Open-period dates recalculated (BR-03, AC-C05-03.3); locked dates → adjustment
+        (SM-ADJ, AC-C05-03.4). Employee must be in scope (AC-07, AC-C05-03.7). MGR/SUP rights: G-19. Shift-level policy assignment
+        vs own shift: OQ-C05-07. Satisfies AC-C05-03.2..03.4, AC-C05-03.7, AC-C05-03.8.
+      x-permission: SCH-02
+      x-module: C05
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RosterChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [employee_id, source, valid_from, reason]
+              properties:
+                employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                source: { type: string, enum: [fixed_shift, roster] }
+                shift_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                weekly_off_pattern_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: Assignment created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmployeeSchedule' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: schedListEmployeeSchedules
+      tags: [Schedules]
+      summary: List employee schedule assignments
+      description: Dated assignments (fixed shift or roster, weekly-off pattern) with history (EM-R6). Satisfies AC-C05-03.2 (read side).
+      x-permission: SCH-03
+      x-module: C05
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - { name: on_date, in: query, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+      responses:
+        '200':
+          description: Page of assignments.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/EmployeeSchedule' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/roster-entries:
+    get:
+      operationId: schedListRosterEntries
+      tags: [Schedules]
+      summary: List roster entries
+      description: >-
+        Roster entries (employee, date, shift version or weekly off, source) in scope (SH-R2). Supervisor reads for their team
+        (DB-R6; team definition G-15); OA/MGR/AUD reads G-14. Satisfies AC-C05-03.1, AC-C05-03.7, AC-C05-03.8, AC-C05-06.3.
+      x-permission: SCH-03
+      x-module: C05
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - { name: from, in: query, required: true, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+        - { name: to, in: query, required: true, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+      responses:
+        '200':
+          description: Page of entries ordered by employee, date.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/RosterEntry' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+  /v1/roster-entries/set:
+    post:
+      operationId: schedSetRosterEntries
+      tags: [Schedules]
+      summary: Set roster entries from the roster screen
+      description: >-
+        SH-R2 by screen: sets one entry per employee and date (a shift, or a weekly off), replacing the entry for that date. The
+        client names the shift; the server stores the shift version in force on the date (BR-05). One transaction: any invalid row
+        (employee outside scope, unknown shift) refuses the whole request with field errors entries[i].… (AC-C05-03.7).
+        One shift per employee per date (more than one: OQ-C05-06). Open dates recalculated (BR-03); locked dates → adjustment
+        (SM-ADJ, AC-C05-03.4). Roster publication and change notification: OQ-C05-10. MGR/SUP rights: G-19.
+        Satisfies AC-C05-03.1, AC-C05-03.3, AC-C05-03.4, AC-C05-03.7, AC-C05-03.8, AC-C07-02.3.
+      x-permission: SCH-02
+      x-module: C05
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RosterChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [entries]
+              properties:
+                reason: { type: string, maxLength: 1000 }
+                entries:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [employee_id, roster_date, is_weekly_off]
+                    properties:
+                      employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                      roster_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                      is_weekly_off: { type: boolean }
+                      shift_id: { $ref: 'common.yaml#/components/schemas/Id', description: Required when is_weekly_off is false; absent otherwise. }
+      responses:
+        '200':
+          description: Entries as stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries]
+                properties:
+                  entries: { type: array, items: { $ref: '#/components/schemas/RosterEntry' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/roster-uploads:
+    post:
+      operationId: schedUploadRoster
+      tags: [Schedules]
+      summary: Upload a roster spreadsheet (job)
+      description: >-
+        SH-R2 by spreadsheet. The file is uploaded through an upload link first (API_CONVENTIONS §7); this starts a job (202) that
+        applies rows exactly as in the file (AC-C05-04.1). Rows naming employees outside scope or organisation are never applied
+        (AC-C05-04.2). Whether invalid rows reject the whole file or valid rows are applied with an error report (Job.error_report_url)
+        is OQ-C05-08 (neutral). Recalculation and lock handling as schedSetRosterEntries (BR-03, SM-ADJ). File type rules:
+        FILE_TYPE_NOT_ALLOWED. Satisfies AC-C05-04.1..04.3.
+      x-permission: SCH-02
+      x-module: C05
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RosterChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [file]
+              properties:
+                file: { $ref: 'common.yaml#/components/schemas/FileRef' }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/roster-entries/copy-forward:
+    post:
+      operationId: schedCopyRosterForward
+      tags: [Schedules]
+      summary: Copy a roster forward (job)
+      description: >-
+        SH-R3: copies the entries of a source range (up to 31 days) for the selected employees to the following periods, repeat_count
+        times, keeping shift per employee per weekday (AC-C05-05.1). Entries get source = copy. What happens where target dates already
+        have entries or are holidays / weekly offs (overwrite, keep or report) is OQ-C05-09: the contract does not choose; the job's
+        report lists, per target date, what was written or left. Recalculation and lock handling as schedSetRosterEntries.
+        Satisfies AC-C05-05.1.
+      x-permission: SCH-02
+      x-module: C05
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RosterChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [source_from, source_to, repeat_count, selection]
+              properties:
+                source_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                source_to: { $ref: 'common.yaml#/components/schemas/Date' }
+                repeat_count: { type: integer, minimum: 1, maximum: 12 }
+                selection: { $ref: '#/components/schemas/EmployeeSelection' }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/roster-entries/rotate:
+    post:
+      operationId: schedRotateRoster
+      tags: [Schedules]
+      summary: Rotate shifts on a pattern (job)
+      description: >-
+        SH-R3: applies an ordered shift pattern from `from` to `to`, advancing one step per `step` (day or week). Employee i starts at
+        pattern position i (mod pattern length), so with morning/evening/night by week three employees each work each shift once in
+        order (AC-C05-05.2). A null pattern element is a weekly off. Entries get source = rotation. Existing entries, holidays and
+        weekly offs in the range: OQ-C05-09 (neutral, reported by the job). Satisfies AC-C05-05.2.
+      x-permission: SCH-02
+      x-module: C05
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RosterChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [from, to, step, pattern, employee_ids]
+              properties:
+                from: { $ref: 'common.yaml#/components/schemas/Date' }
+                to: { $ref: 'common.yaml#/components/schemas/Date' }
+                step: { type: string, enum: [day, week] }
+                pattern:
+                  type: array
+                  minItems: 1
+                  maxItems: 14
+                  items: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                employee_ids: { type: array, minItems: 1, maxItems: 500, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/me/roster:
+    get:
+      operationId: schedGetMyRoster
+      tags: [Schedules]
+      summary: My roster
+      description: >-
+        SH-R4: the signed-in employee's expected schedule per date (rostered or fixed shift, weekly off, holiday) for at most 62 days.
+        Own data only (AT13, AC-C05-06.2). App availability depends on the plan (MD-02, AC-C05-06.4). Whether only "published" dates are
+        shown is OQ-C05-10 (neutral). Satisfies AC-C05-06.1, AC-C05-06.2, AC-C05-06.4.
+      x-permission: SCH-03
+      x-module: C05
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - { name: from, in: query, required: true, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+        - { name: to, in: query, required: true, schema: { $ref: 'common.yaml#/components/schemas/Date' } }
+      responses:
+        '200':
+          description: One item per date.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ScheduleDay' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+
+  /v1/weekly-off-patterns:
+    post:
+      operationId: schedCreateWeeklyOffPattern
+      tags: [Weekly offs]
+      summary: Create a weekly-off pattern
+      description: >-
+        SH-09 / HD-R2: fixed days, alternating (e.g. 2nd and 4th Saturday, with fixed days alongside), or from the roster. Days are
+        ISO weekdays 1 = Monday .. 7 = Sunday. A pattern is never edited in place: a change is a new pattern assigned from a date through
+        schedAssignEmployeeSchedule, so earlier days keep the old one (G5, AC-C07-02.5). AC-04 coverage: G-08.
+        Satisfies AC-C07-02.1, AC-C07-02.2, AC-C07-02.3, AC-C07-02.5.
+      x-permission: SCH-04
+      x-module: C07
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, kind]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                kind: { type: string, enum: [fixed_days, alternating, from_roster] }
+                weekly_days: { type: array, uniqueItems: true, maxItems: 7, items: { type: integer, minimum: 1, maximum: 7 } }
+                alt_day: { type: integer, minimum: 1, maximum: 7 }
+                alt_weeks: { type: array, uniqueItems: true, minItems: 1, maxItems: 5, items: { type: integer, minimum: 1, maximum: 5 } }
+      responses:
+        '201':
+          description: Pattern created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WeeklyOffPattern' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: schedListWeeklyOffPatterns
+      tags: [Weekly offs]
+      summary: List weekly-off patterns
+      description: Weekly-off patterns of the organisation (SH-09).
+      x-permission: SCH-03
+      x-module: C07
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: include_retired, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: Page of patterns.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/WeeklyOffPattern' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/weekly-off-patterns/{id}/retire:
+    post:
+      operationId: schedRetireWeeklyOffPattern
+      tags: [Weekly offs]
+      summary: Retire a weekly-off pattern
+      description: Stops new assignments of the pattern; existing dated assignments keep it (G5). Repeat → 200.
+      x-permission: SCH-04
+      x-module: C07
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Pattern retired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WeeklyOffPattern' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/holiday-calendars:
+    post:
+      operationId: schedCreateHolidayCalendar
+      tags: [Holidays]
+      summary: Create a holiday calendar
+      description: >-
+        HD-R1 / SH-10: one calendar per location; branches point at their calendar (branch field holiday_calendar_id, set on the branch).
+        Who maintains calendars (OA or HR) is G-11 (OQ-C01-01). Satisfies AC-C07-01.1, AC-C07-01.6.
+      x-permission: SCH-05
+      x-module: C07
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+      responses:
+        '201':
+          description: Calendar created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HolidayCalendar' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: schedListHolidayCalendars
+      tags: [Holidays]
+      summary: List holiday calendars
+      description: Calendars used by branches in scope (HD-R1, AC-07). Satisfies AC-C07-01.7.
+      x-permission: SCH-05
+      x-module: C07
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+      responses:
+        '200':
+          description: Page of calendars.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/HolidayCalendar' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/holiday-calendars/{id}:
+    patch:
+      operationId: schedUpdateHolidayCalendar
+      tags: [Holidays]
+      summary: Rename or retire a holiday calendar
+      description: Field edit (G9). Setting retired true stops new use; holidays already applied are unchanged.
+      x-permission: SCH-05
+      x-module: C07
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                retired: { type: boolean }
+      responses:
+        '200':
+          description: Updated calendar.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HolidayCalendar' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/holiday-calendars/{id}/holidays:
+    get:
+      operationId: schedListHolidays
+      tags: [Holidays]
+      summary: List holidays of a calendar
+      description: Holidays with type (national, festival, optional) (HD-R1). Satisfies AC-C07-01.1, AC-C07-01.2.
+      x-permission: SCH-05
+      x-module: C07
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - { name: kind, in: query, schema: { $ref: '#/components/schemas/HolidayKind' } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of holidays by date.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Holiday' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    post:
+      operationId: schedAddHoliday
+      tags: [Holidays]
+      summary: Add a holiday to a calendar
+      description: >-
+        HD-R1: one holiday per date per calendar. Reason recorded (G9). Open dates of affected employees recalculated (BR-03,
+        AC-C07-01.4); locked date → locked period unchanged, difference posts to the next open period (SM-ADJ, AC-C07-01.5).
+        Half-day holidays: OQ-C07-02. Satisfies AC-C07-01.1, AC-C07-01.4..01.7.
+      x-permission: SCH-05
+      x-module: C07
+      x-scope: branch-department
+      x-audit: true
+      x-events: [HolidayCalendarChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [holiday_date, name, kind, reason]
+              properties:
+                holiday_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                name: { type: string, minLength: 1, maxLength: 120 }
+                kind: { $ref: '#/components/schemas/HolidayKind' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: Holiday added.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Holiday' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/holidays/{id}:
+    patch:
+      operationId: schedUpdateHoliday
+      tags: [Holidays]
+      summary: Move or rename a holiday
+      description: >-
+        Moves (new date), renames or retypes a holiday with a reason (G9). Both old and new dates are recalculated or adjusted as for
+        schedAddHoliday (BR-03, SM-ADJ). Changing an optional holiday that employees chose: OQ-C07-04. Satisfies AC-C07-01.4..01.6.
+      x-permission: SCH-05
+      x-module: C07
+      x-scope: branch-department
+      x-audit: true
+      x-events: [HolidayCalendarChanged]
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              minProperties: 2
+              properties:
+                holiday_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                name: { type: string, minLength: 1, maxLength: 120 }
+                kind: { $ref: '#/components/schemas/HolidayKind' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Updated holiday.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Holiday' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/holidays/{id}/remove:
+    post:
+      operationId: schedRemoveHoliday
+      tags: [Holidays]
+      summary: Remove a holiday
+      description: >-
+        Removes a holiday with a reason (G9, audit keeps the old value). Recalculation / adjustment as schedAddHoliday (BR-03, SM-ADJ,
+        AC-C07-01.4, AC-C07-01.5). Removing an optional holiday already chosen: OQ-C07-04. Repeat → 204.
+      x-permission: SCH-05
+      x-module: C07
+      x-scope: branch-department
+      x-audit: true
+      x-events: [HolidayCalendarChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '204': { $ref: 'common.yaml#/components/responses/NoContent' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/me/optional-holidays:
+    get:
+      operationId: schedListMyOptionalHolidays
+      tags: [Holidays]
+      summary: Optional holidays I can choose
+      description: >-
+        HD-R3: optional holidays of the employee's own calendar only (AC-C07-03.4), with the HD-01 allowance and which are chosen.
+        Which year HD-01 counts in is OQ-C07-04, so the contract does not fix it: `year` selects the counting window and the response
+        states the window (window_from, window_to) the server used. Satisfies AC-C07-03.1, AC-C07-03.4.
+      x-permission: SCH-06
+      x-module: C07
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - { name: year, in: query, required: true, schema: { type: integer, minimum: 2000, maximum: 2100 } }
+      responses:
+        '200':
+          description: Allowance and choices.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [allowed, chosen_count, window_from, window_to, items]
+                properties:
+                  allowed: { type: integer, minimum: 0, description: HD-01 in force. }
+                  chosen_count: { type: integer, minimum: 0 }
+                  window_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                  window_to: { $ref: 'common.yaml#/components/schemas/Date' }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [holiday_id, holiday_date, name, chosen]
+                      properties:
+                        holiday_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        holiday_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                        name: { type: string }
+                        chosen: { type: boolean }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/me/optional-holiday-choices:
+    post:
+      operationId: schedChooseOptionalHoliday
+      tags: [Holidays]
+      summary: Choose an optional holiday
+      description: >-
+        HD-R3 / HD-01: the employee picks an optional holiday of their own calendar; it becomes a holiday for them only (AC-C07-03.2).
+        Over the HD-01 allowance → LIMIT_EXCEEDED with reason (AC-C07-03.3); HD-01 = 0 → LIMIT_EXCEEDED (AC-C07-03.1). Not optional or
+        not in own calendar → 422. Whether a pick needs approval and by whom (G-20, OQ-C07-04), the deadline, picking after the date and
+        changing a pick are open: the contract records the choice and leaves an approval step to be added. Choosing an already chosen
+        holiday → 200. Satisfies AC-C07-03.1..03.4.
+      x-permission: SCH-06
+      x-module: C07
+      x-scope: self
+      x-audit: true
+      x-events: [HolidayCalendarChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [holiday_id]
+              properties:
+                holiday_id: { $ref: 'common.yaml#/components/schemas/Id' }
+      responses:
+        '201':
+          description: Choice recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OptionalHolidayChoice' }
+        '200':
+          description: Already chosen.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OptionalHolidayChoice' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/me/shift-change-requests:
+    post:
+      operationId: schedSubmitShiftChangeRequest
+      tags: [Shift change requests]
+      summary: Request a shift change or swap
+      description: >-
+        SH-12, SM-REQ R1: the employee asks for another shift on a date (kind change, requested_shift_id) or a swap with a colleague
+        (kind swap, swap_with_employee_id). Routed to the approver from AC-02 (ShiftChangeRequest, one level per SM-REQ §8.2); the roster
+        is unchanged until approved (AC-C05-08.2). SH-12 off → RULE_GROUP_DISABLED (AC-C05-08.1). NT-05 on submit (AC-C05-08.5).
+        Swap consent by the colleague, approver when the two have different approvers, and timeout: G-21 / OQ-C05-12 (neutral).
+        Draft state and withdraw: GAP-SM-08. Satisfies AC-C05-08.1, AC-C05-08.2, AC-C05-08.5.
+      x-permission: SCH-07
+      x-module: C05
+      x-scope: self
+      x-audit: true
+      x-events: [RequestSubmitted]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [kind, roster_date]
+              properties:
+                kind: { type: string, enum: [change, swap] }
+                roster_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                requested_shift_id: { $ref: 'common.yaml#/components/schemas/Id', description: Required for kind = change. }
+                swap_with_employee_id: { $ref: 'common.yaml#/components/schemas/Id', description: Required for kind = swap; not the requester. }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '201':
+          description: Request submitted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftChangeRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+    get:
+      operationId: schedListMyShiftChangeRequests
+      tags: [Shift change requests]
+      summary: My shift change requests
+      description: Own requests with state and approval steps (SH-12, SM-REQ).
+      x-permission: SCH-07
+      x-module: C05
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: state, in: query, schema: { $ref: 'common.yaml#/components/schemas/RequestState' } }
+      responses:
+        '200':
+          description: Page of requests, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ShiftChangeRequest' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/shift-change-requests:
+    get:
+      operationId: schedListShiftChangeRequests
+      tags: [Shift change requests]
+      summary: Shift change requests to decide
+      description: Requests routed to the caller (AC-02) or delegated to them (AC-03), default pending (SM-REQ). Satisfies AC-C05-08.2.
+      x-permission: SCH-08
+      x-module: C05
+      x-scope: team
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - { name: state, in: query, schema: { $ref: 'common.yaml#/components/schemas/RequestState' } }
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+      responses:
+        '200':
+          description: Page of requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ShiftChangeRequest' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+  /v1/shift-change-requests/{id}:
+    get:
+      operationId: schedGetShiftChangeRequest
+      tags: [Shift change requests]
+      summary: Get a shift change request
+      description: Request with approval steps (SM-REQ, §16).
+      x-permission: SCH-08
+      x-module: C05
+      x-scope: team
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftChangeRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+  /v1/shift-change-requests/{id}/approve:
+    post:
+      operationId: schedApproveShiftChangeRequest
+      tags: [Shift change requests]
+      summary: Approve a shift change request
+      description: >-
+        SM-REQ R5: pending → approved. The roster for the date changes (change: requested shift; swap: both employees' entries), logged
+        with approver and time; affected open days recalculated (AC-C05-08.3, BR-03); locked date → difference posts to the next open
+        period (SM-ADJ). SELF_APPROVAL_FORBIDDEN (403) when the approver is the requester, including when acting as an AC-03 delegate
+        (BR-07, AC-C05-08.4). Approve on approved → 200 with current state, no second roster change; on rejected/cancelled →
+        ILLEGAL_TRANSITION. Swap approver when the two have different approvers: G-21 / OQ-C05-12. Satisfies AC-C05-08.3..08.5.
+      x-permission: SCH-08
+      x-module: C05
+      x-scope: team
+      x-audit: true
+      x-events: [RequestApproved, RosterChanged]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Request approved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftChangeRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+  /v1/shift-change-requests/{id}/reject:
+    post:
+      operationId: schedRejectShiftChangeRequest
+      tags: [Shift change requests]
+      summary: Reject a shift change request
+      description: >-
+        SM-REQ R6: pending → rejected with a reason; roster unchanged; NT-05 to the requester (AC-C05-08.5). SELF_APPROVAL_FORBIDDEN
+        including the AC-03 delegate case (BR-07). Reject on rejected → 200; on approved/cancelled → ILLEGAL_TRANSITION.
+        Cancellation of shift change requests is not in the BRD (GAP-SM-09) and has no operation here.
+      x-permission: SCH-08
+      x-module: C05
+      x-scope: team
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Request rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShiftChangeRequest' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+components:
+  schemas:
+    VersionState:
+      type: string
+      enum: [draft, pending_approval, scheduled, in_force, superseded]
+      description: SM-POLICYVER states, reused for shift versions.
+    ShiftDefinition:
+      type: object
+      additionalProperties: false
+      description: Shift shape (SH-01..SH-07, SH-11). Fields left out keep the default or the copied value.
+      properties:
+        shift_type: { type: string, enum: [fixed, flexible, flexible_core, split, night, open], default: fixed }
+        start_time: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        end_time: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        required_minutes: { type: [integer, 'null'], minimum: 1 }
+        required_per: { type: string, enum: [day, week], default: day, description: 'Week starts on OR-02 (AC-C05-01.5).' }
+        core_start: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        core_end: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        flex_earliest_in: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        flex_latest_out: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        window_before_min: { type: integer, minimum: 0, default: 180 }
+        window_after_min: { type: integer, minimum: 0, default: 360 }
+        is_night_shift: { type: boolean, default: false, description: What marks a night shift is OQ-C05-02. }
+        night_attendance_date: { type: string, enum: [shift_start_date, shift_end_date], default: shift_start_date }
+        half_day_split: { type: string, enum: [middle_of_shift, fixed_time], default: middle_of_shift }
+        half_day_split_time: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        segments:
+          type: [array, 'null']
+          description: Split shifts only; shape is OQ-C05-01, so items are kept open.
+          items: { type: object, additionalProperties: true }
+    ShiftVersion:
+      allOf:
+        - $ref: '#/components/schemas/ShiftDefinition'
+        - type: object
+          required: [id, shift_id, effective_from, state]
+          properties:
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+            shift_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+            state: { $ref: '#/components/schemas/VersionState' }
+            crosses_midnight: { type: [boolean, 'null'], description: Derived (end before start). }
+            reason: { type: [string, 'null'] }
+            updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    Shift:
+      type: object
+      required: [id, code, name]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        code: { type: string }
+        name: { type: string }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        current_version: { oneOf: [ { $ref: '#/components/schemas/ShiftVersion' }, { type: 'null' } ] }
+        versions: { type: array, items: { $ref: '#/components/schemas/ShiftVersion' } }
+    EmployeeSchedule:
+      type: object
+      required: [id, employee_id, source, valid_from, valid_to]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        source: { type: string, enum: [fixed_shift, roster] }
+        shift_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        weekly_off_pattern_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ], description: Inclusive; null = open. }
+        reason: { type: [string, 'null'] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    RosterEntry:
+      type: object
+      required: [id, employee_id, roster_date, is_weekly_off, source]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        roster_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        is_weekly_off: { type: boolean }
+        shift_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        shift_version_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        shift_code: { type: [string, 'null'] }
+        source: { type: string, enum: [screen, upload, copy, rotation] }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        updated_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    EmployeeSelection:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      maxProperties: 1
+      description: Exactly one of employee_ids, branch_id or department_id ("team" is undefined, G-15). Applied within scope.
+      properties:
+        employee_ids: { type: array, minItems: 1, maxItems: 500, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+        branch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        department_id: { $ref: 'common.yaml#/components/schemas/Id' }
+    ScheduleDay:
+      type: object
+      required: [date, source, is_weekly_off]
+      properties:
+        date: { $ref: 'common.yaml#/components/schemas/Date' }
+        source: { type: string, enum: [roster, fixed_shift, none] }
+        shift_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        shift_code: { type: [string, 'null'] }
+        shift_name: { type: [string, 'null'] }
+        start_time: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        end_time: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
+        is_weekly_off: { type: boolean }
+        holiday_name: { type: [string, 'null'] }
+    WeeklyOffPattern:
+      type: object
+      required: [id, name, kind]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        name: { type: string }
+        kind: { type: string, enum: [fixed_days, alternating, from_roster] }
+        weekly_days: { type: [array, 'null'], items: { type: integer, minimum: 1, maximum: 7 } }
+        alt_day: { type: [integer, 'null'], minimum: 1, maximum: 7 }
+        alt_weeks: { type: [array, 'null'], items: { type: integer, minimum: 1, maximum: 5 } }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+    HolidayKind:
+      type: string
+      enum: [national, festival, optional]
+    HolidayCalendar:
+      type: object
+      required: [id, name]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        name: { type: string }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        branch_ids: { type: array, items: { $ref: 'common.yaml#/components/schemas/Id' }, description: Branches pointing at this calendar. }
+    Holiday:
+      type: object
+      required: [id, calendar_id, holiday_date, name, kind]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        calendar_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        holiday_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        name: { type: string }
+        kind: { $ref: '#/components/schemas/HolidayKind' }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    OptionalHolidayChoice:
+      type: object
+      required: [employee_id, holiday_id, created_at]
+      properties:
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        holiday_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        holiday_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    ShiftChangeRequest:
+      allOf:
+        - $ref: 'common.yaml#/components/schemas/RequestSummary'
+        - type: object
+          required: [id, employee_id, kind, roster_date, approval_steps]
+          properties:
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            kind: { type: string, enum: [change, swap] }
+            roster_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            requested_shift_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            requested_shift_version_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            swap_with_employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+            reason: { type: [string, 'null'] }
+            decided_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+            approval_steps: { type: array, items: { $ref: 'common.yaml#/components/schemas/ApprovalStep' } }

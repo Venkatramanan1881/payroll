@@ -283,7 +283,7 @@ CREATE TABLE attendance.regularisation_request (
   state                    text NOT NULL DEFAULT 'pending_l1'
                            CHECK (state IN ('pending_l1','pending_l2','approved','rejected','cancelled')),  -- SM-REQ
   escalated                boolean NOT NULL DEFAULT false,                                                    -- SM-REQ R7
-  decided_basis            text CHECK (decided_basis IN ('manual','auto_on_submit','auto_on_timeout')),     -- SM-REQ R2/R5/R8/R9
+  decided_basis            text CHECK (decided_basis IN ('approver','auto_on_submit','auto_on_timeout')),     -- SM-REQ R2/R5/R8/R9
   proposed_in_at           timestamptz,
   proposed_out_at          timestamptz,
   target_raw_punch_id      uuid,                                  -- punch disputed by a wrong_punch request

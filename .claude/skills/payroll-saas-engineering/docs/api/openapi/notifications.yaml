@@ -1,0 +1,286 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Notifications
+  version: 1.0.0-draft
+  description: >-
+    Notifications context (DOMAIN_MODEL §3.13), BRD module C14 (§9.14, NT-01..NT-11 in V1): notification rules per
+    event × channel × recipient, the caller's in-app inbox, and push device-token registration for the mobile app
+    (TSD §14). Defaults per event/channel/recipient are OQ-C14-01. Conventions: docs/api/API_CONVENTIONS.md.
+security:
+  - userToken: []
+tags:
+  - name: Notification rules
+  - name: Inbox
+  - name: Push devices
+paths:
+  /v1/notifications/rules:
+    get:
+      operationId: notifyListRules
+      summary: List notification rules
+      description: >-
+        Every rule as (event_code, channel, recipient_kind, enabled) (US-C14-01, AC-C14-01.1). Only NT-01..NT-11 are
+        offered in V1 (AC-C14-01.8); events whose module or rule group is off are omitted (AC-C14-01.6). Defaults are
+        OQ-C14-01; the recipient kinds are not fixed by the BRD (OQ-C14-01). Returns an ETag for the rule set.
+      tags: [Notification rules]
+      responses:
+        '200':
+          description: The rule set.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/NotificationRule' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: NTF-01
+      x-module: C14
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+    patch:
+      operationId: notifyChangeRules
+      summary: Switch notification rules on or off
+      description: >-
+        Sets `enabled` for each listed (event_code, channel, recipient_kind) (AC-C14-01.1..01.3). Records who, when,
+        old value, new value and reason (G9, AC-C14-01.4). Without the settings right → FORBIDDEN (AC-C14-01.5).
+        With AC-04 = with OA approval the change is a settings_change request awaiting OA approval (BR-07 applies) and
+        the response is 202 with the pending change; whether AC-04 covers notification settings is G-08 (OQ-C03-11).
+        `push` as a channel with its own switch is OQ-C14-02; SMS/WhatsApp availability by plan is OQ-C14-07; alerts
+        from other modules following these switches is OQ-C14-06.
+      tags: [Notification rules]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason, changes]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+                changes:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [event_code, channel, recipient_kind, enabled]
+                    properties:
+                      event_code: { $ref: '#/components/schemas/EventCode' }
+                      channel: { $ref: '#/components/schemas/Channel' }
+                      recipient_kind: { $ref: '#/components/schemas/RecipientKind' }
+                      enabled: { type: boolean }
+      responses:
+        '200':
+          description: Saved; the new rule set.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/NotificationRule' } }
+        '202':
+          description: Submitted for OA approval (AC-04).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [settings_change_id, state]
+                properties:
+                  settings_change_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                  state: { $ref: 'common.yaml#/components/schemas/RequestState' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: NTF-01
+      x-module: C14
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+
+  /v1/notifications/inbox:
+    get:
+      operationId: notifyListInbox
+      summary: The caller's in-app notifications
+      description: >-
+        In-app notifications addressed to the caller, newest first, in the caller's language (N7, UM-R4,
+        AC-C14-02.1). Only the caller's own organisation's data (AC-C14-01.7). `read_at` has no database column yet
+        (notify.notification) and must be added for this route.
+      tags: [Inbox]
+      parameters:
+        - name: unread
+          in: query
+          schema: { type: boolean }
+        - name: event_code
+          in: query
+          schema: { $ref: '#/components/schemas/EventCode' }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of notifications.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/InboxItem' } }
+                  next_cursor: { type: [string, 'null'] }
+                  unread_count: { type: integer, minimum: 0 }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+      x-permission: AUTHENTICATED
+      x-module: C14
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/notifications/inbox/mark-read:
+    post:
+      operationId: notifyMarkInboxRead
+      summary: Mark own in-app notifications as read
+      description: >-
+        Marks the listed notifications, or all of the caller's, as read. Ids not addressed to the caller are ignored
+        (never confirmed to exist). Repeating is harmless.
+      tags: [Inbox]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items: { $ref: 'common.yaml#/components/schemas/Id' }
+                all: { type: boolean, description: 'true = mark every unread notification read; then ids is omitted.' }
+      responses:
+        '204': { $ref: 'common.yaml#/components/responses/NoContent' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+      x-permission: AUTHENTICATED
+      x-module: C14
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: natural
+
+  /v1/notifications/push-devices:
+    post:
+      operationId: notifyRegisterPushDevice
+      summary: Register the caller's mobile device for push
+      description: >-
+        Stores the Firebase token for the signed-in user's device (TSD §14). Registering the same token again
+        refreshes it (upsert on token). A token belongs to one user; registering it for another user moves it.
+        Whether push is a channel with its own rule switch is OQ-C14-02. There is no table for device tokens in the
+        database yet.
+      tags: [Push devices]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, platform]
+              properties:
+                token: { type: string, minLength: 1, maxLength: 4096 }
+                platform: { type: string, enum: [android, ios] }
+                app_version: { type: string, maxLength: 40 }
+      responses:
+        '200':
+          description: Registered.
+          content: { application/json: { schema: { $ref: '#/components/schemas/PushDevice' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+      x-permission: AUTHENTICATED
+      x-module: C14
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+  /v1/notifications/push-devices/{id}:
+    delete:
+      operationId: notifyUnregisterPushDevice
+      summary: Unregister one of the caller's push devices
+      description: Removes the token (sign-out on the device). Unknown or another user's id → 204 (no disclosure).
+      tags: [Push devices]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '204': { $ref: 'common.yaml#/components/responses/NoContent' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+      x-permission: AUTHENTICATED
+      x-module: C14
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+
+components:
+  schemas:
+    EventCode:
+      type: string
+      enum: [NT-01, NT-02, NT-03, NT-04, NT-05, NT-06, NT-07, NT-08, NT-09, NT-10, NT-11]
+      description: V1 events (AC-C14-01.8). The database also accepts NT-12..NT-14 for later releases.
+    Channel:
+      type: string
+      enum: [in_app, email, sms, whatsapp, push]
+      description: push is from TSD §14, not BRD §9.14 (OQ-C14-02).
+    RecipientKind:
+      type: string
+      minLength: 1
+      maxLength: 40
+      description: 'e.g. employee, manager, hr, payroll. List not fixed by the BRD (OQ-C14-01); no DB CHECK.'
+    NotificationRule:
+      type: object
+      required: [event_code, channel, recipient_kind, enabled]
+      properties:
+        event_code: { $ref: '#/components/schemas/EventCode' }
+        channel: { $ref: '#/components/schemas/Channel' }
+        recipient_kind: { $ref: '#/components/schemas/RecipientKind' }
+        enabled: { type: boolean }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        updated_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    InboxItem:
+      type: object
+      required: [id, event_code, created_at, title, body]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        event_code: { $ref: '#/components/schemas/EventCode' }
+        title: { type: string, description: Localised. }
+        body: { type: string, description: Localised. }
+        link:
+          type: [object, 'null']
+          description: What the notification is about, e.g. a request to open.
+          properties:
+            kind: { type: string, description: 'e.g. leave, permission, on_duty, regularisation, comp_off, period.' }
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        read_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+    PushDevice:
+      type: object
+      required: [id, platform, registered_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        platform: { type: string, enum: [android, ios] }
+        app_version: { type: [string, 'null'] }
+        registered_at: { $ref: 'common.yaml#/components/schemas/Instant' }

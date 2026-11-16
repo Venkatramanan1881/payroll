@@ -1,0 +1,480 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Opening Balances
+  version: 1.0.0-draft
+  description: |
+    Opening Balances context (DOMAIN_MODEL §3.12): OpeningBalanceBatch (SM-OB) and its entries. BRD module C15
+    (OB-R1..R5, OB-01, OB-02, R25). Entries cover leave per type, comp-off (M02 only, AC-C15-01.2), permissions used,
+    and late / early counters, each with an as-of date (OB-R2, OB-R4). Advances and loans are V2 (AC-C15-01.3).
+    Confirmation posts opening entries into the owning contexts' ledgers and counters through their use cases;
+    nothing is overwritten (OB-R5). Use in calculations before confirmation: OQ-C15-08. Validation rules for values
+    (negative, above maximum, not eligible): OQ-C15-03.
+security:
+  - userToken: []
+tags:
+  - name: Batches
+  - name: Entries
+
+x-response-sets:
+  read: &read
+    '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+    '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+  write: &write
+    '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+    '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+    '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+    '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+paths:
+  /v1/opening-balances/batches:
+    post:
+      operationId: openingBalancesCreateBatch
+      summary: Create a draft opening-balance batch
+      description: |
+        SM-OB B1 (OB-R1, US-C15-01). Optional initial entries. Entry rules: as-of date mandatory (AC-C15-01.4);
+        employees only within scope (AC-C15-01.5; outside -> NOT_FOUND-style row error, AC-C15-02.3); comp_off only
+        with M02 enabled; leave_type_id required iff balance_kind = leave; permission_type_id iff permission_used.
+        Allowed roles per OB-01 (AC-C15-01.6).
+      tags: [Batches]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                entries: { type: array, maxItems: 500, items: { $ref: '#/components/schemas/EntryInput' } }
+      responses:
+        '201':
+          description: Batch created in draft.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        <<: *write
+      x-permission: OBL-01
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+    get:
+      operationId: openingBalancesListBatches
+      summary: List opening-balance batches
+      description: Batches with state (SM-OB). Filters after scope. OA / PO read is G-34.
+      tags: [Batches]
+      parameters:
+        - { name: state, in: query, schema: { $ref: '#/components/schemas/BatchState' } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of batches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Batch' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: OBL-04
+      x-module: C15
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/opening-balances/batches/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: openingBalancesGetBatch
+      summary: Get a batch
+      description: Batch with state, submitter and confirmer (OB-R5, AC-C15-03.4).
+      tags: [Batches]
+      responses:
+        '200':
+          description: The batch.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        <<: *read
+      x-permission: OBL-04
+      x-module: C15
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/opening-balances/batches/{id}/entries:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: openingBalancesAddEntries
+      summary: Add entries to a draft batch
+      description: |
+        SM-OB B2. Only while the batch is draft; otherwise ILLEGAL_TRANSITION (AC-C15-03.5: confirmed balances change
+        only through openingBalancesChangeEntry). Row errors are returned in `errors` with the row index as field.
+      tags: [Entries]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [entries]
+              properties:
+                entries: { type: array, minItems: 1, maxItems: 500, items: { $ref: '#/components/schemas/EntryInput' } }
+      responses:
+        '200':
+          description: Entries added; batch returned with new ETag.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        <<: *write
+      x-permission: OBL-01
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+    get:
+      operationId: openingBalancesListEntries
+      summary: List entries of a batch
+      description: |
+        Entries with as-of dates; confirmed batches show them as confirmed (R25 basis, AC-C15-03.4). Superseded
+        entries (OB-02 changes) are included when `include_superseded` is true. Employees see their own balances
+        through the leave / permission balance views (US-C15-05), not here.
+      tags: [Entries]
+      parameters:
+        - { name: employee_id, in: query, schema: { $ref: 'common.yaml#/components/schemas/Id' } }
+        - { name: balance_kind, in: query, schema: { $ref: '#/components/schemas/BalanceKind' } }
+        - { name: include_superseded, in: query, schema: { type: boolean, default: false } }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Entry' } }
+                  next_cursor: { type: [string, 'null'] }
+        <<: *read
+      x-permission: OBL-04
+      x-module: C15
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/opening-balances/batches/{id}/entries/{entry_id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+      - $ref: '#/components/parameters/EntryId'
+    patch:
+      operationId: openingBalancesEditEntry
+      summary: Edit an entry of a draft batch
+      description: SM-OB B2. Draft only, else ILLEGAL_TRANSITION. Validation per OQ-C15-03.
+      tags: [Entries]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                value: { $ref: '#/components/schemas/BalanceValue' }
+                as_of_date: { $ref: 'common.yaml#/components/schemas/Date' }
+      responses:
+        '200':
+          description: Entry updated.
+          headers:
+            ETag: { $ref: 'common.yaml#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        <<: *write
+      x-permission: OBL-01
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+    delete:
+      operationId: openingBalancesRemoveEntry
+      summary: Remove an entry from a draft batch
+      description: SM-OB B2. Draft only, else ILLEGAL_TRANSITION. Discarding a whole draft batch is GAP-SM-13.
+      tags: [Entries]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      responses:
+        '204': { $ref: 'common.yaml#/components/responses/NoContent' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        <<: *write
+      x-permission: OBL-01
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+
+  /v1/opening-balances/batches/{id}/uploads:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: openingBalancesUpload
+      summary: Upload a spreadsheet of entries into a draft batch (job)
+      description: |
+        OB-R3 (US-C15-02). The file comes from POST /v1/files/upload-links (purpose `opening_balances`), held privately
+        in the organisation's area (TB-02, AC-C15-02.4). Runs as a job; the finished job carries `error_report_url`
+        listing each invalid row with its reason (AC-C15-02.2): unknown employee code, unknown leave type, missing
+        as-of date, non-numeric value, employee of another organisation or outside scope (reported without revealing
+        anything, AC-C15-02.3). Whether valid rows are saved when others fail, or the whole file is rejected, is
+        OQ-C15-09 (G-H). Draft only, else ILLEGAL_TRANSITION. Wrong file type -> FILE_TYPE_NOT_ALLOWED.
+      tags: [Entries]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [file]
+              properties:
+                file: { $ref: 'common.yaml#/components/schemas/FileRef' }
+      responses:
+        '202': { $ref: 'common.yaml#/components/responses/Accepted' }
+        <<: *write
+      x-permission: OBL-01
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/opening-balances/batches/{id}/submit:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: openingBalancesSubmitBatch
+      summary: Submit a draft batch for Organisation Admin approval
+      description: |
+        SM-OB B4: draft -> pending_approval, only when OB-01 = HR Manager with Organisation Admin approval (otherwise
+        ILLEGAL_TRANSITION; confirm directly). Whether approval covers entry, confirmation or both is OQ-C15-07 /
+        G-32; this contract places it at confirmation only. Submit on pending_approval -> 200.
+      tags: [Batches]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Current batch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        <<: *write
+      x-permission: OBL-02
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RequestSubmitted]
+      x-idempotent: key
+
+  /v1/opening-balances/batches/{id}/confirm:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: openingBalancesConfirmBatch
+      summary: Confirm a batch (HR directly, or Organisation Admin approval)
+      description: |
+        SM-OB B3 (draft -> confirmed, by HR when OB-01 = HR Manager, AC-C15-03.1) or B5 (pending_approval ->
+        confirmed, by the Organisation Admin as approval, AC-C15-03.2). Confirming locks the batch and posts opening
+        entries into ledgers and counters from each as-of date (OB-R4, OB-R5). B5: SELF_APPROVAL_FORBIDDEN when the
+        approver submitted or entered the batch (BR-07, AC-C15-03.3), including when acting as a delegate (AC-03).
+        Draft confirmed directly while OB-01 requires approval -> ILLEGAL_TRANSITION. Confirm on confirmed -> 200, no
+        second posting. Scope of the OA approval: G-32 (OQ-C15-07). Comp-off expiry of opening credits: OQ-C15-02.
+      tags: [Batches]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ApprovalDecision' }
+      responses:
+        '200':
+          description: Batch confirmed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        <<: *write
+      x-permission: OBL-02
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: [OpeningBalanceConfirmed]
+      x-idempotent: key
+
+  /v1/opening-balances/batches/{id}/reject:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: openingBalancesRejectBatch
+      summary: Organisation Admin rejects a batch pending approval
+      description: |
+        SM-OB B6. The resulting state (back to draft or otherwise) is not in the BRD (GAP-SM-13); the response returns
+        the batch in whatever state the answer defines. Reason mandatory. SELF_APPROVAL_FORBIDDEN (BR-07) for the
+        submitter, also via delegation (AC-03). Not pending_approval -> ILLEGAL_TRANSITION.
+      tags: [Batches]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/RejectionDecision' }
+      responses:
+        '200':
+          description: Current batch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        <<: *write
+      x-permission: OBL-02
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/opening-balances/entries/{entry_id}/change:
+    parameters:
+      - $ref: '#/components/parameters/EntryId'
+    post:
+      operationId: openingBalancesChangeEntry
+      summary: Change a confirmed opening balance with a reason
+      description: |
+        SM-OB B7 (OB-02, US-C15-04): posts a reversal plus a new entry (the old entry gets `superseded_by_entry_id`);
+        nothing is overwritten (OB-R5). OB-02 = not allowed -> RULE_GROUP_DISABLED (AC-C15-04.1). Reason mandatory
+        (AC-C15-04.2). Logged with who, when, old, new and reason (AC-C15-04.3, G9). Entry not in a confirmed batch
+        -> ILLEGAL_TRANSITION. Whether the Organisation Admin must approve the change is G-32 (OQ-C15-07). As-of date
+        in a locked period, or balance already used: OQ-C15-04 (recalculated forward vs posted as a PeriodAdjustment);
+        a locked period's results are never changed (BR-06).
+      tags: [Entries]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [value, reason]
+              properties:
+                value: { $ref: '#/components/schemas/BalanceValue' }
+                as_of_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: New entry (the superseded one is linked to it).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        <<: *write
+      x-permission: OBL-03
+      x-module: C15
+      x-scope: branch-department
+      x-audit: true
+      x-events: [OpeningBalanceConfirmed]
+      x-idempotent: key
+
+components:
+  securitySchemes:
+    userToken: { $ref: 'common.yaml#/components/securitySchemes/userToken' }
+  parameters:
+    EntryId:
+      name: entry_id
+      in: path
+      required: true
+      schema: { $ref: 'common.yaml#/components/schemas/Id' }
+  schemas:
+    BatchState:
+      type: string
+      enum: [draft, pending_approval, confirmed]
+    BalanceKind:
+      type: string
+      enum: [leave, comp_off, permission_used, late_counter, early_counter]
+    BalanceValue:
+      type: string
+      pattern: '^-?[0-9]{1,5}\.[0-9]{2}$'
+      description: 'Decimal string, 2 places (numeric(7,2)): days for leave / comp-off, count for permissions used and counters. Negative values: OQ-C15-03.'
+    EntryInput:
+      type: object
+      additionalProperties: false
+      required: [employee_id, balance_kind, value, as_of_date]
+      properties:
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        balance_kind: { $ref: '#/components/schemas/BalanceKind' }
+        leave_type_id: { $ref: 'common.yaml#/components/schemas/Id', description: Required iff balance_kind = leave. }
+        permission_type_id: { $ref: 'common.yaml#/components/schemas/Id', description: Required iff balance_kind = permission_used. }
+        value: { $ref: '#/components/schemas/BalanceValue' }
+        as_of_date: { $ref: 'common.yaml#/components/schemas/Date' }
+    Entry:
+      type: object
+      required: [id, batch_id, employee_id, balance_kind, value, as_of_date]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        batch_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        balance_kind: { $ref: '#/components/schemas/BalanceKind' }
+        leave_type_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        permission_type_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        value: { $ref: '#/components/schemas/BalanceValue' }
+        as_of_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        change_reason: { type: [string, 'null'] }
+        superseded_by_entry_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    Batch:
+      type: object
+      required: [id, state, created_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        state: { $ref: '#/components/schemas/BatchState' }
+        entry_count: { type: integer, minimum: 0 }
+        upload: { oneOf: [ { $ref: 'common.yaml#/components/schemas/FileRef' }, { type: 'null' } ] }
+        created_by: { $ref: 'common.yaml#/components/schemas/Id' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        submitted_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        confirmed_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        confirmed_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        approval_steps: { type: array, items: { $ref: 'common.yaml#/components/schemas/ApprovalStep' } }

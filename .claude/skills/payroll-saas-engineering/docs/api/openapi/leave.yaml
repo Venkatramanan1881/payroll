@@ -1,0 +1,1044 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Leave & Absence
+  version: 1.0.0-draft
+  description: >-
+    Leave & Absence context (DOMAIN_MODEL §3.9), BRD module C08 Leave (LM-R1..LM-R9, LM-01..LM-32, LV-01..LV-04):
+    leave types and their append-only versions, leave balances and the leave ledger, leave requests (SM-REQ),
+    manual ledger adjustments, absconding cases (SM-ABS) and the read-only absence classification view.
+    Also hosts the generic approval inbox (`/v1/approvals/pending`, DOMAIN_MODEL §6, AC-02, AC-03).
+    Comp-off lives in comp-off.yaml, permissions and on-duty in permissions.yaml.
+    Conventions: docs/api/API_CONVENTIONS.md. Errors: docs/api/ERROR_CATALOG.md.
+security:
+  - userToken: []
+tags:
+  - name: Leave types
+  - name: Leave balances
+  - name: Leave requests
+  - name: Absconding
+  - name: Absence classification
+  - name: Approvals
+paths:
+  /v1/leave/types:
+    get:
+      operationId: leaveListTypes
+      summary: List leave types
+      description: >-
+        Lists the organisation's leave types with the version in force on `on_date` (default today). Callers holding
+        LVE-01 see every type; other signed-in users see only the types they are eligible for (AC-C08-01.1, AC-C08-01.2,
+        LM-01). Organisation isolation: AC-C08-01.5. The matrix has no separate "view leave type" row; reading the
+        offered types is part of applying (LVE-02).
+      tags: [Leave types]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: on_date
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Date' }
+        - name: include_retired
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Page of leave types.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/LeaveType' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: AUTHENTICATED
+      x-module: C08
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+    post:
+      operationId: leaveCreateType
+      summary: Create a leave type with its first version
+      description: >-
+        Creates a LeaveType and its first LeaveTypeVersion (LM-R1, LM-01..LM-15, US-C08-01; AC-C08-01.1, AC-C08-01.4).
+        `code` and `name` are unique in the organisation (a clash is a VALIDATION_FAILED field error).
+        Records who, when, new value and reason (G9). Whether AC-04 = "with OA approval" also covers leave types
+        is G-08 (OQ-C03-11); this contract saves directly and leaves an approval step to that decision.
+        Eligibility "by payroll group" is OQ-C08-01; LM-06 = encash in V1 is OQ-C08-05.
+      tags: [Leave types]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, name, version]
+              properties:
+                code: { type: string, minLength: 1, maxLength: 20 }
+                name: { type: string, minLength: 1, maxLength: 100 }
+                version: { $ref: '#/components/schemas/LeaveTypeVersionInput' }
+      responses:
+        '201':
+          description: Created.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveType' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: LVE-01
+      x-module: C08
+      x-scope: org
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/leave/types/{id}:
+    get:
+      operationId: leaveGetType
+      summary: Get a leave type with all its versions
+      description: Returns the type and its version history, oldest first (G5, BR-05; AC-C08-01.3).
+      tags: [Leave types]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The leave type.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveTypeWithVersions' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: AUTHENTICATED
+      x-module: C08
+      x-scope: org
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/leave/types/{id}/versions:
+    post:
+      operationId: leavePublishTypeVersion
+      summary: Publish a new version of a leave type
+      description: >-
+        Leave type versions are append-only (G5, AC-C08-01.3): a change is a new version with `effective_from`;
+        earlier versions are never edited. A version whose `effective_from` equals an existing one is refused with
+        VERSION_FROZEN. `reason` is required (G9). A version whose `effective_from` falls in a locked period does
+        not change locked results (BR-06); back-dating rules are GAP-SM-16. AC-04 approval coverage: G-08 (OQ-C03-11).
+        Open days from `effective_from` are recalculated (BR-03).
+      tags: [Leave types]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/LeaveTypeVersionInput'
+      responses:
+        '201':
+          description: Version published.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveTypeVersion' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: LVE-01
+      x-module: C08
+      x-scope: org
+      x-audit: true
+      x-events: [PolicyVersionActivated]
+      x-idempotent: key
+
+  /v1/leave/employees/{employee_id}/balances:
+    get:
+      operationId: leaveGetBalances
+      summary: Leave balances of an employee
+      description: >-
+        Balance per leave type = sum of ledger entries (LM-R4); never stored. Reflects approvals and cancellations at
+        once (AC-C08-06.1, AC-C08-06.2). When M02 is enabled the comp-off balance is included (LM-R8, AC-C08-06.3,
+        AC-M02-05.1); when disabled the field is absent. Whether pending requests reserve balance (available vs booked)
+        is OQ-C08-08, so `pending_days` is informational only. Employees see their own only (AC-C08-06.6); Manager
+        access to team balances is G-39; OA/PO/MGR cells are "?" in the matrix.
+      tags: [Leave balances]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+        - name: on_date
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Date' }
+      responses:
+        '200':
+          description: Balances.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [employee_id, balances]
+                properties:
+                  employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                  balances:
+                    type: array
+                    items:
+                      type: object
+                      required: [leave_type_id, account_id, balance]
+                      properties:
+                        leave_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        leave_type_name: { type: string }
+                        account_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        balance: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+                        pending_days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+                  comp_off_balance: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: LVE-08
+      x-module: C08
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/leave/employees/{employee_id}/ledger:
+    get:
+      operationId: leaveListLedger
+      summary: Leave ledger entries of an employee
+      description: >-
+        Append-only ledger (LM-R4, BR-01). Each entry shows date, type, days, kind, reason and its cause (request,
+        penalty, day result, run) (AC-C08-06.4, AC-C08-02.8, AC-C08-15.2). Cancellation shows as a reversal entry,
+        never a deletion (AC-C08-06.2). Same access as balances (LVE-08, G-39).
+      tags: [Leave balances]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+        - name: leave_type_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - name: entry_kind
+          in: query
+          schema: { $ref: '#/components/schemas/LedgerEntryKind' }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of ledger entries, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/LeaveLedgerEntry' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: LVE-08
+      x-module: C08
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/leave/employees/{employee_id}/ledger-adjustments:
+    post:
+      operationId: leavePostLedgerAdjustment
+      summary: Post a manual leave ledger adjustment
+      description: >-
+        Posts one `adjustment` entry with a mandatory reason to the employee's account for the type (DOMAIN_MODEL §3.9;
+        DB CHECK adjustment ⇒ reason). Nothing is overwritten. Who may post it and whether it needs approval is G-26
+        (matrix "?" for HR); this contract posts directly and an approval step, if G-26 requires one, would be added
+        without breaking this shape. A negative adjustment below the LM-07 allowance is refused with LIMIT_EXCEEDED.
+        An `entry_date` in a locked period is refused with PERIOD_LOCKED (a balance entry has no PeriodAdjustment
+        form under SM-ADJ).
+      tags: [Leave balances]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [leave_type_id, quantity, entry_date, reason]
+              properties:
+                leave_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                quantity:
+                  allOf: [ { $ref: 'common.yaml#/components/schemas/DayQuantity' } ]
+                  description: Signed days, non-zero (DB CHECK quantity <> 0).
+                entry_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '201':
+          description: Entry posted.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveLedgerEntry' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: LVE-07
+      x-module: C08
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/leave/employees/{employee_id}/absence-classification:
+    get:
+      operationId: leaveGetAbsenceClassification
+      summary: Absence classification and absence-rule results for an employee
+      description: >-
+        Read-only engine results; nothing here is set by a user (BR-02, BR-08). Per absent day: classification
+        informed_leave / unpaid_leave / uninformed_absence (LM-R6, AC-C08-09.1..09.3, 09.7) and the day effects that
+        came from absence rules: `absence_lop` (LM-28, AC-C08-09.4), `uninformed_absence_cut` (LM-21/LM-22,
+        AC-C08-10.2..10.5); sandwiched days (LM-16..LM-20, AC-C08-08.x) appear with `sandwiched: true`. Excess absence
+        cuts (LM-25, LM-26, AC-C08-11.1) are period results listed under `period_penalties`. Each item carries its
+        explanation (BR-08), filtered for employees by AC-05. Open: DS-10 vs LM-28 (OQ-C08-12), LM-27 comparison
+        (OQ-C08-14), month definition (OQ-C08-15). Uses the attendance view right ATT-01.
+      tags: [Absence classification]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+        - name: from
+          in: query
+          required: true
+          schema: { $ref: 'common.yaml#/components/schemas/Date' }
+        - name: to
+          in: query
+          required: true
+          schema: { $ref: 'common.yaml#/components/schemas/Date' }
+      responses:
+        '200':
+          description: Classification for the range (max 62 days).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [employee_id, days, period_penalties]
+                properties:
+                  employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                  days:
+                    type: array
+                    items:
+                      type: object
+                      required: [absence_date, classification, sandwiched, effects]
+                      properties:
+                        absence_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                        classification: { type: string, enum: [informed_leave, unpaid_leave, uninformed_absence] }
+                        sandwiched: { type: boolean }
+                        result_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        effects:
+                          type: array
+                          items:
+                            type: object
+                            required: [effect_kind, reason_code, rule_ref]
+                            properties:
+                              effect_kind: { type: string, enum: [absence_lop, uninformed_absence_cut] }
+                              days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+                              reason_code: { type: string }
+                              rule_ref: { type: string }
+                        explanation: { type: array, items: { $ref: 'common.yaml#/components/schemas/ExplanationStep' } }
+                  period_penalties:
+                    type: array
+                    items:
+                      type: object
+                      required: [period_id, rule_ref]
+                      properties:
+                        period_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        rule_ref: { type: string, enum: [LM-25, LM-26] }
+                        days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+                        explanation: { type: array, items: { $ref: 'common.yaml#/components/schemas/ExplanationStep' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+      x-permission: ATT-01
+      x-module: C08
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+  /v1/leave/requests:
+    post:
+      operationId: leaveSubmitRequest
+      summary: Apply for leave (own)
+      description: >-
+        Employee applies for full-day or half-day leave for themself; the employee comes from the token, so applying
+        for someone else is impossible here (AC-C08-04.10). Checks at submission, each refusing with no request created
+        (SM-REQ): eligibility LM-01 / notice-period LM-15 = block → NOT_ELIGIBLE (AC-C08-01.2, AC-C08-04.9);
+        notice LM-09 and past-date window LM-11 → OUTSIDE_REQUEST_WINDOW (AC-C08-04.3, 04.5); balance LM-07 and
+        max consecutive LM-10 → LIMIT_EXCEEDED (AC-C08-04.7, 04.4); overlap with an active request or LM-14 = block
+        → OVERLAPPING_REQUEST (AC-C08-04.8); half day with LM-08 off or missing LM-12 document → VALIDATION_FAILED
+        (AC-C08-04.2, 04.6). On success the request is pending_l1 with the AC-02 approver (AC-C08-04.1, SM-REQ R1);
+        the balance does not change until approval. Pending requests reserving balance: OQ-C08-08. LM-15 = extend
+        notice: OQ-C08-07. Taking comp-off as leave: OQ-M02-08 (see comp-off.yaml).
+      tags: [Leave requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: '#/components/schemas/LeaveRequestInput' } ]
+              unevaluatedProperties: false
+      responses:
+        '201':
+          description: Submitted.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: LVE-02
+      x-module: C08
+      x-scope: self
+      x-audit: true
+      x-events: [RequestSubmitted]
+      x-idempotent: key
+    get:
+      operationId: leaveListRequests
+      summary: List leave requests
+      description: >-
+        Requests visible to the caller after scope: an employee sees their own; approvers see requests in their scope
+        (AC-07, AC-C08-05.8). Filters apply after scope. The matrix has no separate "view leave request" row; the
+        listed codes are the ones whose holders need this read.
+      tags: [Leave requests]
+      parameters:
+        - name: employee_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: state
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/RequestState' }
+        - name: leave_type_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - name: sort
+          in: query
+          schema: { type: string, enum: [submitted_at, -submitted_at, from_date, -from_date], default: -submitted_at }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/LeaveRequest' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: [LVE-02, LVE-04, LVE-05, LVE-08]
+      x-module: C08
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/leave/requests/on-behalf:
+    post:
+      operationId: leaveSubmitRequestOnBehalf
+      summary: Apply for leave on behalf of an employee
+      description: >-
+        Same checks and outcome as leaveSubmitRequest, for the employee named in the body; `requested_by` records the
+        caller. Whether HR or a Manager may do this at all, and who then approves, is G-25 (matrix "?"); the grant
+        is off until decided. BR-07 still applies at approval: the caller cannot approve a request they raised.
+      tags: [Leave requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/LeaveRequestInput'
+                - type: object
+                  required: [employee_id]
+                  properties:
+                    employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+              unevaluatedProperties: false
+      responses:
+        '201':
+          description: Submitted.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: LVE-03
+      x-module: C08
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RequestSubmitted]
+      x-idempotent: key
+  /v1/leave/requests/{id}:
+    get:
+      operationId: leaveGetRequest
+      summary: Get a leave request with its approval steps
+      description: Request, per-day breakdown and approval history (SM-REQ, §16). Out-of-scope requests return NOT_FOUND (AC-C08-05.8).
+      tags: [Leave requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The request.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: [LVE-02, LVE-04, LVE-05, LVE-08]
+      x-module: C08
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/leave/requests/{id}/approve:
+    post:
+      operationId: leaveApproveRequest
+      summary: Approve a leave request at the caller's level
+      description: >-
+        SM-REQ R4/R5. Level 1 (LVE-04) moves to pending_l2 when LM-13 = manager then HR (AC-C08-05.2), else to
+        approved; level 2 (LVE-05) approves. Final approval re-validates balance (LM-07 → LIMIT_EXCEEDED), posts the
+        ledger debit (plus sandwich debit) and triggers recalculation (AC-C08-05.1, AC-C08-05.10, AC-C08-12.1..12.3).
+        BR-07: the requester, or a delegate acting for the requester, gets 403 SELF_APPROVAL_FORBIDDEN (AC-C08-05.5).
+        AC-03: a delegate of the routed approver may act; the step records actor and on-behalf-of (AC-C08-05.7).
+        Not routed to the caller, or outside scope → NOT_FOUND. Approve on approved → 200, no second debit;
+        on rejected/cancelled → ILLEGAL_TRANSITION. Dates in a locked period: the locked period is unchanged and the
+        difference is posted to the next open period as a PeriodAdjustment (SM-ADJ Q1, AC-C08-12.4); beyond PL-07
+        → ADJUSTMENT_WINDOW_EXCEEDED (outcome OQ-C12-04). Requests pending at lock: OQ-C12-03. Auto-approve with
+        insufficient balance: OQ-C08-08.
+      tags: [Leave requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ApprovalDecision' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state after the approval.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [LVE-04, LVE-05]
+      x-module: C08
+      x-scope: team
+      x-audit: true
+      x-events: [RequestApprovedAtLevel, RequestApproved, AdjustmentPosted]
+      x-idempotent: key
+  /v1/leave/requests/{id}/reject:
+    post:
+      operationId: leaveRejectRequest
+      summary: Reject a leave request
+      description: >-
+        SM-REQ R6 with a mandatory reason; no ledger entry (AC-C08-05.3). BR-07 → SELF_APPROVAL_FORBIDDEN, including
+        a delegate acting on their own request (AC-C08-05.5); AC-03 delegate recorded (AC-C08-05.7). Reject on
+        rejected → 200 current state; on approved/cancelled → ILLEGAL_TRANSITION.
+      tags: [Leave requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/RejectionDecision' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state after the rejection.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [LVE-04, LVE-05]
+      x-module: C08
+      x-scope: team
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/leave/requests/bulk-decisions:
+    post:
+      operationId: leaveBulkDecideRequests
+      summary: Approve or reject several leave requests at once
+      description: >-
+        LM-R3 bulk action: one SM-REQ R4/R5 (or R6) per request, each audited individually with the same actor and
+        time (AC-C08-05.4). The batch is not atomic: each item reports its own outcome. Items refused for BR-07
+        (AC-C08-05.5), state, scope or balance carry the Problem `code` (SELF_APPROVAL_FORBIDDEN, ILLEGAL_TRANSITION,
+        NOT_FOUND, LIMIT_EXCEEDED, ...). AC-03 delegation and locked-date handling as in leaveApproveRequest.
+      tags: [Leave requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision, request_ids]
+              properties:
+                decision: { type: string, enum: [approve, reject] }
+                request_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  uniqueItems: true
+                  items: { $ref: 'common.yaml#/components/schemas/Id' }
+                comment: { type: string, maxLength: 1000 }
+                reason: { type: string, minLength: 1, maxLength: 1000, description: Required when decision = reject. }
+      responses:
+        '200':
+          description: Per-item results.
+          content: { application/json: { schema: { $ref: '#/components/schemas/BulkDecisionResult' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: [LVE-04, LVE-05]
+      x-module: C08
+      x-scope: team
+      x-audit: true
+      x-events: [RequestApprovedAtLevel, RequestApproved, AdjustmentPosted]
+      x-idempotent: key
+  /v1/leave/requests/{id}/cancel:
+    post:
+      operationId: leaveCancelRequest
+      summary: Cancel a pending or approved leave request
+      description: >-
+        SM-REQ R10 (pending) or R11 (approved). Cancelling approved leave posts a reversal ledger entry, never a delete,
+        and recalculates open days (AC-C08-06.2, AC-C08-07.1); dates in a locked period are unchanged and the
+        difference posts to the next open period tagged with the original date (SM-ADJ Q1, AC-C08-07.2; PL-07 window
+        OQ-C12-04). Actor, time and reason are recorded (AC-C08-07.3). Who may cancel (employee, approver, HR), until
+        when, and whether cancelling approved leave needs approval is OQ-C08-10 (G-24): role grants stay "?" and this
+        contract takes no position; a decided approval step would be additive. Cancel on cancelled → 200;
+        on rejected → ILLEGAL_TRANSITION.
+      tags: [Leave requests]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ReasonRequired' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Current state after cancellation.
+          content: { application/json: { schema: { $ref: '#/components/schemas/LeaveRequest' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: LVE-06
+      x-module: C08
+      x-scope: branch-department
+      x-audit: true
+      x-events: [RequestCancelled, AdjustmentPosted]
+      x-idempotent: key
+
+  /v1/leave/absconding-cases:
+    get:
+      operationId: leaveListAbscondingCases
+      summary: List absconding cases
+      description: >-
+        AbscondingCase (SM-ABS), opened by job J8 when LM-29 is on and LM-30 continuous uninformed days are reached
+        (AC-C08-13.1..13.4). Shows the pay-hold flag (LM-31; V1 meaning OQ-C08-13). Counting rule: OQ-C08-17.
+        Uses the absconding right ATT-12 (HR, scoped).
+      tags: [Absconding]
+      parameters:
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/AbscondingState' }
+        - name: employee_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of cases.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AbscondingCase' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: ATT-12
+      x-module: C08
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/leave/absconding-cases/{id}:
+    get:
+      operationId: leaveGetAbscondingCase
+      summary: Get an absconding case
+      description: SM-ABS case detail (LM-29..LM-32).
+      tags: [Absconding]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The case.
+          content: { application/json: { schema: { $ref: '#/components/schemas/AbscondingCase' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: ATT-12
+      x-module: C08
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/leave/absconding-cases/{id}/return-to-active:
+    post:
+      operationId: leaveReturnAbscondingToActive
+      summary: Return the employee to active
+      description: >-
+        SM-ABS K2: open → closed_returned with a mandatory reason; the pay hold is released; actor, time and reason
+        recorded (LM-32, AC-C08-13.5). Repeat on closed_returned → 200; on closed_offboarding → ILLEGAL_TRANSITION.
+        Automatic close when leave is approved later or the employee punches again is OQ-C08-16 / GAP-SM-14.
+      tags: [Absconding]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ReasonRequired' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Case after the command.
+          content: { application/json: { schema: { $ref: '#/components/schemas/AbscondingCase' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: ATT-12
+      x-module: C08
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/leave/absconding-cases/{id}/start-offboarding:
+    post:
+      operationId: leaveStartAbscondingOffboarding
+      summary: Start offboarding for an absconding employee
+      description: >-
+        SM-ABS K3: open → closed_offboarding; records that offboarding was started, with actor and time (LM-32,
+        AC-C08-13.6, §21 note 4). What "start offboarding" changes in V1 (employment status path SM-EMP E6, the
+        pay hold) is GAP-SM-14; this contract only closes the case. Repeat → 200; from closed_returned →
+        ILLEGAL_TRANSITION.
+      tags: [Absconding]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ReasonRequired' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Case after the command.
+          content: { application/json: { schema: { $ref: '#/components/schemas/AbscondingCase' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: ATT-12
+      x-module: C08
+      x-scope: branch-department
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+
+  /v1/approvals/pending:
+    get:
+      operationId: approvalsListPending
+      summary: Pending approvals for the caller, all request types
+      description: >-
+        One inbox over every SM-REQ request type and the other approval aggregates of DOMAIN_MODEL §6, listing items
+        currently routed to the caller at their level by AC-02, including items delegated to the caller (AC-03; the
+        item carries `on_behalf_of_user_id`). Items the caller raised are never listed (BR-07). Items whose module is
+        disabled are omitted (MD-03). Each item gives `request_type` and `request_id`; act on it through that type's
+        approve/reject operation. Any role can be a routed approver (PERMISSION_MATRIX P6), so the route is
+        AUTHENTICATED and filtered to the caller. `x-module: C03` (approval routing, AC-02/AC-03) is chosen because the
+        inbox spans modules. Escalated items: target is OQ-C08-09 / OQ-C09-06; whether delegates also get NT-05/NT-06
+        is OQ-C14-09.
+      tags: [Approvals]
+      parameters:
+        - name: request_type
+          in: query
+          schema: { $ref: '#/components/schemas/ApprovalRequestType' }
+        - name: escalated
+          in: query
+          schema: { type: boolean }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [submitted_at, -submitted_at], default: submitted_at }
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of pending items.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [request_type, request_id, level, submitted_at, escalated]
+                      properties:
+                        request_type: { $ref: '#/components/schemas/ApprovalRequestType' }
+                        request_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        level: { type: integer, enum: [1, 2] }
+                        employee_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                        employee_name: { type: [string, 'null'] }
+                        requester_user_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        on_behalf_of_user_id:
+                          oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ]
+                          description: Set when the item reached the caller by delegation (AC-03).
+                        summary: { type: string, description: Short localised description, e.g. "Casual leave 12-14 Nov". }
+                        submitted_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                        escalated: { type: boolean }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+      x-permission: AUTHENTICATED
+      x-module: C03
+      x-scope: self
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+components:
+  schemas:
+    DecidedBasis:
+      type: [string, 'null']
+      enum: [approver, auto_on_submit, auto_on_timeout, null]
+      description: DB CHECK values (leave_request.decided_basis). Null while pending.
+    ApprovalStatus:
+      type: object
+      required: [state, escalated, submitted_at]
+      properties:
+        state: { $ref: 'common.yaml#/components/schemas/RequestState' }
+        escalated: { type: boolean }
+        decided_basis: { $ref: '#/components/schemas/DecidedBasis' }
+        current_approver_user_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        submitted_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        cancelled_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        cancelled_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        steps: { type: array, items: { $ref: 'common.yaml#/components/schemas/ApprovalStep' } }
+    ApprovalRequestType:
+      type: string
+      enum: [leave, permission, on_duty, regularisation, comp_off, shift_change, punch_flag, period_unlock, settings_change, opening_balance]
+      description: app.approval_step.request_type CHECK values.
+    BulkDecisionResult:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [request_id, outcome]
+            properties:
+              request_id: { $ref: 'common.yaml#/components/schemas/Id' }
+              outcome: { type: string, enum: [done, refused] }
+              state: { $ref: 'common.yaml#/components/schemas/RequestState' }
+              error: { $ref: 'common.yaml#/components/schemas/Problem' }
+    DayPart:
+      type: string
+      enum: [full, first_half, second_half]
+    LeaveRequestInput:
+      type: object
+      description: Closed by unevaluatedProperties false at each use.
+      required: [leave_type_id, from_date, to_date]
+      properties:
+        leave_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        from_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        to_date: { $ref: 'common.yaml#/components/schemas/Date', description: '>= from_date.' }
+        from_part: { allOf: [ { $ref: '#/components/schemas/DayPart' } ], default: full }
+        to_part:
+          allOf: [ { $ref: '#/components/schemas/DayPart' } ]
+          default: full
+          description: For a one-day request must equal from_part (DB CHECK).
+        reason: { type: string, maxLength: 1000 }
+        document: { $ref: 'common.yaml#/components/schemas/FileRef' }
+    LeaveRequest:
+      allOf:
+        - $ref: '#/components/schemas/ApprovalStatus'
+        - type: object
+          required: [id, employee_id, leave_type_id, from_date, to_date, from_part, to_part, requested_by, days]
+          properties:
+            id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            leave_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            from_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            to_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            from_part: { $ref: '#/components/schemas/DayPart' }
+            to_part: { $ref: '#/components/schemas/DayPart' }
+            reason: { type: [string, 'null'] }
+            document_path: { type: [string, 'null'] }
+            requested_by: { $ref: 'common.yaml#/components/schemas/Id' }
+            days:
+              type: array
+              items:
+                type: object
+                required: [leave_date, fraction]
+                properties:
+                  leave_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                  fraction: { type: string, enum: ['0.50', '1.00'] }
+                  half: { type: [string, 'null'], enum: [first_half, second_half, null] }
+    LeaveType:
+      type: object
+      required: [id, code, name]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        code: { type: string }
+        name: { type: string }
+        retired_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        current_version: { $ref: '#/components/schemas/LeaveTypeVersion' }
+    LeaveTypeWithVersions:
+      allOf:
+        - $ref: '#/components/schemas/LeaveType'
+        - type: object
+          required: [versions]
+          properties:
+            versions: { type: array, items: { $ref: '#/components/schemas/LeaveTypeVersion' } }
+    LeaveTypeVersionInput:
+      type: object
+      additionalProperties: false
+      required: [effective_from, reason, paid, eligibility, credit_method, accrual_timing, proration, year_end, negative_allowed_days, half_day_allowed, min_notice_days, approval_levels, timeout_action, during_notice, combine_allowed]
+      description: Columns of leave.leave_type_version (LM-01..LM-15). Days are DayQuantity strings.
+      properties:
+        effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        reason: { type: string, minLength: 1, maxLength: 1000, description: G9 change reason. }
+        paid: { type: boolean, description: LM-R1 }
+        eligibility:
+          type: object
+          description: LM-01 category / employee type / after probation. Payroll group is OQ-C08-01.
+          additionalProperties: false
+          properties:
+            category_ids: { type: array, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+            employee_type_ids: { type: array, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+            after_probation: { type: boolean }
+        credit_method: { type: string, enum: [annual_grant, monthly_accrual, quarterly_accrual, earned_by_days_worked], description: LM-02 }
+        credit_days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        earn_per_worked_days: { type: integer, minimum: 1, description: Required iff credit_method = earned_by_days_worked (OQ-C08-04). }
+        accrual_timing: { type: string, enum: [start, end], description: LM-03 }
+        proration: { type: string, enum: [prorated, full, none], description: LM-04 (formula OQ-C08-03) }
+        max_balance: { $ref: 'common.yaml#/components/schemas/DayQuantity', description: LM-05 }
+        year_end: { type: string, enum: [carry_forward, lapse, encash], description: LM-06 (encash in V1 OQ-C08-05) }
+        carry_forward_max: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        negative_allowed_days: { $ref: 'common.yaml#/components/schemas/DayQuantity', description: LM-07 }
+        half_day_allowed: { type: boolean, description: LM-08 }
+        min_notice_days: { type: integer, minimum: 0, description: LM-09 }
+        max_consecutive_days: { $ref: 'common.yaml#/components/schemas/DayQuantity', description: LM-10 }
+        after_event_days: { type: integer, minimum: 0, description: 'LM-11; null = not allowed.' }
+        document_after_days: { $ref: 'common.yaml#/components/schemas/DayQuantity', description: LM-12 }
+        approval_levels: { type: string, enum: [manager, manager_then_hr], description: LM-13 }
+        timeout_action: { type: string, enum: [escalate, auto_approve, auto_reject], description: LM-13 }
+        timeout_days: { type: integer, minimum: 1 }
+        combine_allowed: { type: boolean, description: LM-14 }
+        during_notice: { type: string, enum: [allow, block, extend_notice], description: LM-15 (extend OQ-C08-07) }
+    LeaveTypeVersion:
+      type: object
+      required: [id, leave_type_id, effective_from]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        leave_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        effective_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        settings:
+          type: object
+          description: The version's LM settings, same fields as LeaveTypeVersionInput.
+          additionalProperties: true
+    LedgerEntryKind:
+      type: string
+      enum: [opening, accrual, grant, debit, reversal, sandwich_debit, penalty_debit, absence_auto_debit, carry_forward, lapse, encashment, adjustment]
+    LeaveLedgerEntry:
+      type: object
+      required: [id, account_id, leave_type_id, entry_date, entry_kind, quantity, cause_kind, cause_id, created_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        account_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        leave_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        entry_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        entry_kind: { $ref: '#/components/schemas/LedgerEntryKind' }
+        quantity: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        cause_kind: { type: string, description: 'e.g. leave_request, period_penalty, day_result, opening_balance_entry, accrual_run.' }
+        cause_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        reason: { type: [string, 'null'] }
+        reverses_entry_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        created_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+    AbscondingState:
+      type: string
+      enum: [open, closed_returned, closed_offboarding]
+    AbscondingCase:
+      type: object
+      required: [id, employee_id, state, opened_on, trigger_days, pay_hold]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        state: { $ref: '#/components/schemas/AbscondingState' }
+        opened_on: { $ref: 'common.yaml#/components/schemas/Date' }
+        trigger_days: { type: integer, minimum: 1 }
+        pay_hold: { type: boolean, description: LM-31 (V1 meaning OQ-C08-13). }
+        closed_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        closed_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        close_reason: { type: [string, 'null'] }

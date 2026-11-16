@@ -11,3 +11,7 @@
 | Date | Change | Effect on approved gates |
 |---|---|---|
 | 2026-11-15 | BRD v0.7 → v0.8 at the project owner's request: pay rounding fixed (BR-15 added, TB-05 reworded, §13.2 working shown, P17 and Q17 added). v0.7 kept for traceability. | None. The change touches V2 pay only; no V1 story, rule, domain object or table depends on it. No re-approval needed. |
+
+| Gate | Scope | Decision | By | Date | Conditions |
+|---|---|---|---|---|---|
+| 3 Database | `docs/database/` (DATA_MODEL, migrations 0001–0005, DATA_DICTIONARY, MIGRATIONS, tests/tenant_isolation.sql) | Approved | Project owner (in session) | 2026-11-15 | Supabase deployment checks in MIGRATIONS.md §3 still to be run before the first test-environment migration. "?" permission cells seeded as not granted. |

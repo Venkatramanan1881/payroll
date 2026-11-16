@@ -1,0 +1,1310 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Vendor console (Platform)
+  version: 1.0.0-draft
+  description: |
+    Platform context, vendor console (BRD V01: VC-R1..VC-R9, VC-01..VC-05; MD Module control: MD-01..MD-04).
+    Vendor routes live under /v1/vendor and take a vendor token (TSD §4.3); organisation users are refused
+    (AC-V01-06.4, AC-V01-13.4). Organisation-level facts only, never employee data (P12, AC-V01-06.3, AC-V01-11.5): usage and
+    health read the platform summary table `platform.organisation_usage` (written by J10), never client tables.
+    Vendor role split (VC-05 full_admin / support / read_only) beyond the matrix VA column is G-01 / OQ-V01-14; read_only
+    users may view but every change is refused (AC-V01-13.2). Vendor sign-in is not defined here (OQ-V01-17).
+    Dated rows (daterange) are exposed as `valid_from` (inclusive) / `valid_to` (exclusive, null = open).
+    Read operations of the console carry PLT-10 (no separate view rows exist for plans, templates or organisations).
+security:
+  - vendorToken: []
+tags:
+  - name: Organisations
+  - name: Modules
+  - name: Usage and health
+  - name: Plans
+  - name: Sector templates
+  - name: Announcements
+  - name: Vendor users
+  - name: Support access
+x-exempt-permissions:
+  PLT-09: 'Setting VC-03 has no route until G-04 decides the actor (vendor or Organisation Admin); the data dictionary has no column for VC-03 yet.'
+  PLT-16: 'Viewing data under an active SupportAccessGrant is exercised through the normal client routes with a grant-bound token; no route of its own. Extent: G-02 / OQ-V01-12.'
+  PLT-17: 'Changing settings or data under a grant is exercised through client routes, if at all: OQ-V01-12 / G-02 is open. Changing results is a fixed denial (P10).'
+paths:
+  /v1/vendor/organisations:
+    get:
+      operationId: vendorListOrganisations
+      summary: List organisations
+      description: Organisations with state, plan and template (VC-R1, VC-R3). Organisation-level facts only (P12).
+      tags: [Organisations]
+      x-permission: PLT-10
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: state
+          in: query
+          schema: { type: string, enum: [active, suspended] }
+        - name: sector_template_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Page of organisations.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/VendorOrganisation' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: vendorCreateOrganisation
+      summary: Create an organisation from a sector template
+      description: |
+        SM-ORG O1 (VC-R1, MD-01, A1; AC-V01-01.1..01.7). Plan, enabled modules, employee limit and first admin user are all
+        required, else VALIDATION_FAILED (AC-V01-01.2). The template is copied into the new organisation (OQ-V01-10); common
+        modules C01..C16 in V1 are always on (AC-V01-01.4). The first admin user holds Organisation Admin for this
+        organisation only (AC-V01-01.3). May modules / limit differ from the plan: OQ-V01-02 (accepted as given).
+        Module dependencies (MD-04) → 409 MODULE_DEPENDENCY_UNMET (proposed code). Audited with template, plan, modules and
+        limit (AC-V01-01.7). Vendor-only (AC-V01-01.5).
+      tags: [Organisations]
+      x-permission: PLT-01
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: [OrganisationCreated]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [display_name, legal_name, sector_template_id, plan_id, modules, employee_limit, first_admin, subscription]
+              properties:
+                display_name: { type: string, minLength: 1, maxLength: 200 }
+                legal_name: { type: string, minLength: 1, maxLength: 300 }
+                sector_template_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                plan_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                modules: { type: array, uniqueItems: true, items: { $ref: '#/components/schemas/ModuleCode' }, description: Optional modules switched on. }
+                employee_limit: { $ref: '#/components/schemas/EmployeeLimitInput' }
+                first_admin:
+                  type: object
+                  additionalProperties: false
+                  required: [email]
+                  properties:
+                    email: { type: string, format: email, maxLength: 254 }
+                    mobile: { type: string, pattern: '^\+[1-9][0-9]{6,14}$' }
+                    language: { $ref: 'common.yaml#/components/schemas/Language' }
+                subscription: { $ref: '#/components/schemas/SubscriptionInput' }
+      responses:
+        '201':
+          description: Organisation created (state active).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorOrganisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: vendorGetOrganisation
+      summary: Get an organisation's vendor record
+      description: |
+        State, current plan, modules, employee limit with VC-01, subscription (plan, start, renewal, billing status; VC-R5,
+        AC-V01-08.1) and template. No invoices (AC-V01-08.4). No employee data (P12).
+      tags: [Organisations]
+      x-permission: PLT-10
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Organisation.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorOrganisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+
+  /v1/vendor/organisations/{id}/change-plan:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorChangeOrganisationPlan
+      summary: Change an organisation's plan from a date
+      description: |
+        VC-R2, MD-02 (AC-V01-04.1, 04.2). Ends the current `organisation_plan` row and starts a new one with reason; history
+        rows are never edited. Immediate vs dated effect: OQ-V01-04 (`valid_from` defaults to today). Whether modules and
+        limit follow the plan automatically: OQ-V01-02 (not done here; use the module and limit commands).
+      tags: [Organisations]
+      x-permission: PLT-03
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [plan_id, reason]
+              properties:
+                plan_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Plan changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorOrganisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/change-employee-limit:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorChangeEmployeeLimit
+      summary: Change an organisation's employee limit from a date
+      description: |
+        VC-R2 (AC-V01-04.1). New dated `employee_limit` row; `max_active` null = no limit. Lowering the limit below the
+        current headcount, and whether zero / no limit are allowed: OQ-V01-01 (no employee is deactivated by this command).
+        The VC-01 behaviour on reaching the limit is changed by change-vendor-settings and carried forward here.
+      tags: [Organisations]
+      x-permission: PLT-03
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [max_active, reason]
+              properties:
+                max_active: { type: [integer, 'null'], minimum: 1 }
+                valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Limit changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorOrganisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/change-vendor-settings:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorChangeVendorSettings
+      summary: Set VC-01, VC-02 and VC-04 for an organisation
+      description: |
+        Vendor console settings (§4.3): VC-01 on reaching the limit (`employee_limit.on_reach`: block / allow_and_alert,
+        AC-V01-05.1..05.5); VC-02 renewal reminder N days (`subscription.renewal_reminder_days`, AC-V01-08.3); VC-04 suspension
+        (`subscription.auto_suspend_after_days`: null = manual only, AC-V01-07.6, 07.7; "not renewed" OQ-V01-09). VC-03 is
+        not here (G-04). Old/new values in the dated history (AC-V01-05.5, G9).
+      tags: [Organisations]
+      x-permission: PLT-08
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              minProperties: 2
+              properties:
+                on_reach: { type: string, enum: [block, allow_and_alert], description: VC-01 }
+                renewal_reminder_days: { type: integer, minimum: 0, description: VC-02 }
+                auto_suspend_after_days: { type: [integer, 'null'], minimum: 0, description: 'VC-04; null = manual only.' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Settings changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorOrganisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/change-subscription:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorChangeSubscription
+      summary: Record subscription details
+      description: |
+        VC-R5 (AC-V01-08.1, 08.2): start date, renewal date (≥ start), billing status. Billing status values are not defined
+        (OQ-V01-11), so it is free text. Invoicing is outside the app (AC-V01-08.4). Kept in the dated history.
+      tags: [Organisations]
+      x-permission: PLT-05
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/SubscriptionInput'
+                - type: object
+                  required: [reason]
+                  properties:
+                    reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Subscription recorded.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorOrganisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/modules/{module_code}/switch-on:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+      - $ref: '#/components/parameters/ModuleCodePath'
+    post:
+      operationId: vendorSwitchModuleOn
+      summary: Switch an optional module on for an organisation
+      description: |
+        MD-01, MD-03, VC-R2 (AC-V01-03.1, 03.3, 03.9). New dated `module_entitlement` row with reason. Earlier data of the
+        module becomes available again unchanged (AT2). Modules not released in V1 → VALIDATION_FAILED (AC-V01-03.6).
+        MD-04: a module whose prerequisite (Payroll) is off → 409 MODULE_DEPENDENCY_UNMET naming the prerequisite
+        (AC-V01-03.7; testable from V2). Effective date vs immediate: OQ-V01-04. Already on → 200 with current state.
+      tags: [Modules]
+      x-permission: PLT-02
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModuleSwitchInput' }
+      responses:
+        '200':
+          description: Module on.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModuleEntitlement' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/modules/{module_code}/switch-off:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+      - $ref: '#/components/parameters/ModuleCodePath'
+    post:
+      operationId: vendorSwitchModuleOff
+      summary: Switch an optional module off for an organisation
+      description: |
+        MD-01, MD-03 (AC-V01-03.2, 03.4, 03.9): hidden everywhere, rules not evaluated, data kept. Common modules C01..C16
+        cannot be switched off → VALIDATION_FAILED (AC-V01-03.5). MD-04: switching off a prerequisite while a dependant is
+        on — blocked or cascaded is OQ-V01-03; if blocked → 409 MODULE_DEPENDENCY_UNMET. In-flight items of the module:
+        GAP-SM-17. Recalculation of open days: OQ-V01-04. Already off → 200 with current state.
+      tags: [Modules]
+      x-permission: PLT-02
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModuleSwitchInput' }
+      responses:
+        '200':
+          description: Module off.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModuleEntitlement' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/suspend:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorSuspendOrganisation
+      summary: Suspend an organisation
+      description: |
+        SM-ORG O2: active → suspended with date, vendor user and reason (VC-R4, AC-V01-07.1). From then on organisation users
+        can view and export only (AC-V01-07.3, 07.4); device punches are still stored (AC-V01-07.2). App/web punches and
+        timed jobs while suspended: OQ-V01-08. Already suspended → 200 with current state (no-op). Organisation users can
+        never call this route (AC-V01-07.8).
+      tags: [Organisations]
+      x-permission: PLT-06
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: [OrganisationSuspended]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Suspended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorOrganisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/reactivate:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorReactivateOrganisation
+      summary: Reactivate a suspended organisation
+      description: |
+        SM-ORG O4: suspended → active (VC-R4, AC-V01-07.5). Punches received during suspension are present. Already active
+        → 200 with current state (no-op).
+      tags: [Organisations]
+      x-permission: PLT-06
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: [OrganisationReactivated]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Active.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorOrganisation' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/history:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: vendorListOrganisationHistory
+      summary: Dated history of plan, module, limit, vendor-setting, subscription and state changes
+      description: |
+        VC-R2 (AC-V01-04.1, 04.2, 03.9, 05.5, 08.2): date order, who, old value, new value, reason; entries cannot be edited
+        or deleted. Whether the Organisation Admin or Auditor may see this for their own organisation is OQ-V01-05 / G-05
+        (no client route until decided).
+      tags: [Organisations]
+      x-permission: PLT-19
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/HistoryKind' }
+      responses:
+        '200':
+          description: Page of history entries, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [kind, set_at, set_by]
+                      properties:
+                        kind: { $ref: '#/components/schemas/HistoryKind' }
+                        subject: { type: [string, 'null'], description: 'Module code for kind = module.' }
+                        old_value: {}
+                        new_value: {}
+                        valid_from: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+                        reason: { type: [string, 'null'] }
+                        set_by: { $ref: 'common.yaml#/components/schemas/Id' }
+                        set_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+
+  /v1/vendor/usage:
+    get:
+      operationId: vendorListUsage
+      summary: Usage per organisation
+      description: |
+        VC-R3 (AC-V01-06.1..06.4) from `platform.organisation_usage` only: active employees against the limit, branches,
+        devices online, last sign-in (whose: OQ-V01-07), refreshed time. "Last pay run" is not applicable in V1
+        (AC-V01-06.2). No employee records, punches or pay data (AC-V01-06.3).
+      tags: [Usage and health]
+      x-permission: PLT-10
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: over_limit
+          in: query
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Page of usage rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [organisation_id, display_name, active_employees, branches, devices_online, devices_total, refreshed_at]
+                      properties:
+                        organisation_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        display_name: { type: string }
+                        active_employees: { type: integer, minimum: 0 }
+                        max_active: { type: [integer, 'null'] }
+                        branches: { type: integer, minimum: 0 }
+                        devices_online: { type: integer, minimum: 0 }
+                        devices_total: { type: integer, minimum: 0 }
+                        last_sign_in_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+                        last_pay_run: { type: 'null', description: Not applicable in V1 (Payroll is V2). }
+                        refreshed_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/vendor/health:
+    get:
+      operationId: vendorListHealth
+      summary: Health view across organisations
+      description: |
+        VC-R8 (AC-V01-11.1..11.5) from platform summary tables only: devices offline, periods waiting to be locked
+        (definition OQ-V01-15), and failed / retried timed jobs (TB-03; summary source not yet in the data dictionary).
+        "Failed pay runs" has no data in V1 (AC-V01-11.4). Organisation-level facts only (AC-V01-11.5); device and branch
+        are named by label, not employee data. What counts as a sync failure: OQ-V01-15.
+      tags: [Usage and health]
+      x-permission: PLT-10
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: only_with_issues
+          in: query
+          schema: { type: boolean, default: true }
+      responses:
+        '200':
+          description: Page of health rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [organisation_id, display_name, devices_online, devices_total, periods_awaiting_lock, refreshed_at]
+                      properties:
+                        organisation_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        display_name: { type: string }
+                        devices_online: { type: integer, minimum: 0 }
+                        devices_total: { type: integer, minimum: 0 }
+                        device_sync_failures:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              device_label: { type: string }
+                              branch_name: { type: string }
+                              since: { $ref: 'common.yaml#/components/schemas/Instant' }
+                        periods_awaiting_lock: { type: integer, minimum: 0 }
+                        failed_jobs:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              job: { type: string }
+                              failed_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                              retried: { type: boolean }
+                        failed_pay_runs: { type: 'null', description: No data in V1. }
+                        refreshed_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+  /v1/vendor/plans:
+    get:
+      operationId: vendorListPlans
+      summary: List plans
+      description: Plans with modules, employee limit and whether the mobile app is included (MD-02, AC-V01-02.1).
+      tags: [Plans]
+      x-permission: PLT-10
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Plans.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Plan' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: vendorCreatePlan
+      summary: Create a plan
+      description: MD-02 (AC-V01-02.1, 02.4). Plan contents (BRD Q5) are OQ-V01-02. Code unique. MD-04 checked on `modules` → MODULE_DEPENDENCY_UNMET.
+      tags: [Plans]
+      x-permission: PLT-04
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, name, modules, mobile_app]
+              properties:
+                code: { type: string, minLength: 1, maxLength: 30 }
+                name: { type: string, minLength: 1, maxLength: 120 }
+                modules: { type: array, uniqueItems: true, items: { $ref: '#/components/schemas/ModuleCode' } }
+                employee_limit: { type: [integer, 'null'], minimum: 1 }
+                mobile_app: { type: boolean }
+      responses:
+        '201':
+          description: Plan created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Plan' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/plans/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    patch:
+      operationId: vendorUpdatePlan
+      summary: Change a plan
+      description: |
+        MD-02. Changes the plan definition only; organisations on the plan keep their own dated modules and limits
+        (OQ-V01-02). Mobile app off blocks the app for organisations on the plan (AC-V01-02.2, 02.3). Audited.
+      tags: [Plans]
+      x-permission: PLT-04
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                modules: { type: array, uniqueItems: true, items: { $ref: '#/components/schemas/ModuleCode' } }
+                employee_limit: { type: [integer, 'null'], minimum: 1 }
+                mobile_app: { type: boolean }
+      responses:
+        '200':
+          description: Plan changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Plan' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/sector-templates:
+    get:
+      operationId: vendorListSectorTemplates
+      summary: List sector templates
+      description: Factory, Supermarket, Restaurant and bakery, Office and services (G6, AC-V01-10.1).
+      tags: [Sector templates]
+      x-permission: PLT-10
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Templates.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/SectorTemplate' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: vendorCreateSectorTemplate
+      summary: Add a sector template
+      description: VC-R7. Whether templates beyond the four in G6 may be added is OQ-V01-10 (route exists, not decided). Audited.
+      tags: [Sector templates]
+      x-permission: PLT-07
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code, name, content]
+              properties:
+                code: { type: string, minLength: 1, maxLength: 40 }
+                name: { type: string, minLength: 1, maxLength: 120 }
+                content: { type: object, additionalProperties: true, description: 'Template settings and starter lists (jsonb); shape owned by the core settings schema.' }
+      responses:
+        '201':
+          description: Template created (version 1).
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SectorTemplate' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/sector-templates/{id}:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    get:
+      operationId: vendorGetSectorTemplate
+      summary: Get a sector template with the organisations created from it
+      description: VC-R7 (AC-V01-10.3).
+      tags: [Sector templates]
+      x-permission: PLT-10
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      responses:
+        '200':
+          description: Template.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SectorTemplate'
+                  - type: object
+                    properties:
+                      content: { type: object, additionalProperties: true }
+                      organisations:
+                        type: array
+                        items:
+                          type: object
+                          required: [organisation_id, display_name]
+                          properties:
+                            organisation_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                            display_name: { type: string }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+    patch:
+      operationId: vendorUpdateSectorTemplate
+      summary: Change a sector template
+      description: |
+        VC-R7 (AC-V01-10.2): saved with who, when, old and new values; `version` increments. Whether a change affects
+        organisations already created from it is OQ-V01-10 (this route does not push changes to them). Organisation users
+        are refused (AC-V01-10.4).
+      tags: [Sector templates]
+      x-permission: PLT-07
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                name: { type: string, minLength: 1, maxLength: 120 }
+                content: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: Template changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SectorTemplate' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/announcements:
+    get:
+      operationId: vendorListAnnouncements
+      summary: List sent announcements
+      description: Sender, time and chosen organisations (VC-R9, AC-V01-12.2).
+      tags: [Announcements]
+      x-permission: PLT-10
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of announcements.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Announcement' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: vendorSendAnnouncement
+      summary: Send an announcement to chosen organisations
+      description: |
+        VC-R9 (AC-V01-12.1, 12.2). Only the chosen organisations' users receive it. Which users inside an organisation and
+        through which channel: OQ-V01-16. Organisation users cannot send (AC-V01-12.3).
+      tags: [Announcements]
+      x-permission: PLT-11
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [title, body, organisation_ids]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 200 }
+                body: { type: string, minLength: 1, maxLength: 5000 }
+                organisation_ids: { type: array, minItems: 1, uniqueItems: true, maxItems: 10000, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+      responses:
+        '201':
+          description: Announcement sent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Announcement' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/vendor-users:
+    get:
+      operationId: vendorListVendorUsers
+      summary: List vendor users
+      description: Vendor users and their VC-05 roles (US-V01-13).
+      tags: [Vendor users]
+      x-permission: PLT-12
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of vendor users.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/VendorUser' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+    post:
+      operationId: vendorCreateVendorUser
+      summary: Create a vendor user
+      description: |
+        VC-05 (AC-V01-13.1): full_admin / support / read_only. Who may manage vendor users: G-06 (US-V01-13 assumes full
+        admin). Vendor users can never sign in to an organisation (AC-V01-13.3). Email unique. Audited.
+      tags: [Vendor users]
+      x-permission: PLT-12
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email, full_name, vendor_role]
+              properties:
+                email: { type: string, format: email, maxLength: 254 }
+                full_name: { type: string, minLength: 1, maxLength: 200 }
+                vendor_role: { $ref: '#/components/schemas/VendorRole' }
+      responses:
+        '201':
+          description: Vendor user created.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorUser' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/vendor-users/{id}/change-role:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorChangeVendorUserRole
+      summary: Change a vendor user's role
+      description: VC-05 (AC-V01-13.5). History shows who, when, old and new role. Same role → 200 no-op. Actor G-06.
+      tags: [Vendor users]
+      x-permission: PLT-12
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+        - $ref: 'common.yaml#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [vendor_role, reason]
+              properties:
+                vendor_role: { $ref: '#/components/schemas/VendorRole' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Role changed.
+          headers: { ETag: { $ref: 'common.yaml#/components/headers/ETag' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorUser' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '412': { $ref: 'common.yaml#/components/responses/PreconditionFailed' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/vendor-users/{id}/deactivate:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorDeactivateVendorUser
+      summary: Deactivate a vendor user
+      description: Sets `active` = false; console sign-in and any active support grant of that user stop working (VC-05, TB-01). Already inactive → 200.
+      tags: [Vendor users]
+      x-permission: PLT-12
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: 'common.yaml#/components/schemas/ReasonRequired' }
+      responses:
+        '200':
+          description: Inactive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorUser' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/organisations/{id}/support-access-requests:
+    parameters:
+      - $ref: 'common.yaml#/components/parameters/Id'
+    post:
+      operationId: vendorRequestSupportAccess
+      summary: Request support access to an organisation
+      description: |
+        SM-SUPPORT S1/S2 (VC-R6, VC-03; AC-V01-09.1, 09.3, 09.4). VC-03 = on → state `requested`, the Organisation Admin
+        is notified and no client data is visible until approved (201). VC-03 = off → state `active` at once, still
+        time-limited and logged (201). Every request is new; a past approval is never reused (AC-V01-09.3). Window length
+        and who sets it: OQ-V01-13 (`requested_window_minutes` is a request, not a decision). Which vendor roles may
+        request: OQ-V01-14 / G-01. Unanswered request: GAP-SM-02.
+      tags: [Support access]
+      x-permission: PLT-13
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: [SupportAccessRequested, SupportAccessGranted]
+      x-idempotent: key
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+                requested_window_minutes: { type: integer, minimum: 1 }
+      responses:
+        '201':
+          description: Grant created (requested or active).
+          content:
+            application/json:
+              schema: { $ref: 'identity.yaml#/components/schemas/SupportAccessGrant' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+
+  /v1/vendor/support-access-grants:
+    get:
+      operationId: vendorListSupportAccessGrants
+      summary: List the caller's support-access grants
+      description: Grants requested by vendor users, with state and window (VC-R6, SM-SUPPORT).
+      tags: [Support access]
+      x-permission: PLT-13
+      x-module: V01
+      x-scope: vendor
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+        - name: state
+          in: query
+          schema: { $ref: 'identity.yaml#/components/schemas/SupportAccessState' }
+        - name: organisation_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+      responses:
+        '200':
+          description: Page of grants.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: 'identity.yaml#/components/schemas/SupportAccessGrant' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+
+components:
+  parameters:
+    ModuleCodePath:
+      name: module_code
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/ModuleCode' }
+  schemas:
+    ModuleCode:
+      type: string
+      pattern: '^(V01|C[0-9]{2}|M[0-9]{2})$'
+      description: Module code (BRD §4). C01..C16 are always on and cannot be switched.
+    ModuleSwitchInput:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        reason: { type: string, minLength: 1, maxLength: 1000 }
+    ModuleEntitlement:
+      type: object
+      required: [module_code, enabled, valid_from, valid_to, set_by, set_at]
+      properties:
+        module_code: { $ref: '#/components/schemas/ModuleCode' }
+        enabled: { type: boolean }
+        valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        valid_to: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+        reason: { type: [string, 'null'] }
+        set_by: { $ref: 'common.yaml#/components/schemas/Id' }
+        set_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    EmployeeLimitInput:
+      type: object
+      additionalProperties: false
+      required: [max_active, on_reach]
+      properties:
+        max_active: { type: [integer, 'null'], minimum: 1, description: 'null = no limit (OQ-V01-01).' }
+        on_reach: { type: string, enum: [block, allow_and_alert], description: 'VC-01, default allow_and_alert.' }
+    SubscriptionInput:
+      type: object
+      additionalProperties: false
+      required: [start_date, renewal_date, billing_status]
+      properties:
+        start_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        renewal_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        billing_status: { type: string, minLength: 1, maxLength: 40, description: 'Values not defined: OQ-V01-11.' }
+        renewal_reminder_days: { type: integer, minimum: 0, description: 'VC-02, default 15.' }
+        auto_suspend_after_days: { type: [integer, 'null'], minimum: 0, description: 'VC-04; null = manual only (default).' }
+        reason: { type: string, minLength: 1, maxLength: 1000 }
+    VendorOrganisation:
+      type: object
+      required: [id, display_name, legal_name, state, state_changed_at, created_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        display_name: { type: string }
+        legal_name: { type: string }
+        state: { type: string, enum: [active, suspended] }
+        state_changed_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        state_reason: { type: [string, 'null'] }
+        sector_template_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        plan_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        modules: { type: array, items: { $ref: '#/components/schemas/ModuleEntitlement' } }
+        employee_limit:
+          type: object
+          properties:
+            max_active: { type: [integer, 'null'] }
+            on_reach: { type: string, enum: [block, allow_and_alert] }
+            valid_from: { $ref: 'common.yaml#/components/schemas/Date' }
+        subscription:
+          type: object
+          properties:
+            start_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            renewal_date: { $ref: 'common.yaml#/components/schemas/Date' }
+            billing_status: { type: string }
+            renewal_reminder_days: { type: integer }
+            auto_suspend_after_days: { type: [integer, 'null'] }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    HistoryKind:
+      type: string
+      enum: [plan, module, employee_limit, vendor_settings, subscription, state]
+    Plan:
+      type: object
+      required: [id, code, name, modules, employee_limit, mobile_app]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        code: { type: string }
+        name: { type: string }
+        modules: { type: array, items: { $ref: '#/components/schemas/ModuleCode' } }
+        employee_limit: { type: [integer, 'null'] }
+        mobile_app: { type: boolean }
+    SectorTemplate:
+      type: object
+      required: [id, code, name, version, updated_at]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        code: { type: string }
+        name: { type: string }
+        version: { type: integer, minimum: 1 }
+        updated_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+    Announcement:
+      type: object
+      required: [id, title, body, created_by, created_at, organisation_ids]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        title: { type: string }
+        body: { type: string }
+        created_by: { $ref: 'common.yaml#/components/schemas/Id' }
+        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+        organisation_ids: { type: array, items: { $ref: 'common.yaml#/components/schemas/Id' } }
+    VendorRole:
+      type: string
+      enum: [full_admin, support, read_only]
+    VendorUser:
+      type: object
+      required: [id, email, full_name, vendor_role, active]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        email: { type: string }
+        full_name: { type: string }
+        vendor_role: { $ref: '#/components/schemas/VendorRole' }
+        active: { type: boolean }

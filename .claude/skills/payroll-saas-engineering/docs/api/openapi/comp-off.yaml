@@ -1,0 +1,312 @@
+openapi: 3.1.0
+info:
+  title: Payroll App API - Comp-off
+  version: 1.0.0-draft
+  description: >-
+    Comp-off inside the Leave & Absence context (DOMAIN_MODEL §3.9), BRD module M02 (CO-R1..CO-R4, HW-01..HW-06):
+    comp-off credits earned from work on a holiday or weekly off (each credit is also its CompOffClaim, SM-COMPOFF
+    with approval on SM-REQ, request_type comp_off), the employee's pay-or-comp-off choice, and the comp-off balance
+    and ledger. Every operation needs M02 enabled (AC-M02-01.1). Taking comp-off is a LeaveRequest (CO-R2,
+    SM-COMPOFF C6, leave.yaml); how comp-off is identified on it and which leave rules apply is OQ-M02-08.
+    Conventions: docs/api/API_CONVENTIONS.md.
+security:
+  - userToken: []
+tags:
+  - name: Comp-off credits
+  - name: Comp-off balance
+x-exempt-permissions:
+  CMP-01: 'HW-01..HW-06 are the HW rule group of a PolicyVersion (policy.policy_rule_group); they are changed through the policy version operations (policy file), not a comp-off route. That operation must accept CMP-01 for the HW rule group.'
+  CMP-02: 'Prior approval to work on a holiday / weekly off (HW-03) has no aggregate in DOMAIN_MODEL or the database and no approval_step request_type; outcome without it is OQ-M02-02. No operation until modelled.'
+  CMP-03: 'Approval side of CMP-02; same gap (HW-03, OQ-M02-02).'
+  CMP-06: 'Taking comp-off is submitted as a LeaveRequest through leaveSubmitRequest (CO-R2, SM-COMPOFF C6/C7, comp_off_ledger_entry cause_kind leave_request). Whether that uses a comp-off leave type or a dedicated marker, and which LM settings apply, is OQ-M02-08; consumption order is OQ-M02-09. No separate operation.'
+paths:
+  /v1/comp-off/credits:
+    get:
+      operationId: compOffListCredits
+      summary: List comp-off credits (claims)
+      description: >-
+        Credits created by the system when a worked holiday/weekly off earns comp-off (SM-COMPOFF C1/C3, CO-R1, HW-04,
+        AC-M02-02.1..02.4, AC-M02-03.1): pending_approval while HW-02 = on, credited at once when off. Approvers use
+        `state=pending_approval` (the generic inbox `/v1/approvals/pending` also lists them). Employees see their own.
+        Each credit shows worked date, half/full, expiry and basis (AC-M02-02.7). Manager access: G-39.
+      tags: [Comp-off credits]
+      parameters:
+        - name: employee_id
+          in: query
+          schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/CompOffCreditState' }
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - $ref: 'common.yaml#/components/parameters/BranchFilter'
+        - $ref: 'common.yaml#/components/parameters/DepartmentFilter'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of credits.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/CompOffCredit' } }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+      x-permission: [CMP-05, CMP-07]
+      x-module: M02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/comp-off/credits/{id}:
+    get:
+      operationId: compOffGetCredit
+      summary: Get a comp-off credit
+      description: Credit with its approval steps and explanation (BR-08, AC-M02-02.7). Out of scope → NOT_FOUND.
+      tags: [Comp-off credits]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+      responses:
+        '200':
+          description: The credit.
+          content: { application/json: { schema: { $ref: '#/components/schemas/CompOffCredit' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: [CMP-05, CMP-07]
+      x-module: M02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/comp-off/credits/{id}/approve:
+    post:
+      operationId: compOffApproveCredit
+      summary: Approve a comp-off credit
+      description: >-
+        SM-COMPOFF C2 (SM-REQ R5, one level): pending_approval → credited; posts the credit ledger entry keyed by the
+        credit and sets the expiry (HW-05; from worked or credit date OQ-M02-10) (AC-M02-03.2). BR-07: the approver's
+        own comp-off, also as delegate → SELF_APPROVAL_FORBIDDEN (AC-M02-03.5). AC-03: a delegate of the routed approver
+        may act; the step records actor and on-behalf-of. Who approves and escalation: OQ-M02-05. Credited → 200 with
+        no second entry; not_credited → ILLEGAL_TRANSITION. A credit is a balance entry, not a day result, so no
+        PeriodAdjustment arises. NT-05 notifies the employee (AC-M02-03.6).
+      tags: [Comp-off credits]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/ApprovalDecision' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Credit after approval.
+          content: { application/json: { schema: { $ref: '#/components/schemas/CompOffCredit' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: CMP-05
+      x-module: M02
+      x-scope: team
+      x-audit: true
+      x-events: [RequestApproved]
+      x-idempotent: key
+  /v1/comp-off/credits/{id}/reject:
+    post:
+      operationId: compOffRejectCredit
+      summary: Reject a comp-off credit
+      description: >-
+        SM-COMPOFF C4: pending_approval → not_credited with reason; nothing credited (AC-M02-03.3). BR-07 →
+        SELF_APPROVAL_FORBIDDEN incl. delegate (AC-M02-03.5); AC-03 delegate recorded. not_credited → 200;
+        credited → ILLEGAL_TRANSITION.
+      tags: [Comp-off credits]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/Id'
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf: [ { $ref: 'common.yaml#/components/schemas/RejectionDecision' } ]
+              unevaluatedProperties: false
+      responses:
+        '200':
+          description: Credit after rejection.
+          content: { application/json: { schema: { $ref: '#/components/schemas/CompOffCredit' } } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: CMP-05
+      x-module: M02
+      x-scope: team
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/comp-off/choices:
+    post:
+      operationId: compOffChooseTreatment
+      summary: Choose pay or comp-off for an own worked holiday / weekly off
+      description: >-
+        CO-R4, HW-01 = employee chooses (AC-M02-04.1..04.4). `comp_off` → a credit is earned as in US-M02-02 (basis
+        employee_choice); `pay` → no credit. When HW-01 is not "employee chooses" → RULE_GROUP_DISABLED
+        (AC-M02-04.3); a date the employee did not work on a holiday/weekly off → VALIDATION_FAILED. Records employee
+        and time. Open and not decided here: what "pay" produces in V1 (OQ-M02-06), the fallback when no choice is
+        made, the deadline, and whether a choice can be changed (OQ-M02-07); a repeat with the same choice returns
+        200, a different choice is refused with ILLEGAL_TRANSITION until OQ-M02-07 says otherwise.
+      tags: [Comp-off credits]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [worked_date, choice]
+              properties:
+                worked_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                choice: { type: string, enum: [pay, comp_off] }
+      responses:
+        '200':
+          description: Choice recorded; `credit` is present when comp_off was chosen.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [worked_date, choice, chosen_at]
+                properties:
+                  worked_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                  choice: { type: string, enum: [pay, comp_off] }
+                  chosen_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                  credit: { $ref: '#/components/schemas/CompOffCredit' }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '409': { $ref: 'common.yaml#/components/responses/Conflict' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+        '428': { $ref: 'common.yaml#/components/responses/PreconditionRequired' }
+      x-permission: CMP-04
+      x-module: M02
+      x-scope: self
+      x-audit: true
+      x-events: []
+      x-idempotent: key
+  /v1/comp-off/employees/{employee_id}/balance:
+    get:
+      operationId: compOffGetBalance
+      summary: Comp-off balance of an employee
+      description: >-
+        Balance = sum of comp-off ledger entries (LM-R8, CO-R2, AC-M02-05.1), including confirmed opening balance
+        (AC-M02-05.6), with the open credits and their expiry dates (HW-05). Employees see their own; Manager access
+        G-39. Shown alongside leave in leaveGetBalances when M02 is on.
+      tags: [Comp-off balance]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+      responses:
+        '200':
+          description: Balance and open credits.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [employee_id, balance, open_credits]
+                properties:
+                  employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                  balance: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+                  pending_approval_days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+                  open_credits: { type: array, items: { $ref: '#/components/schemas/CompOffCredit' } }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: CMP-07
+      x-module: M02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+  /v1/comp-off/employees/{employee_id}/ledger:
+    get:
+      operationId: compOffListLedger
+      summary: Comp-off ledger entries of an employee
+      description: >-
+        Append-only ledger: credit, debit (comp-off taken, AC-M02-05.2), reversal (leave cancelled, AC-M02-05.3) and
+        expiry (lapse, AC-M02-06.1). Expiry in V1 with HW-06 = pay: OQ-M02-01.
+      tags: [Comp-off balance]
+      parameters:
+        - $ref: 'common.yaml#/components/parameters/EmployeeId'
+        - $ref: 'common.yaml#/components/parameters/From'
+        - $ref: 'common.yaml#/components/parameters/To'
+        - $ref: 'common.yaml#/components/parameters/Limit'
+        - $ref: 'common.yaml#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of entries, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, credit_id, entry_date, entry_kind, quantity, cause_kind, cause_id, created_at]
+                      properties:
+                        id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        credit_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        entry_date: { $ref: 'common.yaml#/components/schemas/Date' }
+                        entry_kind: { type: string, enum: [credit, debit, reversal, expiry] }
+                        quantity: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+                        cause_kind: { type: string, description: 'e.g. comp_off_credit, leave_request, expiry_run, opening_balance_entry.' }
+                        cause_id: { $ref: 'common.yaml#/components/schemas/Id' }
+                        reason: { type: [string, 'null'] }
+                        reverses_entry_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+                        created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '403': { $ref: 'common.yaml#/components/responses/Forbidden' }
+        '404': { $ref: 'common.yaml#/components/responses/NotFound' }
+      x-permission: CMP-07
+      x-module: M02
+      x-scope: branch-department
+      x-audit: false
+      x-events: []
+      x-idempotent: n/a
+
+components:
+  schemas:
+    CompOffCreditState:
+      type: string
+      enum: [pending_approval, credited, partially_used, used, expired_lapsed, expired_paid, not_credited]
+      description: SM-COMPOFF (expired_paid is V2, OQ-M02-01).
+    CompOffCredit:
+      type: object
+      required: [id, employee_id, worked_date, fraction, earned_basis, state, escalated]
+      properties:
+        id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        worked_date: { $ref: 'common.yaml#/components/schemas/Date' }
+        fraction: { type: string, enum: ['0.50', '1.00'], description: HW-04 half or full. }
+        earned_basis: { type: string, enum: [policy, employee_choice, opening] }
+        state: { $ref: '#/components/schemas/CompOffCreditState' }
+        expires_on: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ] }
+        escalated: { type: boolean }
+        current_approver_user_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        decided_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        decided_by: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
+        remaining: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
+        steps: { type: array, items: { $ref: 'common.yaml#/components/schemas/ApprovalStep' } }
+        explanation: { type: array, items: { $ref: 'common.yaml#/components/schemas/ExplanationStep' } }
