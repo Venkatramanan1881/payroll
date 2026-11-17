@@ -35,6 +35,7 @@ dependencies = [
  "domain-iam",
  "domain-policy",
  "domain-sched",
+ "domain-timecap",
  "domain-workforce",
  "http-body-util",
  "serde",

@@ -93,7 +93,8 @@ pub struct Decision {
 }
 
 impl PunchContext {
-    fn applicable_branches(&self) -> Vec<Uuid> {
+    /// PC-16: the master branch, plus the allowed branches unless PC-16 = master.
+    pub fn applicable_branches(&self) -> Vec<Uuid> {
         let master_only = self.settings.as_ref().is_some_and(|s| s.fences == "master");
         let mut b = vec![self.master_branch];
         if !master_only {

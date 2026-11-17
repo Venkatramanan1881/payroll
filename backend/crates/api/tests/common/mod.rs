@@ -89,7 +89,7 @@ pub async fn seed_org(pool: &PgPool) -> SeedOrg {
         .bind(org_id).bind(hr_user_id).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name, system_code) VALUES ($1, $2, 'HR Manager', 'hr_manager')")
         .bind(org_id).bind(role_id).execute(pool).await.unwrap();
-    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07", "TCP-11", "CMP-01"] {
+    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07", "TCP-11", "CMP-01", "TCP-04", "TCP-06", "TCP-07", "TCP-08", "TCP-09"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')")
             .bind(org_id).bind(role_id).bind(op).execute(pool).await.unwrap();
     }
@@ -124,4 +124,52 @@ pub async fn call(app: &axum::Router, s: &SeedOrg, method: &str, uri: &str, body
     let (res, json) = send(app, req(method, uri, &s.hr_token, body, &headers)).await;
     let etag = res.headers().get("etag").map(|v| v.to_str().unwrap().to_string());
     (res.status(), json, etag)
+}
+
+/// An employee of the seed organisation who signs in to the app: TCP-03 (punch), TCP-07 and TCP-09 on own records.
+pub struct Worker {
+    pub employee_id: Uuid,
+    pub user_id: Uuid,
+    pub token: String,
+}
+
+pub async fn seed_worker(pool: &PgPool, app: &axum::Router, s: &SeedOrg, name: &str) -> Worker {
+    let employee_id: Uuid = create_employee(app, s, name).await["id"].as_str().unwrap().parse().unwrap();
+    let user_id = Uuid::new_v4();
+    let role_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO iam.user_account (org_id, id, employee_id, login_kind, mobile) VALUES ($1, $2, $3, 'mobile_otp', $4)")
+        .bind(s.org_id).bind(user_id).bind(employee_id).bind(format!("+9190{}", &user_id.simple().to_string()[..8].bytes().map(|b| (b % 10).to_string()).collect::<String>()))
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO iam.role (org_id, id, name) VALUES ($1, $2, $3)").bind(s.org_id).bind(role_id).bind(format!("Employee {role_id}")).execute(pool).await.unwrap();
+    for op in ["TCP-03", "TCP-07", "TCP-09"] {
+        sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'self')")
+            .bind(s.org_id).bind(role_id).bind(op).execute(pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(s.org_id).bind(user_id).bind(role_id).execute(pool).await.unwrap();
+    Worker { employee_id, user_id, token: token(user_id, s.org_id) }
+}
+
+/// An enabled geo-fence for a branch (PC-03).
+pub async fn fence(pool: &PgPool, org: Uuid, branch: Uuid, lat: f64, lon: f64, radius_m: i32) {
+    sqlx::query("INSERT INTO org.geo_fence (org_id, branch_id, latitude, longitude, radius_m, enabled) VALUES ($1, $2, $3, $4, $5, true)")
+        .bind(org).bind(branch).bind(lat).bind(lon).bind(radius_m).execute(pool).await.unwrap();
+}
+
+/// A published 09:00-18:00 shift assigned to the employee from 2026-01-01, so no day is an off day.
+pub async fn day_shift(app: &axum::Router, s: &SeedOrg, employee: Uuid) {
+    let code = format!("G{}", &Uuid::new_v4().simple().to_string()[..6]);
+    let def = serde_json::json!({ "shift_type": "fixed", "start_time": "09:00", "end_time": "18:00" });
+    let (st, b, _) = call(app, s, "POST", "/v1/shifts", Some(serde_json::json!({ "code": code, "name": code, "effective_from": "2026-01-01", "definition": def })), None).await;
+    assert_eq!(st, axum::http::StatusCode::CREATED, "{b}");
+    let v = b["versions"][0]["id"].as_str().unwrap().to_string();
+    call(app, s, "POST", &format!("/v1/shift-versions/{v}/publish"), None, None).await;
+    let body = serde_json::json!({ "employee_id": employee, "source": "fixed_shift", "shift_id": b["id"], "valid_from": "2026-01-01", "reason": "joining" });
+    let (st, b, _) = call(app, s, "POST", "/v1/employee-schedules", Some(body), None).await;
+    assert_eq!(st, axum::http::StatusCode::CREATED, "{b}");
+}
+
+/// A request as another user (worker) with optional extra headers.
+pub async fn as_user(app: &axum::Router, token: &str, method: &str, uri: &str, body: Option<serde_json::Value>, headers: &[(&str, String)]) -> (axum::http::StatusCode, serde_json::Value) {
+    let (res, json) = send(app, req(method, uri, token, body, headers)).await;
+    (res.status(), json)
 }
