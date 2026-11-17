@@ -103,11 +103,22 @@ pub async fn create_draft(tx: &mut OrgTx<'_>, actor: Uuid, set: Uuid, from: Naiv
     Ok(id)
 }
 
-/// PATCH a draft (effective_from, reason). Published versions are refused by the G5 trigger.
+/// Only drafts can change (G5): published versions (scheduled, in force or superseded) are frozen.
+async fn require_draft(tx: &mut OrgTx<'_>, id: Uuid) -> Result<(), DomainError> {
+    let state: Option<String> = sqlx::query_scalar("SELECT state FROM policy.policy_version WHERE id = $1 FOR UPDATE").bind(id).fetch_optional(&mut ***tx).await?;
+    match state.as_deref() {
+        None => Err(DomainError::NotFound),
+        Some("draft") => Ok(()),
+        Some(_) => Err(DomainError::VersionFrozen),
+    }
+}
+
+/// PATCH a draft (effective_from, reason).
 pub async fn update_draft(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, from: Option<NaiveDate>, reason: Option<String>) -> Result<(), DomainError> {
     if from.is_none() && reason.is_none() {
         return Err(invalid("at least one field"));
     }
+    require_draft(tx, id).await?;
     let n = sqlx::query("UPDATE policy.policy_version SET effective_from = coalesce($2, effective_from), reason = coalesce($3, reason), updated_at = now(), updated_by = $4 WHERE id = $1")
         .bind(id)
         .bind(from)
@@ -124,7 +135,8 @@ pub async fn update_draft(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, from: Optio
 }
 
 async fn touch(tx: &mut OrgTx<'_>, actor: Uuid, version: Uuid) -> Result<(), DomainError> {
-    // Moves the version's ETag; on a published version the G5 trigger refuses this first (VERSION_FROZEN).
+    require_draft(tx, version).await?;
+    // Moves the version's ETag, so a stale If-Match on the next rule-group edit is refused.
     let n = sqlx::query("UPDATE policy.policy_version SET updated_at = now(), updated_by = $2 WHERE id = $1")
         .bind(version)
         .bind(actor)
@@ -205,8 +217,15 @@ pub async fn publish(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, today: NaiveDate
         "scheduled" | "in_force" | "superseded" => return Ok(()),
         other => return Err(DomainError::IllegalTransition(format!("cannot publish a {other} version"))),
     }
-    let locked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM period.lock_coverage WHERE dates @> $1::date)").bind(from).fetch_one(&mut ***tx).await?;
-    if locked {
+    // The version governs [from, next published version's start): refuse if that touches locked days (BR-06).
+    let next: Option<NaiveDate> = sqlx::query_scalar(
+        "SELECT min(effective_from) FROM policy.policy_version WHERE policy_set_id = $1 AND state IN ('scheduled','in_force','superseded') AND effective_from > $2",
+    )
+    .bind(set)
+    .bind(from)
+    .fetch_one(&mut ***tx)
+    .await?;
+    if db::any_locked(tx, from, next).await? {
         return Err(DomainError::PeriodLocked);
     }
     let new_state = if from <= today { "in_force" } else { "scheduled" };

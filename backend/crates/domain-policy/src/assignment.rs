@@ -58,6 +58,9 @@ pub async fn create_assignment(tx: &mut OrgTx<'_>, actor: Uuid, a: NewAssignment
     if a.valid_to.is_some_and(|to| to <= a.valid_from) {
         return Err(invalid("valid_to must be after valid_from"));
     }
+    if db::any_locked(tx, a.valid_from, a.valid_to).await? {
+        return Err(DomainError::PeriodLocked);
+    }
     let (col_sql, val_sql) = column.map(|c| (format!(", {c}"), ", $6")).unwrap_or_default();
     let sql = format!(
         "INSERT INTO policy.policy_assignment (org_id, policy_set_id, level, valid, reason, created_by{col_sql})
@@ -99,6 +102,10 @@ pub async fn end_assignment(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, to: Naive
     let (from, current_to) = row.ok_or(DomainError::NotFound)?;
     if to <= from || current_to.is_some_and(|c| to > c) {
         return Err(invalid("valid_to must fall inside the assignment"));
+    }
+    // Ending changes which policy applies on [to, old end): refuse if that touches locked days.
+    if db::any_locked(tx, to, current_to).await? {
+        return Err(DomainError::PeriodLocked);
     }
     sqlx::query("UPDATE policy.policy_assignment SET valid = daterange(lower(valid), $2) WHERE id = $1").bind(id).bind(to).execute(&mut ***tx).await?;
     db::audit(tx, actor, "policy_assignment.end", "policy_assignment", Some(id), Some(json!({ "valid_to": to, "reason": reason }))).await?;

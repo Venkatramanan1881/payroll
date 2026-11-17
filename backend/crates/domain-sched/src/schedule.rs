@@ -92,7 +92,8 @@ async fn pattern_is_off(tx: &mut OrgTx<'_>, pattern: Uuid, date: NaiveDate) -> R
     let week_of_month = ((date.day() - 1) / 7 + 1) as i16;
     Ok(match kind.as_str() {
         "fixed_days" => days.unwrap_or_default().contains(&iso_day),
-        "alternating" => alt_day == Some(iso_day) && alt_weeks.unwrap_or_default().contains(&week_of_month),
+        // Alternating may also carry weekly days off on top (e.g. Sundays plus 2nd and 4th Saturday).
+        "alternating" => days.unwrap_or_default().contains(&iso_day) || (alt_day == Some(iso_day) && alt_weeks.unwrap_or_default().contains(&week_of_month)),
         _ => false, // from_roster: only roster entries say so
     })
 }
@@ -115,6 +116,9 @@ pub async fn assign_schedule(tx: &mut OrgTx<'_>, actor: Uuid, s: NewSchedule) ->
     let NewSchedule { employee, source, shift, pattern, from, reason } = s;
     if reason.trim().is_empty() {
         return Err(invalid("reason"));
+    }
+    if db::employee_locked(tx, employee, from, None).await? {
+        return Err(DomainError::PeriodLocked);
     }
     let current: Option<(Uuid, NaiveDate)> =
         sqlx::query_as("SELECT id, lower(valid) FROM sched.employee_schedule WHERE employee_id = $1 AND valid @> $2::date FOR UPDATE")

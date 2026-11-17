@@ -15,9 +15,23 @@ const DEFINITION: [&str; 17] = [
 const VERSION_JSON: &str = "(to_jsonb(v) - 'org_id')";
 
 fn check_fields(def: &Map<String, Value>, extra: &[&str]) -> Result<(), DomainError> {
-    match def.keys().find(|k| !DEFINITION.contains(&k.as_str()) && !extra.contains(&k.as_str())) {
-        Some(k) => Err(invalid(format!("unknown field {k}"))),
-        None => Ok(()),
+    if let Some(k) = def.keys().find(|k| !DEFINITION.contains(&k.as_str()) && !extra.contains(&k.as_str())) {
+        return Err(invalid(format!("unknown field {k}")));
+    }
+    // The expected-day resolver handles only the default (SH-06 = shift start date); refuse rather than resolve the wrong day.
+    if def.get("night_attendance_date").and_then(Value::as_str) == Some("shift_end_date") {
+        return Err(invalid("night_attendance_date = shift_end_date is not supported yet"));
+    }
+    Ok(())
+}
+
+/// Only drafts can change (G5): published versions (scheduled, in force or superseded) are frozen.
+async fn require_draft(tx: &mut OrgTx<'_>, id: Uuid) -> Result<(), DomainError> {
+    let state: Option<String> = sqlx::query_scalar("SELECT state FROM sched.shift_version WHERE id = $1 FOR UPDATE").bind(id).fetch_optional(&mut ***tx).await?;
+    match state.as_deref() {
+        None => Err(DomainError::NotFound),
+        Some("draft") => Ok(()),
+        Some(_) => Err(DomainError::VersionFrozen),
     }
 }
 
@@ -115,6 +129,7 @@ pub async fn update_version(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, patch: Ma
         return Err(invalid("at least one field"));
     }
     check_fields(&patch, &["effective_from"])?;
+    require_draft(tx, id).await?;
     let mut cols = columns(&patch);
     if patch.contains_key("effective_from") {
         cols.push("effective_from");
@@ -144,6 +159,17 @@ pub async fn publish_version(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, today: N
         "draft" => {}
         "scheduled" | "in_force" | "superseded" => return Ok(()),
         other => return Err(DomainError::IllegalTransition(format!("cannot publish a {other} version"))),
+    }
+    // The version governs [from, next published version's start): refuse if that touches locked days (BR-06).
+    let next: Option<NaiveDate> = sqlx::query_scalar(
+        "SELECT min(effective_from) FROM sched.shift_version WHERE shift_id = $1 AND state IN ('scheduled','in_force','superseded') AND effective_from > $2",
+    )
+    .bind(shift)
+    .bind(from)
+    .fetch_one(&mut ***tx)
+    .await?;
+    if db::any_locked(tx, from, next).await? {
+        return Err(DomainError::PeriodLocked);
     }
     let new_state = if from <= today { "in_force" } else { "scheduled" };
     sqlx::query("UPDATE sched.shift_version SET state = $2, updated_by = $3 WHERE id = $1").bind(id).bind(new_state).bind(actor).execute(&mut ***tx).await?;

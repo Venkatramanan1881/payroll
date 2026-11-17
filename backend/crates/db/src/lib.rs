@@ -91,3 +91,23 @@ impl From<sqlx::Error> for DomainError {
 pub fn invalid(msg: impl Into<String>) -> DomainError {
     DomainError::Validation(msg.into())
 }
+
+/// True when any employee's locked attendance (period.lock_coverage) overlaps [from, to) — `to` None = open-ended.
+/// For organisation-wide changes (shift and policy versions, assignments, holidays) that could alter locked days (BR-06).
+pub async fn any_locked(tx: &mut OrgTx<'_>, from: chrono::NaiveDate, to: Option<chrono::NaiveDate>) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM period.lock_coverage WHERE dates && daterange($1, $2))")
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut ***tx)
+        .await
+}
+
+/// True when this employee's locked attendance overlaps [from, to).
+pub async fn employee_locked(tx: &mut OrgTx<'_>, employee: Uuid, from: chrono::NaiveDate, to: Option<chrono::NaiveDate>) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM period.lock_coverage WHERE employee_id = $1 AND dates && daterange($2, $3))")
+        .bind(employee)
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut ***tx)
+        .await
+}

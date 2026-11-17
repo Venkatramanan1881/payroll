@@ -208,7 +208,7 @@ pub struct CalendarPatch {
 }
 
 pub async fn update_calendar(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "SCH-05").await?;
+    calendar_in_scope(&mut tx, &p, id).await?;
     sqlx::query("SELECT 1 FROM sched.holiday_calendar WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **tx).await?;
     if_match(&headers, &calendar::get_calendar(&mut tx, id).await?)?;
     let r: CalendarPatch = parse(&raw)?;
@@ -240,7 +240,7 @@ pub struct NewHoliday {
 }
 
 pub async fn add_holiday(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "SCH-05").await?;
+    calendar_in_scope(&mut tx, &p, id).await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/holiday-calendars/{id}/holidays"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -261,7 +261,8 @@ pub struct HolidayPatch {
 }
 
 pub async fn update_holiday(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "SCH-05").await?;
+    let cal = calendar::holiday_calendar_of(&mut tx, id).await?;
+    calendar_in_scope(&mut tx, &p, cal).await?;
     sqlx::query("SELECT 1 FROM sched.holiday WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **tx).await?;
     if_match(&headers, &calendar::get_holiday(&mut tx, id).await?)?;
     let r: HolidayPatch = parse(&raw)?;
@@ -272,7 +273,8 @@ pub async fn update_holiday(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers
 }
 
 pub async fn remove_holiday(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "SCH-05").await?;
+    let cal = calendar::holiday_calendar_of(&mut tx, id).await?;
+    calendar_in_scope(&mut tx, &p, cal).await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/holidays/{id}/remove"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -408,4 +410,15 @@ pub async fn my_roster(Auth(p, mut tx): Auth, Query(r): Query<Range>) -> Result<
     let from = r.from.unwrap_or_else(today);
     let to = r.to.unwrap_or(from + chrono::Days::new(13));
     Ok(Json(json!({ "items": schedule::schedule_days(&mut tx, me, branch, from, to).await? })))
+}
+
+/// SCH-05 is scoped (PERMISSION_MATRIX): a calendar may be changed only when every branch it serves is in the caller's
+/// scope. Out of scope reads as not found, as for employees.
+async fn calendar_in_scope(tx: &mut OrgTx<'_>, p: &domain_iam::authz::Principal, calendar: Uuid) -> Result<(), ApiError> {
+    use domain_iam::authz::{employee_in_scope, GrantKind};
+    let grant = require(tx, p, "SCH-05").await?;
+    calendar::get_calendar(tx, calendar).await?;
+    let branches = calendar::calendar_branches(tx, calendar).await?;
+    let ok = matches!(grant.kind, GrantKind::All | GrantKind::Scoped) && branches.iter().all(|b| employee_in_scope(&grant.scope, *b, None));
+    if ok { Ok(()) } else { Err(ApiError::NotFound) }
 }

@@ -137,6 +137,7 @@ pub async fn add_holiday(tx: &mut OrgTx<'_>, actor: Uuid, calendar: Uuid, date: 
         return Err(invalid("name and reason are required"));
     }
     get_calendar(tx, calendar).await?; // NotFound for another organisation's calendar
+    holiday_unlocked(tx, date).await?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO sched.holiday (org_id, calendar_id, holiday_date, name, kind, created_by, updated_by)
          VALUES (app.current_org(), $1, $2, $3, $4, $5, $5) RETURNING id",
@@ -172,6 +173,10 @@ pub async fn update_holiday(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, date: Opt
         return Err(invalid("reason"));
     }
     let before = get_holiday(tx, id).await?;
+    holiday_unlocked(tx, date_of(&before)?).await?;
+    if let Some(d) = date {
+        holiday_unlocked(tx, d).await?;
+    }
     sqlx::query(
         "UPDATE sched.holiday SET holiday_date = coalesce($2, holiday_date), name = coalesce($3, name), kind = coalesce($4, kind),
            updated_at = now(), updated_by = $5 WHERE id = $1",
@@ -190,6 +195,7 @@ pub async fn update_holiday(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, date: Opt
 /// Deletes the holiday; its prior values stay in the audit entry (sched.holiday has no soft-remove column).
 pub async fn remove_holiday(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid) -> Result<(), DomainError> {
     let before = get_holiday(tx, id).await?;
+    holiday_unlocked(tx, date_of(&before)?).await?;
     sqlx::query("DELETE FROM sched.holiday WHERE id = $1").bind(id).execute(&mut ***tx).await?;
     sqlx::query(
         "INSERT INTO audit.audit_entry (org_id, actor_kind, actor_id, action, target_type, target_id, before_value)
@@ -201,4 +207,26 @@ pub async fn remove_holiday(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid) -> Result
     .execute(&mut ***tx)
     .await?;
     Ok(())
+}
+
+/// A holiday on a locked date would change locked days (BR-06).
+async fn holiday_unlocked(tx: &mut OrgTx<'_>, date: NaiveDate) -> Result<(), DomainError> {
+    if db::any_locked(tx, date, date.succ_opt()).await? {
+        return Err(DomainError::PeriodLocked);
+    }
+    Ok(())
+}
+
+fn date_of(holiday: &Value) -> Result<NaiveDate, DomainError> {
+    holiday["holiday_date"].as_str().and_then(|d| d.parse().ok()).ok_or_else(|| invalid("holiday_date"))
+}
+
+/// Branches whose expected days this calendar drives (for the caller's scope check).
+pub async fn calendar_branches(tx: &mut OrgTx<'_>, calendar: Uuid) -> Result<Vec<Uuid>, DomainError> {
+    Ok(sqlx::query_scalar("SELECT id FROM org.branch WHERE holiday_calendar_id = $1").bind(calendar).fetch_all(&mut ***tx).await?)
+}
+
+/// The calendar a holiday belongs to.
+pub async fn holiday_calendar_of(tx: &mut OrgTx<'_>, holiday: Uuid) -> Result<Uuid, DomainError> {
+    sqlx::query_scalar("SELECT calendar_id FROM sched.holiday WHERE id = $1").bind(holiday).fetch_optional(&mut ***tx).await?.ok_or(DomainError::NotFound)
 }
