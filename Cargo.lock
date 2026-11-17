@@ -394,6 +394,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "domain-timecap"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "db",
+ "domain-policy",
+ "domain-sched",
+ "serde_json",
+ "sqlx",
+ "uuid",
+]
+
+[[package]]
 name = "domain-workforce"
 version = "0.1.0"
 dependencies = [
