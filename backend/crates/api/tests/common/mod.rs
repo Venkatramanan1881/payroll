@@ -74,7 +74,7 @@ pub struct SeedOrg {
     pub hr_token: String,
 }
 
-/// One organisation, one branch "HQ", and an HR Manager with WRK-01/02/03/08 scoped to all branches.
+/// One organisation, one branch "HQ", and an HR Manager with the slice-1/2 grants (WRK, SCH, POL) scoped to all branches.
 /// Inserted as the superuser (the test pool), the way vendor set-up would.
 pub async fn seed_org(pool: &PgPool) -> SeedOrg {
     let org_id = Uuid::new_v4();
@@ -89,7 +89,7 @@ pub async fn seed_org(pool: &PgPool) -> SeedOrg {
         .bind(org_id).bind(hr_user_id).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name, system_code) VALUES ($1, $2, 'HR Manager', 'hr_manager')")
         .bind(org_id).bind(role_id).execute(pool).await.unwrap();
-    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08"] {
+    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')")
             .bind(org_id).bind(role_id).bind(op).execute(pool).await.unwrap();
     }
@@ -113,4 +113,15 @@ pub fn bearer(token: &str) -> axum::http::HeaderMap {
     let mut h = axum::http::HeaderMap::new();
     h.insert("authorization", format!("Bearer {token}").parse().unwrap());
     h
+}
+
+/// POST/PUT/PATCH helper for HR with a fresh Idempotency-Key (and optional If-Match).
+pub async fn call(app: &axum::Router, s: &SeedOrg, method: &str, uri: &str, body: Option<serde_json::Value>, if_match: Option<&str>) -> (axum::http::StatusCode, serde_json::Value, Option<String>) {
+    let mut headers = vec![("idempotency-key", Uuid::new_v4().to_string())];
+    if let Some(t) = if_match {
+        headers.push(("if-match", t.to_string()));
+    }
+    let (res, json) = send(app, req(method, uri, &s.hr_token, body, &headers)).await;
+    let etag = res.headers().get("etag").map(|v| v.to_str().unwrap().to_string());
+    (res.status(), json, etag)
 }

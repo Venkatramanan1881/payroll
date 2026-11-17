@@ -33,6 +33,7 @@ dependencies = [
  "chrono",
  "db",
  "domain-iam",
+ "domain-sched",
  "domain-workforce",
  "http-body-util",
  "serde",
@@ -364,6 +365,17 @@ dependencies = [
  "sha2",
  "sqlx",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "domain-sched"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "db",
+ "serde_json",
+ "sqlx",
  "uuid",
 ]
 

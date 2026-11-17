@@ -14,6 +14,8 @@ pub enum ApiError {
     PreconditionRequired,
     PreconditionFailed,
     PeriodLocked,
+    VersionFrozen,
+    IllegalTransition(String),
     IdempotencyConflict,
     EmployeeLimitReached,
     /// Phone verified for several organisations: (choice token, [(candidate_ref, display_name)]).
@@ -30,6 +32,8 @@ impl ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", "Not found"),
             ApiError::PreconditionFailed => (StatusCode::PRECONDITION_FAILED, "PRECONDITION_FAILED", "Resource changed since it was read"),
             ApiError::PeriodLocked => (StatusCode::CONFLICT, "PERIOD_LOCKED", "Date is in a locked period"),
+            ApiError::VersionFrozen => (StatusCode::CONFLICT, "VERSION_FROZEN", "A published version cannot be changed"),
+            ApiError::IllegalTransition(_) => (StatusCode::CONFLICT, "ILLEGAL_TRANSITION", "Not allowed in the current state"),
             ApiError::PreconditionRequired => (StatusCode::PRECONDITION_REQUIRED, "PRECONDITION_REQUIRED", "Required header missing"),
             ApiError::IdempotencyConflict => (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT", "Idempotency-Key reused with a different body"),
             ApiError::EmployeeLimitReached => (StatusCode::CONFLICT, "EMPLOYEE_LIMIT_REACHED", "Employee limit reached"),
@@ -54,7 +58,7 @@ impl IntoResponse for ApiError {
             "correlation_id": uuid::Uuid::new_v4(),
         });
         match self {
-            ApiError::ValidationFailed(detail) => body["detail"] = json!(detail),
+            ApiError::ValidationFailed(detail) | ApiError::IllegalTransition(detail) => body["detail"] = json!(detail),
             ApiError::OrganisationChoiceRequired(choice_token, cands) => {
                 body["choice_token"] = json!(choice_token);
                 body["candidates"] = cands.iter().map(|(r, n)| json!({ "candidate_ref": r, "display_name": n })).collect();
@@ -88,6 +92,20 @@ impl From<domain_workforce::employee::WorkforceError> for ApiError {
             W::LimitReached => ApiError::EmployeeLimitReached,
             W::PeriodLocked => ApiError::PeriodLocked,
             W::Db(e) => e.into(),
+        }
+    }
+}
+
+impl From<db::DomainError> for ApiError {
+    fn from(e: db::DomainError) -> Self {
+        use db::DomainError as D;
+        match e {
+            D::Validation(m) => ApiError::ValidationFailed(m),
+            D::NotFound => ApiError::NotFound,
+            D::IllegalTransition(m) => ApiError::IllegalTransition(m),
+            D::VersionFrozen => ApiError::VersionFrozen,
+            D::PeriodLocked => ApiError::PeriodLocked,
+            D::Db(e) => e.into(),
         }
     }
 }

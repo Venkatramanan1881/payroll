@@ -59,3 +59,35 @@ pub async fn audit(
     .await?;
     Ok(())
 }
+
+/// Error shared by the domain crates added from slice 2 on.
+#[derive(Debug)]
+pub enum DomainError {
+    Validation(String),
+    NotFound,
+    IllegalTransition(String),
+    VersionFrozen,
+    PeriodLocked,
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for DomainError {
+    /// Constraint violations come from the caller's input (422); the G5 freeze trigger is VERSION_FROZEN.
+    fn from(e: sqlx::Error) -> Self {
+        if let Some(db) = e.as_database_error() {
+            match db.code().as_deref() {
+                Some("23503" | "23505" | "23514" | "23P01" | "22007" | "22008" | "22P02") => {
+                    return DomainError::Validation(db.constraint().unwrap_or(db.message()).to_string())
+                }
+                // RLS violations share 42501, so only the trigger's own "(G5)" message counts as frozen.
+                Some("42501") if db.message().contains("(G5)") => return DomainError::VersionFrozen,
+                _ => {}
+            }
+        }
+        DomainError::Db(e)
+    }
+}
+
+pub fn invalid(msg: impl Into<String>) -> DomainError {
+    DomainError::Validation(msg.into())
+}
