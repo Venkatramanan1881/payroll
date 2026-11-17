@@ -11,6 +11,9 @@ pub enum ApiError {
     OrgSuspended,
     NotFound,
     ValidationFailed(String),
+    PreconditionRequired,
+    IdempotencyConflict,
+    EmployeeLimitReached,
     /// Phone verified for several organisations: (choice token, [(candidate_ref, display_name)]).
     OrganisationChoiceRequired(String, Vec<(String, String)>),
     Internal(anyhow::Error),
@@ -23,6 +26,9 @@ impl ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "FORBIDDEN", "Not allowed"),
             ApiError::OrgSuspended => (StatusCode::FORBIDDEN, "ORG_SUSPENDED", "Organisation is suspended"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", "Not found"),
+            ApiError::PreconditionRequired => (StatusCode::PRECONDITION_REQUIRED, "PRECONDITION_REQUIRED", "Required header missing"),
+            ApiError::IdempotencyConflict => (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT", "Idempotency-Key reused with a different body"),
+            ApiError::EmployeeLimitReached => (StatusCode::CONFLICT, "EMPLOYEE_LIMIT_REACHED", "Employee limit reached"),
             ApiError::ValidationFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Request is not valid"),
             ApiError::OrganisationChoiceRequired(..) => (StatusCode::CONFLICT, "ORGANISATION_CHOICE_REQUIRED", "Choose an organisation"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Internal error"),
@@ -66,6 +72,17 @@ impl From<domain_iam::authz::AuthzError> for ApiError {
         match e {
             domain_iam::authz::AuthzError::Forbidden => ApiError::Forbidden,
             domain_iam::authz::AuthzError::Db(e) => e.into(),
+        }
+    }
+}
+
+impl From<domain_workforce::employee::WorkforceError> for ApiError {
+    fn from(e: domain_workforce::employee::WorkforceError) -> Self {
+        use domain_workforce::employee::WorkforceError as W;
+        match e {
+            W::Validation(m) => ApiError::ValidationFailed(m),
+            W::LimitReached => ApiError::EmployeeLimitReached,
+            W::Db(e) => e.into(),
         }
     }
 }

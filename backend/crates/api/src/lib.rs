@@ -1,5 +1,6 @@
 mod error;
 mod extract;
+mod idempotency;
 mod routes;
 
 pub use error::ApiError;
@@ -23,6 +24,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/auth/organisation-choice", post(routes::auth::choose_organisation))
         .route("/v1/auth/refresh", post(routes::auth::refresh))
         .route("/v1/auth/sign-out", post(routes::auth::sign_out))
+        .route("/v1/employees", post(routes::employees::create))
         .fallback(|| async { ApiError::NotFound })
         .with_state(state)
 }
