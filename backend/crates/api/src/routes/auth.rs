@@ -1,6 +1,6 @@
 //! identity.yaml: Firebase sign-in, organisation choice, refresh, sign-out.
 
-use crate::{unix_now, ApiError, AppState, Auth};
+use crate::{unix_now, ApiError, AppState};
 use axum::extract::{rejection::JsonRejection, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -72,7 +72,9 @@ pub async fn refresh(State(state): State<AppState>, req: Result<Json<Refresh>, J
     Ok(token_pair(&state, user_id, org_id, sid, refresh))
 }
 
-pub async fn sign_out(Auth(p, mut tx): Auth) -> Result<StatusCode, ApiError> {
+/// Not treated as a write for VC-R4: a suspended organisation's users must still be able to end their session.
+pub async fn sign_out(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
+    let (p, mut tx) = crate::authenticate(&state, &headers, false).await?;
     if let Some(sid) = p.session_id {
         signin::revoke_session(&mut tx, p.user_id, sid).await?;
         tx.commit().await?;

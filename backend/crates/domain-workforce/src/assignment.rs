@@ -74,6 +74,12 @@ pub async fn change_assignment(
     .bind(valid_from)
     .fetch_optional(&mut ***tx)
     .await?;
+    if let Some((_, start, row)) = &current {
+        let same_target = value.map(|v| v.to_string()) == row[target_column(kind).expect("checked")].as_str().map(str::to_string);
+        if *start == valid_from && same_target {
+            return Ok(row.clone()); // workforce.yaml: same value and date -> 200 no-op (nothing written)
+        }
+    }
     if let Some((id, start, _)) = &current {
         if *start >= valid_from {
             return Err(invalid("valid_from must be after the current assignment's start"));

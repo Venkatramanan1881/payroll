@@ -17,7 +17,7 @@ pub(crate) fn today() -> chrono::NaiveDate {
 pub async fn create(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<(StatusCode, Json<Value>), ApiError> {
     let grant = require(&mut tx, &p, "WRK-01").await?;
     let key = idempotency::key(&headers)?;
-    if let Some((status, body)) = idempotency::begin(&mut tx, key, &raw).await? {
+    if let Some((status, body)) = idempotency::begin(&mut tx, key, "POST /v1/employees", &raw).await? {
         return Ok((status, Json(body)));
     }
     let input: EmployeeCreate = serde_json::from_slice(&raw).map_err(|e| ApiError::ValidationFailed(e.to_string()))?;
@@ -42,8 +42,12 @@ use domain_workforce::assignment;
 use uuid::Uuid;
 
 /// The employee as the caller may see it: outside the caller's organisation or scope it is NOT_FOUND, never FORBIDDEN.
-async fn load_in_scope(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, op: &str) -> Result<Value, ApiError> {
+async fn load_in_scope(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, op: &str, lock: bool) -> Result<Value, ApiError> {
     let grant = require(tx, p, op).await?;
+    if lock {
+        // Writes hold the row from the ETag check to commit, so two edits of one version cannot both apply.
+        sqlx::query("SELECT 1 FROM workforce.employee WHERE id = $1 FOR UPDATE").bind(id).execute(&mut ***tx).await?;
+    }
     let emp = employee::load_employee(tx, id, today()).await?.ok_or(ApiError::NotFound)?;
     let uuid_at = |k: &str| emp["current"][k].as_str().and_then(|s| Uuid::parse_str(s).ok());
     let visible = match grant.kind {
@@ -65,14 +69,14 @@ fn with_etag(status: StatusCode, body: Value, etag: &str) -> Response {
 
 /// GET /v1/employees/{employee_id} (WRK-08).
 pub async fn get(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
-    let emp = load_in_scope(&mut tx, &p, id, "WRK-08").await?;
+    let emp = load_in_scope(&mut tx, &p, id, "WRK-08", false).await?;
     let tag = employee::etag(&emp);
     Ok(with_etag(StatusCode::OK, emp, &tag))
 }
 
 /// PATCH /v1/employees/{employee_id} (WRK-02).
 pub async fn patch(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    let emp = load_in_scope(&mut tx, &p, id, "WRK-02").await?;
+    let emp = load_in_scope(&mut tx, &p, id, "WRK-02", true).await?;
     if_match(&headers, &emp)?;
     let fields: serde_json::Map<String, Value> = serde_json::from_slice(&raw).map_err(|e| ApiError::ValidationFailed(e.to_string()))?;
     employee::update_employee(&mut tx, p.user_id, id, fields, today()).await?;
@@ -90,7 +94,7 @@ pub struct AssignmentFilter {
 
 /// GET /v1/employees/{employee_id}/assignments (WRK-08).
 pub async fn list_assignments(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, Query(f): Query<AssignmentFilter>) -> Result<Json<Value>, ApiError> {
-    load_in_scope(&mut tx, &p, id, "WRK-08").await?;
+    load_in_scope(&mut tx, &p, id, "WRK-08", false).await?;
     let items = assignment::list_assignments(&mut tx, id, f.kind.as_deref(), f.on).await?;
     Ok(Json(serde_json::json!({ "items": items })))
 }
@@ -106,10 +110,10 @@ pub struct ChangeAssignment {
 
 /// POST /v1/employees/{employee_id}/change-assignment (WRK-03). Idempotency-Key and If-Match (employee ETag).
 pub async fn change_assignment(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    let emp = load_in_scope(&mut tx, &p, id, "WRK-03").await?;
+    let emp = load_in_scope(&mut tx, &p, id, "WRK-03", true).await?;
     let key = idempotency::key(&headers)?;
     // A retry replays the stored answer even though the ETag has since moved on.
-    if let Some((status, body)) = idempotency::begin(&mut tx, key, &raw).await? {
+    if let Some((status, body)) = idempotency::begin(&mut tx, key, &format!("POST /v1/employees/{id}/change-assignment"), &raw).await? {
         let tag = employee::etag(&employee::load_employee(&mut tx, id, today()).await?.ok_or(ApiError::NotFound)?);
         return Ok(with_etag(status, body, &tag));
     }

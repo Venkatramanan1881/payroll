@@ -14,8 +14,9 @@ pub fn key(headers: &HeaderMap) -> Result<Uuid, ApiError> {
 }
 
 /// Claims the key. Ok(None): first use, run the command. Ok(Some(..)): stored response to replay.
-pub async fn begin(tx: &mut OrgTx<'_>, key: Uuid, body: &[u8]) -> Result<Option<(StatusCode, Value)>, ApiError> {
-    let hash = Sha256::digest(body).to_vec();
+/// `operation` is the method and path, so one key reused on another resource is a conflict, not a replay.
+pub async fn begin(tx: &mut OrgTx<'_>, key: Uuid, operation: &str, body: &[u8]) -> Result<Option<(StatusCode, Value)>, ApiError> {
+    let hash = Sha256::new().chain_update(operation.as_bytes()).chain_update([0u8]).chain_update(body).finalize().to_vec();
     // A concurrent request with the same key waits here until the first one commits.
     let inserted = sqlx::query("INSERT INTO app.idempotency_key (org_id, key, request_hash) VALUES (app.current_org(), $1, $2) ON CONFLICT DO NOTHING")
         .bind(key)

@@ -229,7 +229,8 @@ async fn next_code(tx: &mut OrgTx<'_>, branch: Uuid) -> Result<String, Workforce
     Ok(format!("{prefix}-{n:04}"))
 }
 
-/// workforce.yaml Employee with `current` = assignments valid on `today`. None if not visible in the caller's organisation.
+/// workforce.yaml Employee with `current` = assignments valid on `today`, or on the joining date for a future joiner
+/// (so a new hire entered ahead of time stays visible and in scope). None if not visible in the caller's organisation.
 pub async fn load_employee(tx: &mut OrgTx<'_>, id: Uuid, today: NaiveDate) -> Result<Option<Value>, WorkforceError> {
     let row: Option<Value> = sqlx::query_scalar(
         "SELECT jsonb_build_object(
@@ -245,7 +246,7 @@ pub async fn load_employee(tx: &mut OrgTx<'_>, id: Uuid, today: NaiveDate) -> Re
                'employee_type_id', max(a.list_entry_id::text) FILTER (WHERE a.kind = 'employee_type'),
                'reporting_manager_employee_id', max(a.manager_employee_id::text) FILTER (WHERE a.kind = 'reporting_manager'),
                'contractor_id', max(a.contractor_id::text) FILTER (WHERE a.kind = 'contractor'))
-             FROM workforce.employee_assignment a WHERE a.employee_id = e.id AND a.valid @> $2::date),
+             FROM workforce.employee_assignment a WHERE a.employee_id = e.id AND a.valid @> greatest($2::date, e.joining_date)),
            'created_at', e.created_at, 'updated_at', e.updated_at)
          FROM workforce.employee e WHERE e.id = $1",
     )
@@ -271,11 +272,23 @@ pub async fn update_employee(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, fields: 
     if let Some(k) = fields.keys().find(|k| !PATCHABLE.contains(&k.as_str())) {
         return Err(invalid(k)); // includes custom_fields, not supported yet
     }
-    if let Some(v) = fields.get("full_name") {
-        let ok = v.as_str().is_some_and(|n| !n.trim().is_empty() && n.chars().count() <= 200);
-        if !ok {
-            return Err(invalid("full_name"));
-        }
+    let mut fields = fields;
+    if let Some(v) = fields.get_mut("full_name") {
+        let name = v.as_str().map(str::trim).filter(|n| !n.is_empty() && n.chars().count() <= 200).ok_or_else(|| invalid("full_name"))?;
+        *v = Value::String(name.to_string());
+    }
+    let text_ok = |k: &str, max: usize| fields.get(k).is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.chars().count() <= max));
+    if !text_ok("email", 254) {
+        return Err(invalid("email"));
+    }
+    if !text_ok("address", 500) {
+        return Err(invalid("address"));
+    }
+    if fields.get("date_of_birth").is_some_and(|v| !v.is_null() && v.as_str().and_then(|d| d.parse::<NaiveDate>().ok()).is_none()) {
+        return Err(invalid("date_of_birth"));
+    }
+    if fields.get("emergency_contact").is_some_and(|v| !v.is_null() && !v.is_object()) {
+        return Err(invalid("emergency_contact"));
     }
     if let Some(v) = fields.get("mobile").filter(|v| !v.is_null()) {
         let digits = v.as_str().and_then(|m| m.strip_prefix('+')).unwrap_or("");
