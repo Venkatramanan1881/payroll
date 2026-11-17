@@ -42,7 +42,7 @@ use domain_workforce::assignment;
 use uuid::Uuid;
 
 /// The employee as the caller may see it: outside the caller's organisation or scope it is NOT_FOUND, never FORBIDDEN.
-async fn load_in_scope(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, op: &str, lock: bool) -> Result<Value, ApiError> {
+pub(crate) async fn load_in_scope(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, op: &str, lock: bool) -> Result<Value, ApiError> {
     let grant = require(tx, p, op).await?;
     if lock {
         // Writes hold the row from the ETag check to commit, so two edits of one version cannot both apply.
