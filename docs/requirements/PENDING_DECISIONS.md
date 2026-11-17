@@ -1,29 +1,31 @@
 # Pending decisions: everything still unanswered
 
+Answers are logged in `DECISIONS.md` (first batch 2026-11-16).
+
 Status as of 2026-11-16, end of Phase 4 (API contracts). Full detail for every ID is in `OPEN_QUESTIONS.md`.
 Each line says **what it blocks**. Gates 1–3 were approved with all of these still open. The design keeps a neutral slot for each one, but **Phase 5 code cannot be written for the parts marked Tier 1 without an answer**: the skill forbids guessing business rules in implementation.
 
 ## Tier 1: answer before Phase 5 (backend) starts
 
-| # | ID | Question | Blocks |
-|---|---|---|---|
-| 1 | Q14 | Who signs off BRD v0.8 and TSD v0.1? Both are still "Draft, not yet approved". | Formal baseline for everything built |
-| 2 | DP-01 / G-A | How is a V1 attendance period defined without payroll groups: per organisation, per branch, or per policy set? (and what "payroll period" means in V1 settings) | Period generation, lock, counters, exports |
-| 3 | DP-03 | When an employee matches policy assignments at two of branch, department, category and shift, which wins? | PolicyResolver, i.e. every day calculation |
-| 4 | DP-04 / G-J | Punching at an allowed branch in another time zone: whose time zone and holiday calendar apply? | Attendance date, late/early, holidays |
-| 5 | DP-05 / G-16 | Which punch flags count before approval (E18 says geo-fence does not), and who decides each flag? | Day calculation, approval routing |
-| 6 | DP-02 / G-B | Leave debit order for penalties and absences: LA-12/EC-11 or LV-04, and what if "casual leave" does not exist? | Penalty recovery, ledger postings |
-| 7 | DP-06 / G-C | Absent day with no leave: DS-10 or LM-28 governs? | Day status, deduction days |
-| 8 | G-K | Which "cut-off" applies to unresolved missed punches (MP-03) and pending requests at lock? | Missed-punch resolution, lock |
-| 9 | DP-11 / G-N | Is overtime identified (and exported) when the Overtime module is off? | Payroll input export |
-| 10 | G-D / OQ-C12-05 | Does the Payroll Officer role exist in V1 organisations without Payroll; if not, who locks periods? | Lock permissions, seed roles |
-| 11 | Q15 / D1 / TB-04 | Can the eSSL devices in use push over HTTPS, and how often do they contact the server? | Device gateway adapter |
-| 12 | Q16 / D2 / D3 | Sign-in codes: Indian SMS provider or Firebase; which SMS and email providers? | Employee sign-in |
-| 13 | Q5 | Which modules and limits go in each plan; which plans include the app? | Vendor console seed data |
-| 14 | D4 | Is a Mumbai region available on the chosen Supabase plan? (TB-07 data in India) | Environment set-up |
-| 15 | Supabase checks | Can the migration role create the `BYPASSRLS` role `app_resolver`, change function owners, and create `btree_gist`? (MIGRATIONS.md §3) | First migration on test |
-| 16 | OQ-V01-17 | How do vendor users sign in, and is a second step mandatory for them? (no contract possible until decided) | Vendor console sign-in |
-| 17 | GAP-SM-07 | What does "finalised" mean for a day, and when is it reached? (BRD §2 success measure; TSD J1 nightly finalisation) | Day lifecycle, nightly job J1 |
+| # | ID | Question | Blocks | Status |
+|---|---|---|---|---|
+| 1 | Q14 | Who signs off BRD v0.8 and TSD v0.1? Both are still "Draft, not yet approved". | Formal baseline for everything built | **D-01:** you are the sign-off authority; formal sign-off of BRD v0.8 / TSD v0.2 still pending |
+| 2 | DP-01 / G-A | How is a V1 attendance period defined without payroll groups: per organisation, per branch, or per policy set? (and what "payroll period" means in V1 settings) | Period generation, lock, counters, exports | ✅ **D-02:** one cycle per organisation |
+| 3 | DP-03 | When an employee matches policy assignments at two of branch, department, category and shift, which wins? | PolicyResolver, i.e. every day calculation | ✅ **D-03:** employee > shift > department > category > branch > organisation |
+| 4 | DP-04 / G-J | Punching at an allowed branch in another time zone: whose time zone and holiday calendar apply? | Attendance date, late/early, holidays | ✅ **D-04:** branch where the punch happened |
+| 5 | DP-05 / G-16 | Which punch flags count before approval (E18 says geo-fence does not), and who decides each flag? | Day calculation, approval routing | ✅ **D-05 / D-05c:** per flag type, defaults approved |
+| 6 | DP-02 / G-B | Leave debit order for penalties and absences: LA-12/EC-11 or LV-04, and what if "casual leave" does not exist? | Penalty recovery, ledger postings | ✅ **D-06 / D-06b / D-06c:** LA-12/EC-11 with all five options; sector template defines the leave types |
+| 7 | DP-06 / G-C | Absent day with no leave: DS-10 or LM-28 governs? | Day status, deduction days | ✅ **D-07 / D-07b:** DS-10, all options, auto-debit uses LV-04 |
+| 8 | G-K | Which "cut-off" applies to unresolved missed punches (MP-03) and pending requests at lock? | Missed-punch resolution, lock | ✅ **D-08:** 02:30 per shift, on the day after the shift ends (migration 0008) |
+| 9 | DP-11 / G-N | Is overtime identified (and exported) when the Overtime module is off? | Payroll input export | ✅ **D-09:** no overtime in V1 (overrides BRD §21 notes 1–2) |
+| 10 | G-D / OQ-C12-05 | Does the Payroll Officer role exist in V1 organisations without Payroll; if not, who locks periods? | Lock permissions, seed roles | ✅ **D-10:** HR Manager |
+| 11 | Q15 / D1 / TB-04 | Can the eSSL devices in use push over HTTPS, and how often do they contact the server? | Device gateway adapter | Later (your request) |
+| 12 | Q16 / D2 / D3 | Sign-in codes: Indian SMS provider or Firebase; which SMS and email providers? | Employee sign-in | ✅ **D-12 / D-12b:** Firebase for sign-in; Zoho ZeptoMail for email |
+| 13 | Q5 | Which modules and limits go in each plan; which plans include the app? | Vendor console seed data | ✅ **D-13:** plans approved (one cell wording to confirm) |
+| 14 | D4 | Is a Mumbai region available on the chosen Supabase plan? (TB-07 data in India) | Environment set-up | ✅ **D-14:** yes |
+| 15 | Supabase checks | Can the migration role create the `BYPASSRLS` role `app_resolver`, change function owners, and create `btree_gist`? (MIGRATIONS.md §3) | First migration on test | You are running the script; waiting for PASS/FAIL lines |
+| 16 | OQ-V01-17 | How do vendor users sign in, and is a second step mandatory for them? (no contract possible until decided) | Vendor console sign-in | ✅ **D-16:** email + password + authenticator, mandatory |
+| 17 | GAP-SM-07 | What does "finalised" mean for a day, and when is it reached? (BRD §2 success measure; TSD J1 nightly finalisation) | Day lifecycle, nightly job J1 | ✅ **D-17:** at period lock (migration 0007) |
 
 ## Tier 2: can be answered during Phase 5 (a default is not assumed; the item stays neutral)
 
@@ -44,7 +46,7 @@ Q1 daily allowance logic (V3) · Q2 leave encashment (V2) · Q3 bank list format
 | # | Item | Why it matters |
 |---|---|---|
 | H1 | ~~Run `git init`~~ | **Done by you** (commit "Upto phase 3"). |
-| H2 | ~~Move `docs/`~~ | **Done 2026-11-16 at your request:** now `.claude/skills/payroll-saas-engineering/docs/` (beside SKILL.md). |
+| H2 | ~~Move `docs/`~~ | **Done 2026-11-16 at your request:** now `docs/` (beside SKILL.md). |
 | H3 | Update TSD v0.1: its header says it accompanies BRD v0.7, and §5.3 says rounding happens only where a BRD *setting* says so (BR-15 is now a rule) | The TSD is out of step with BRD v0.8 |
 | H4 | Delete BRD v0.7 | Kept only because approved artefacts cite it |
 

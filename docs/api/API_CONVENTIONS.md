@@ -30,7 +30,7 @@ Every operation in every OpenAPI file carries these extensions. A route without 
 
 | Who | How | Token carries |
 |---|---|---|
-| Employee | Mobile number + one-time code (UM-R3) → access token + refresh token | user, organisation, roles, scope |
+| Employee | Mobile number + one-time code through Firebase phone sign-in (D-12); the Firebase ID token is exchanged at `/v1/auth/firebase/sign-in` for our access token + refresh token | user, organisation, roles, scope |
 | Admin users | Email + password + second step where AC-08 is on | same |
 | Vendor users | Separate vendor sign-in (OQ-V01-17) | vendor user, vendor role |
 | Device gateway | Device serial resolved server-side (TSD §9.1); no user token | device, organisation |

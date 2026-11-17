@@ -218,7 +218,7 @@ Work-from-home requests are **DP-09** (no BRD module defines them: G-E).
 ### 3.11 Period
 
 **AttendancePeriod** (root). Org-owned.
-- Members: **cycle owner** (DP-01), start and end dates, cut-off (PL-02), pre-lock checklist snapshot (PL-R2), lock state and history (SM-PERIOD), and the **PeriodTotals** per employee frozen at lock (layer 5: payable days, deduction days by reason, late and early minutes, identified overtime hours).
+- Members: **cycle owner** (DP-01), start and end dates, cut-off (PL-02), pre-lock checklist snapshot (PL-R2), lock state and history (SM-PERIOD), and the **PeriodTotals** per employee frozen at lock (layer 5: payable days, deduction days by reason, late and early minutes, identified overtime hours: none in V1, D-09).
 - Invariants:
   - Once locked, its totals and every DayResult in it are frozen (BR-06, PL-R3).
   - Unlock happens only if PL-06 allows it, with Organisation Admin approval and a reason. What happens to adjustments and exports already posted is open (OQ-C12-07).
@@ -290,7 +290,7 @@ Request aggregates: LeaveRequest, PermissionRequest, OnDutyRequest, Regularisati
 
 Produced by the Period context. It is the only way Payroll (V2) or an external payroll (MD-06) reads attendance.
 
-Per employee per period: payable days, deduction days **by reason line** (LOP, uninformed-absence extra cut, excess informed, excess uninformed, late/early penalty, unearned weekly off: V2), late minutes and early minutes after grace and waivers (PD-07), identified overtime hours, comp-off expiries due for payout (V2), absconding pay-hold flag (LM-31), branch-costed day counts (EM-08), and adjustments from earlier periods tagged with their original date (PL-R4). Every line carries references to its Explanation sources (BR-08).
+Per employee per period: payable days, deduction days **by reason line** (LOP, uninformed-absence extra cut, excess informed, excess uninformed, late/early penalty, unearned weekly off: V2), late minutes and early minutes after grace and waivers (PD-07), identified overtime hours (null in V1: D-09; M01 is V3), comp-off expiries due for payout (V2), absconding pay-hold flag (LM-31), branch-costed day counts (EM-08), and adjustments from earlier periods tagged with their original date (PL-R4). Every line carries references to its Explanation sources (BR-08).
 
 The contract is versioned. Payroll never reads DayResults directly.
 
@@ -326,19 +326,21 @@ Audited with before and after values or a change reference: organisation, plan, 
 
 ## 11. Open decision points
 
+Decisions taken are logged in `../requirements/DECISIONS.md`.
+
 Each DP is an unanswered Gate 1 question that affects the model. The model contains the **slot**; the answer fills it.
 
 | DP | Question | Slot in the model | Source |
 |---|---|---|---|
-| DP-01 | What owns a V1 attendance period's cycle (organisation, branch or policy set)? | `AttendancePeriod.cycle owner`. V2 adds payroll group as an owner kind. | G-A |
-| DP-02 | Which leave-debit order governs penalties and absences (LA-12/EC-11 vs LV-04), and what if the named type does not exist? | Debit-order value inside the policy version, read by LedgerPoster | G-B |
-| DP-03 | Ranking between branch, department, category and shift assignments | PolicyResolver precedence list | OQ-X-03 |
-| DP-04 | Which time zone and calendar apply when punching at another branch | PunchAttributor and ScheduleResolver input: "schedule zone" | G-J |
-| DP-05 | Which flag reasons count before decision, who decides each, and what a rejection does | `PunchFlag.counts_before_decision` and approver routing per reason | OQ-C04-01/02 |
-| DP-06 | DS-10 vs LM-28 for an absent day with no leave | Single "unexplained absence" rule in the policy, one owner | G-C |
+| DP-01 | What owns a V1 attendance period's cycle (organisation, branch or policy set)? **Decided D-02: organisation.** | `AttendancePeriod.cycle owner`. V2 adds payroll group as an owner kind. | G-A |
+| DP-02 | Which leave-debit order governs penalties and absences (LA-12/EC-11 vs LV-04), and what if the named type does not exist? **Decided D-06: LA-12/EC-11.** | Debit-order value inside the policy version, read by LedgerPoster | G-B |
+| DP-03 | Ranking between branch, department, category and shift assignments **Decided D-03: employee > shift > department > category > branch > organisation.** | PolicyResolver precedence list | OQ-X-03 |
+| DP-04 | Which time zone and calendar apply when punching at another branch **Decided D-04: branch where the punch happened.** | PunchAttributor and ScheduleResolver input: "schedule zone" | G-J |
+| DP-05 | Which flag reasons count before decision, who decides each, and what a rejection does **Decided D-05: per flag type; any non-Employee role can decide (defaults to confirm).** | `PunchFlag.counts_before_decision` and approver routing per reason | OQ-C04-01/02 |
+| DP-06 | DS-10 vs LM-28 for an absent day with no leave **Decided D-07: DS-10.** | Single "unexplained absence" rule in the policy, one owner | G-C |
 | DP-07 | Enrolment ID uniqueness scope | EnrolmentMapping uniqueness | G-G |
 | DP-08 | Does a direct HR correction (RG-10) need a second person? | HRCorrection approval path | BR-07, RG-10 |
 | DP-09 | Work-from-home request and approval | Possible WFHRequest aggregate in Permission & On-duty | G-E |
 | DP-10 | Are organisation-wide settings effective-dated like policy versions? | OrganisationSettings versioning | G5, G9 |
-| DP-11 | Does overtime identification run when M01 / OT-01 is off? | DayEngine overtime step guard | G-N |
-| DP-12 | Is Pub/Sub or Redis needed? Not assumed; recalculation uses Cloud Tasks | Infrastructure only, no domain impact | OQ-X-09 |
+| DP-11 | Does overtime identification run when M01 / OT-01 is off? **Decided D-09: no; V1 never identifies or exports overtime.** | DayEngine overtime step guard | G-N |
+| DP-12 | Is Pub/Sub or Redis needed? Not assumed; recalculation uses Cloud Tasks **Closed by ADR-002.** | Infrastructure only, no domain impact | OQ-X-09 |

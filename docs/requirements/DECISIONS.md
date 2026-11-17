@@ -1,0 +1,36 @@
+# Decision log
+
+Answers given by the project owner in session. Each decision closes the listed questions. The BRD and TSD are not rewritten by this log: a later BRD version can fold these in when the owner asks (a v0.9 is offered, not made).
+
+| ID | Date | Question | Decision | Closes | Follow-up |
+|---|---|---|---|---|---|
+| D-01 | 2026-11-16 | Who signs off the BRD and TSD? (Q14) | The project owner in this session is the sign-off authority. BRD v0.8 and TSD stay **Draft** until the owner explicitly signs them off. | Q14, OQ-X-06 | Sign-off itself still pending |
+| D-02 | 2026-11-16 | How is a V1 attendance period defined? (DP-01) | **One attendance cycle per organisation.** Owner asked for the more reliable option: one cycle, one lock, one export, nothing to reconcile between overlapping cycles, and it splits cleanly into payroll groups in V2 (PL-01). | DP-01, G-A (OQ-C12-01 and the "payroll period" / "month" questions in OQ-C08-01, OQ-C08-15, OQ-C09-01, OQ-C09-12, OQ-C13-01, OQ-C15-06, OQ-C16-05: in V1 these mean the organisation's attendance period) | `attendance_cycle.owner_kind = 'organisation'` in V1; branch / policy_set values stay unused until a later decision |
+| D-03 | 2026-11-16 | Which policy set wins when assignments at several levels match? (DP-03) | **employee > shift > department > category > branch > organisation.** Owner asked for the more reliable option: a fixed total order, so exactly one set always wins and there are no ties. | DP-03, OQ-X-03 | PolicyResolver uses this order |
+| D-04 | 2026-11-16 | Punch at a branch in another time zone: whose time zone and holiday calendar? (DP-04) | **The branch where the punch happened.** | DP-04, G-J (OQ-C04-03, OQ-C07-01) | Late/early is measured against the shift in that branch's local time; `day_result.schedule_tz` records it |
+| D-05 | 2026-11-16 | Does a flagged punch count before a decision? (DP-05) | **Decided per flag type** (each flag reason has its own setting). | DP-05 (part), OQ-C04-01 | Defaults: D-05c |
+| D-05b | 2026-11-16 | Who decides a flag? (G-16) | **Any role except Employee** can be configured as the decider for a flag type. | G-16, OQ-C04-02 (part) | Defaults: D-05c |
+| D-06 | 2026-11-16 | Debit order for late/early penalties: LA-12/EC-11 or LV-04? (DP-02) | **LA-12 / EC-11 governs** penalty recovery. | DP-02, G-B (OQ-C06-04, OQ-C08-19) | LV-04 no longer applies to penalties (see D-07 for absences) |
+| D-06c | 2026-11-16 | Which LA-12 / EC-11 recovery options are offered? | **All five:** permission balance; chosen leave types in order; loss of pay; fixed fine; none (report only). "Fixed fine" is money, so it takes effect from V2 (BRX-02, OQ-C06-18). | OQ-C06-18 (part) | — |
+| D-06b | 2026-11-16 | The LA-12 default names "casual leave", which may not exist | **The sector template defines** the leave types and the default recovery order. | OQ-X-02 | Templates must name real leave types |
+| D-07 | 2026-11-16 | Absent day with no leave: DS-10 or LM-28? (DP-06) | **DS-10 governs.** | DP-06, G-C (OQ-C06-06, OQ-C08-12) | LM-28 becomes redundant; auto-debit order settled by D-07b (LV-04) |
+| D-07b | 2026-11-16 | Which DS-10 options are offered, and which order does "auto-debit" use? | **All three:** loss of pay; auto-debit leave in a chosen order; hold as pending for N days (default pending 3 days, then loss of pay). The auto-debit order is **LV-04** (the leave debit order); LA-12/EC-11 covers penalties only (D-06). | DP-02 remainder, LV-04 scope | LM-28 redundant (D-07) |
+| D-10 | 2026-11-16 | Who locks periods in V1 without Payroll? (G-D) | **The HR Manager.** The Payroll Officer system role stays for V2. | G-D, G-29 (OQ-C12-05, OQ-C16-03) | PERMISSION_MATRIX PER-02, PER-03 updated |
+| D-12 | 2026-11-16 | Sign-in codes provider (Q16, D2) | **Firebase phone sign-in.** | Q16, D2 | TSD v0.2 updated. Email provider (D3) still open |
+| D-14 | 2026-11-16 | Mumbai region on the Supabase plan? (D4) | **Yes, available.** | D4 | — |
+| D-17 | 2026-11-16 | When is a day "finalised"? (GAP-SM-07) | **Only at period lock.** "Finalised" and "locked" are the same; the nightly job J1 is a recalculation pass, not finalisation. | GAP-SM-07 | SM-DAY updated; migration 0007 drops `finalised`; BRD §2 measure ("95% finalised with no manual action") is measured at lock |
+| D-05c | 2026-11-16 | Default per flag type | **Approved as proposed:** outside geo-fence, branch not allowed, location unavailable, web IP check failed → do not count until decided; low accuracy, punch on off day / holiday / no shift, late sync, device clock mismatch → count. Default decider: Manager for fence, location, IP and accuracy flags; HR for branch-not-allowed, off-day, late-sync and clock flags. | DP-05, G-16 | Defaults go into every sector template's PC rule group |
+| D-08 | 2026-11-16 | Which cut-off resolves unresolved missed punches? (G-K) | **A per-shift time of day, default 02:30, on the calendar day after the shift's end date, in the zone of the branch where the punch happened.** Owner asked for the better of the two options; this keeps 02:30 and never falls inside a night shift. Example: shift ends Mon 18:00 → Tue 02:30; night shift ends Tue 06:00 → Wed 02:30. New setting, proposed BRD id MP-06. | G-K (OQ-C06-03 for missed punches) | Migration 0008 adds `sched.shift_version.missed_punch_cutoff`. Pending requests at lock remain OQ-C12-03 |
+| D-09 | 2026-11-16 | Is overtime identified in V1 when the Overtime module is off? (DP-11) | **No. V1 never identifies or exports overtime**; it starts when M01 (V3) is on. Owner confirmed this overrides BRD §21 notes 1–2. | DP-11, G-N (OQ-C06-16, OQ-C06-17) | Migration 0008 makes overtime columns NULL when not identified; US-C06-17 deferred to V3; BRD §21 to be aligned in the next BRD version |
+| D-13 | 2026-11-16 | Plans (Q5) | **Approved:** Starter / Standard / Business as in `docs/product/PLANS.md`. | Q5 | One cell in PLANS.md was edited outside this session and reads oddly; wording to confirm |
+| D-16 | 2026-11-16 | Vendor sign-in (OQ-V01-17) | **Email + password + authenticator app; second step mandatory** for every vendor user. | OQ-V01-17 | Vendor sign-in contract to add in Phase 5 |
+| D-12b | 2026-11-17 | Email provider (D3) | **Zoho ZeptoMail** (transactional email; India data centre to be selected at sign-up, TB-07). | D3 | TSD to record it in its next version; current prices and data-location terms to be checked at sign-up |
+| D-H3 | 2026-11-16 | Update the TSD for BRD v0.8? | **Yes**: TSD v0.2 written, v0.1 kept. | H3 | — |
+| D-H4 | 2026-11-16 | Delete BRD v0.7? | **No. Never delete any version** of a source document. | H4 | Standing rule |
+
+## Answered but not yet closed (need a follow-up answer)
+
+| Q | Answer given | Why not closed |
+|---|---|---|
+| #15 Supabase checks | "Okay" | Owner will run `database/tests/supabase_permission_check.sql` on the test project; waiting for the PASS/FAIL lines |
+| #11 Q15 eSSL HTTPS | "Later" | Open by request |

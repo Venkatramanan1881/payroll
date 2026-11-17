@@ -19,14 +19,20 @@ tags:
 x-exempt-permissions:
   IAM-10: 'Acting as a delegate has no route of its own: it is exercised on each request type''s approve / reject routes, which record on_behalf_of_user_id (AC-03, BR-07).'
 paths:
-  /v1/auth/otp/request:
+  /v1/auth/firebase/sign-in:
     post:
-      operationId: identityRequestOtp
-      summary: Request a one-time code for a mobile number
+      operationId: identityFirebaseSignIn
+      summary: Sign in an employee with a Firebase phone sign-in token
       description: |
-        Employee sign-in step 1 (UM-R3, AC-C03-04.1). Always answers 202 with the same body whether or not the number is
-        on an employee record, so the API never confirms a number exists (AC-C03-04.3, TB-01). Code life, attempts and
-        lock-out are OQ-C03-05. Sign-in on the web when the plan excludes the app: OQ-C03-05 / MD-02.
+        Employee sign-in (UM-R3) using Firebase phone sign-in (decision D-12, TSD v0.2 §8). The app sends and checks the
+        one-time code with the Firebase client SDK, then posts the Firebase ID token here. The server verifies the token
+        (signature, project, expiry) and takes the verified phone number from it, never from the request body, then
+        resolves the user (iam.resolve_login) and issues its own session. Invalid or expired token → 401 UNAUTHENTICATED.
+        A verified number with no active user → 401 UNAUTHENTICATED, with the same body as a bad token, so the API never
+        confirms a number exists (AC-C03-04.3, TB-01). When the number is on employee records in more than one
+        organisation, 409 ORGANISATION_CHOICE_REQUIRED returns the candidate organisation names with opaque references,
+        and the client completes with `/v1/auth/organisation-choice`. Whether this choice step is the final behaviour is
+        OQ-C03-05. Code life, attempts and lock-out are handled by Firebase. Inactive user → 401 (AC-C03-03.7).
       tags: [Sign-in]
       security: []
       x-permission: SELF-AUTH
@@ -42,51 +48,9 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [mobile]
+              required: [firebase_id_token]
               properties:
-                mobile: { type: string, pattern: '^\+[1-9][0-9]{6,14}$', description: E.164 mobile number. }
-      responses:
-        '202':
-          description: If the number is known a code has been sent.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [challenge_token, expires_at]
-                properties:
-                  challenge_token: { type: string, description: Opaque; send back with the code. }
-                  expires_at: { $ref: 'common.yaml#/components/schemas/Instant' }
-        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
-        '429': { $ref: 'common.yaml#/components/responses/TooManyRequests' }
-
-  /v1/auth/otp/verify:
-    post:
-      operationId: identityVerifyOtp
-      summary: Verify the one-time code and sign in
-      description: |
-        Employee sign-in step 2 (UM-R3). Wrong or expired code → 400 OTP_INVALID (AC-C03-04.2). When the mobile number is on
-        employee records in more than one organisation, 409 ORGANISATION_CHOICE_REQUIRED returns the candidate organisation
-        names with opaque references, and the client completes with `/v1/auth/organisation-choice`. Whether this choice step
-        is the final behaviour is OQ-C03-05; the contract stays neutral. Inactive user → 401 (AC-C03-03.7).
-      tags: [Sign-in]
-      security: []
-      x-permission: SELF-AUTH
-      x-module: C03
-      x-scope: self
-      x-audit: true
-      x-events: []
-      x-idempotent: natural
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [challenge_token, code]
-              properties:
-                challenge_token: { type: string, maxLength: 2000 }
-                code: { type: string, pattern: '^[0-9]{4,8}$' }
+                firebase_id_token: { type: string, maxLength: 4096, description: ID token from Firebase phone sign-in. }
                 device_label: { type: string, maxLength: 100 }
       responses:
         '200':
@@ -94,7 +58,6 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TokenPair' }
-        '400': { $ref: 'common.yaml#/components/responses/BadRequest' }
         '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
         '409': { $ref: '#/components/responses/OrganisationChoiceRequired' }
         '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }

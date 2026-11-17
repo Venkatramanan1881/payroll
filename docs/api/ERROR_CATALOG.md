@@ -17,7 +17,7 @@ Every error is `application/problem+json` (RFC 9457), as defined by `Problem` in
 | `UNAUTHENTICATED` | 401 | Missing, expired or revoked token | TSD §8 |
 | `SECOND_FACTOR_REQUIRED` | 401 | Admin sign-in needs the second step (AC-08) | AC-08 |
 | `ORGANISATION_CHOICE_REQUIRED` | 409 | Sign-in identity exists in more than one organisation | OQ-C03-05 |
-| `OTP_INVALID` | 400 | Wrong or expired one-time code | UM-R3 |
+| `OTP_INVALID` | 400 | Not used for employee sign-in since D-12 (Firebase checks the code; a bad Firebase token is `UNAUTHENTICATED`). Kept for any future server-checked code | UM-R3 |
 | `RATE_LIMITED` | 429 | Too many sign-in, OTP or punch attempts (`Retry-After` set) | TSD §15 |
 | `FORBIDDEN` | 403 | Role has no grant for the operation | AC-01, N5 |
 | `NOT_FOUND` | 404 | No such resource **or** outside the user's scope or organisation | TB-01, AC-07 |

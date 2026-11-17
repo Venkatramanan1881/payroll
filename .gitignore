@@ -1,0 +1,5 @@
+# Rust build output
+/target
+
+# Plan-execution scratch (superpowers); the git history is the record
+/.superpowers/

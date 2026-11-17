@@ -85,7 +85,7 @@ Lock → pull inputs → calculate → review exceptions → approve → release
 
 | Topic | Rule | Source |
 |---|---|---|
-| Policy assignment | Most specific wins. Levels: organisation, branch, department, category, shift, employee. Employee is the most specific and organisation the least; the BRD does not rank branch, department, category and shift against each other. | G3, BR-05; see OQ-X-03 |
+| Policy assignment | Most specific wins, in this order: **employee > shift > department > category > branch > organisation** (D-03, 2026-11-16). | G3, BR-05, D-03 |
 | Settings version | The version in force on the attendance date applies. | G5, BR-05 |
 | Two penalties for one shortfall | The larger applies once. | BR-04, LM-27 |
 | Disabled rule or module | No effect at all. | G2, BR-14, MD-03 |

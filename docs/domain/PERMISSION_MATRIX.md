@@ -224,8 +224,8 @@ Self-service by users who hold another role as well (a Manager raising their own
 | ID | Operation | VA | VS | VR | OA | HR | PO | MGR | SUP | EMP | AUD | Source / notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | PER-01 | Change period settings (PL-02..07) | — | — | — | A Cfg(AC-04) | Y Cfg(AC-04) | — | — | — | — | — | §5, US-C12-02 |
-| PER-02 | View pre-lock checklist | — | — | — | — | ? | Y | — | — | — | S | PL-R2, NT-09, DB-R4 (PO); HR: G-29 (OQ-C12-05) |
-| PER-03 | Lock AttendancePeriod | — | — | — | — | ? | Y Cfg(PL-04, PL-05) | — | — | — | — | §5 PO "locks periods", PL-04 manual; HR: G-29 |
+| PER-02 | View pre-lock checklist | — | — | — | — | Y (D-10) | Y | — | — | — | S | PL-R2, NT-09, DB-R4 (PO, V2); HR in V1: D-10 |
+| PER-03 | Lock AttendancePeriod | — | — | — | — | Y Cfg(PL-04, PL-05) (D-10) | Y Cfg(PL-04, PL-05) | — | — | — | — | §5 PO "locks periods" (V2), PL-04 manual; HR locks in V1: D-10 |
 | PER-04 | Request period unlock | — | — | — | — | ? | ? | — | — | — | — | PL-06 names only the approver: G-30 |
 | PER-05 | Approve period unlock | — | — | — | A Cfg(PL-06) | — | — | — | — | — | — | §5 OA "approves period unlock", PL-06 (default never); OQ-C12-07 |
 | PER-06 | Export PayrollInput (produce PayrollInputExport) | — | — | — | — | ? | ? | — | — | — | — | MD-06 names no actor: G-31 (OQ-C12-05, OQ-C12-11); AUD write denied |

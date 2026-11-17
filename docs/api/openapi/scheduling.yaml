@@ -1332,6 +1332,10 @@ components:
         is_night_shift: { type: boolean, default: false, description: What marks a night shift is OQ-C05-02. }
         night_attendance_date: { type: string, enum: [shift_start_date, shift_end_date], default: shift_start_date }
         half_day_split: { type: string, enum: [middle_of_shift, fixed_time], default: middle_of_shift }
+        missed_punch_cutoff:
+          allOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' } ]
+          default: '02:30'
+          description: 'D-08. An unresolved missed punch gets its MP-03 outcome at this time on the day after the shift end date, in the branch''s zone. Example: shift ends Mon 18:00 -> Tue 02:30; night shift ends Tue 06:00 -> Wed 02:30.'
         half_day_split_time: { oneOf: [ { $ref: 'common.yaml#/components/schemas/TimeOfDay' }, { type: 'null' } ] }
         segments:
           type: [array, 'null']

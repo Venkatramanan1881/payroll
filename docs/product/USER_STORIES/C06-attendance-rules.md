@@ -341,6 +341,9 @@ Edge and negative cases
 - Money deduction PD-01 alongside day-count penalties: V2 warning (PD note); reference only.
 
 ### US-C06-17 Identify overtime hours (computed only)
+
+> **Deferred to V3 by decision D-09 (2026-11-16):** overtime is identified only when the Overtime module (M01) is on, and M01 arrives in V3. In V1 no overtime is identified or exported. This contradicts BRD §21 notes 1–2; a BRD revision should align them.
+
 As a Payroll Officer, I want overtime hours identified from attendance each day, so that computed overtime is available in the period totals and export before overtime approval and pay arrive.
 Source: §10.1 intro, OT-02, OT-03, OT-07, OT-R2 (computed kept separately), MD-06, §21 note 2, RD-04
 Settings involved: OT-02 (default after shift end); OT-03 (default 30); OT-07 (default no)

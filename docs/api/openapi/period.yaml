@@ -711,7 +711,9 @@ components:
         deduction_lines: { type: array, items: { $ref: '#/components/schemas/DeductionLine' } }
         late_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
         early_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
-        overtime_identified_minutes: { $ref: 'common.yaml#/components/schemas/Minutes' }
+        overtime_identified_minutes:
+          oneOf: [ { $ref: 'common.yaml#/components/schemas/Minutes' }, { type: 'null' } ]
+          description: Always null in V1 (D-09); identified only when the Overtime module (M01, V3) is on.
         pay_hold: { type: boolean }
         branch_days: { type: array, items: { $ref: '#/components/schemas/BranchDays' } }
         frozen_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
@@ -784,7 +786,9 @@ components:
               deduction_lines: { type: array, items: { $ref: '#/components/schemas/DeductionLine' } }
               late_minutes: { $ref: 'common.yaml#/components/schemas/Minutes', description: After grace and waivers (PD-07). }
               early_minutes: { $ref: 'common.yaml#/components/schemas/Minutes', description: After grace and waivers (PD-07). }
-              overtime_identified_minutes: { $ref: 'common.yaml#/components/schemas/Minutes', description: Computed only (OT-R2). }
+              overtime_identified_minutes:
+                oneOf: [ { $ref: 'common.yaml#/components/schemas/Minutes' }, { type: 'null' } ]
+                description: Computed only (OT-R2). Always null in V1 (D-09); M01 is V3.
               pay_hold: { type: boolean, description: Absconding pay hold (LM-31). }
               branch_days: { type: array, items: { $ref: '#/components/schemas/BranchDays' }, description: Branch-costed day counts (EM-08). }
               adjustments:

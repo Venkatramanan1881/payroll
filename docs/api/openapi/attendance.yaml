@@ -704,8 +704,8 @@ components:
       enum: [present, half_day, quarter_day, absent, leave, half_day_leave, holiday, weekly_off, on_duty]
     ProcessingState:
       type: string
-      enum: [provisional, exception, absence_pending, finalised, locked]
-      description: SM-DAY. "Finalised" is undefined in the BRD (GAP-SM-07).
+      enum: [provisional, exception, absence_pending, locked]
+      description: SM-DAY. A day is finalised only at period lock, so "locked" is the finalised state (D-17).
     Session:
       type: object
       required: [in_at]

@@ -188,32 +188,32 @@ One PunchFlag per punch per reason. Reasons and their sources: outside fence (PC
 
 This is the processing state of the day. DayResults are a separate append-only history (BRX-03); every recalculation adds a new current DayResult **without** changing this state unless the table says so.
 
+A day is **finalised only when its period is locked** (decision D-17, 2026-11-16): "finalised" and "Locked" are the same state. The nightly job J1 is a recalculation pass, not finalisation. The BRD §2 success measure ("95% of employee-days finalised with no manual action") is measured at lock.
+
 | State | Meaning | BRD basis |
 |---|---|---|
-| Provisional | Day not yet finalised by J1; results recalculated on every input. | **Not in BRD**; TSD J1 only → GAP-SM-07 |
-| Exception | Current DayResult has an open exception sent to regularisation: MP-01/MP-02 = flag; MP-05 auto check-out (always flagged); PR-05; PR-06; BK-07 flag; EC-14 flag for HR; LV-01 flag; LA-05 hold check-in (OQ-C06-07); Raised PunchFlag (DP-05). | §9.6 step 5 and 8 |
-| Absence pending | Absent with no leave; held for N days (DS-10 = pending). | DS-10; DP-06 |
-| Finalised | Processed, no open exception or pending hold. | BRD §2 success measure uses "finalised" (undefined) → GAP-SM-07 |
-| Locked | Period locked; frozen (PL-R3). Basis: actual, or assumed present for days after cut-off (PL-03), or pending treated per PL-05. | PL-R3, PL-03, PL-05 |
+| Provisional | Processed; no open exception or pending hold; recalculated on every input while the period is open. | D-17 |
+| Exception | Current DayResult has an open exception sent to regularisation: MP-01/MP-02 = flag; MP-05 auto check-out (always flagged); PR-05; PR-06; BK-07 flag; EC-14 flag for HR; LV-01 flag; LA-05 hold check-in (OQ-C06-07); Raised PunchFlag that does not count before decision (D-05). | §9.6 step 5 and 8 |
+| Absence pending | Absent with no leave; held for N days (DS-10 = pending; DS-10 governs: D-07). | DS-10 |
+| Locked | Period locked; frozen and finalised (PL-R3, D-17). Basis: actual, or assumed present for days after cut-off (PL-03), or pending treated per PL-05. | PL-R3, PL-03, PL-05, D-17 |
 
 | # | From | Event / command | To | Actor | Preconditions | Side effects / events | Mode |
 |---|---|---|---|---|---|---|---|
-| A1 | — | First input for date or J1 run | Provisional | SYS | Employee employed on date | DayResult v1 | Auto |
-| A2 | Provisional | Finalise (previous day) | Finalised / Exception / Absence pending (by result) | SYS J1 | Date < today in branch zone (BR-11, DP-04) | MP-04 next-morning reminder (NT-01); NT-02 timing → OQ-C14-05 | Auto |
-| A3 | Finalised | Recalculated with new exception | Exception | SYS (RecalculationScheduler) | Period open | New DayResult | Auto |
-| A4 | Exception | Regularisation approved / HR correction (RG-10, DP-08) / bulk regularisation (RG-11) / flag decided / waiver (LA-17) | Finalised (or stays Exception if another remains) | SYS after the approving actor | Period open; RG-04 window | New DayResult; counters rebuilt | Auto |
-| A5 | Exception | Cut-off reached unresolved | Finalised (MP-03 outcome recorded) | SYS | Which cut-off → OQ-C06-03 / G-K | New DayResult with MP-03 explanation | Auto |
-| A6 | Absence pending | Leave approved within hold | Finalised | SYS | — | Absence classified informed (LM-R6) | Auto |
-| A7 | Absence pending | N days elapse | Finalised | SYS (no TSD job named) | DS-10 N; calendar/working → OQ-C06-05 | LOP or auto-debit (DS-10 vs LM-28 → DP-06); LedgerPoster keyed by day | Auto |
-| A8 | Finalised / Exception / Absence pending | Period locked | Locked | SYS on SM-PERIOD P5 | PL-05 decides treatment of Exception / pending days | Current DayResult frozen; pending at lock → OQ-C06-05, OQ-C12-03 | Auto |
-| A9 | Locked | Period unlocked | prior state re-evaluated | SYS on SM-PERIOD P7 | PL-06 ≠ never | → OQ-C12-07 | Auto |
-| A10 | Locked | Any changed input | Locked (unchanged) | SYS | — | PeriodAdjustment created (SM-ADJ); days assumed present under PL-03 → OQ-C12-02 | Auto |
-| A11 | Any non-Locked | Recalculation, same fingerprint | unchanged | SYS | — | Skipped (BR-02, AT5) | Auto |
+| A1 | — | First input for date or J1 run | Provisional (or Exception / Absence pending by result) | SYS | Employee employed on date | DayResult v1 | Auto |
+| A2 | Provisional | Recalculated (any input, or J1 nightly pass) with an open exception or absence | Exception / Absence pending | SYS (RecalculationScheduler, J1) | Period open; dates in the branch's zone (BR-11, D-04) | New DayResult; MP-04 next-morning reminder (NT-01); NT-02 timing → OQ-C14-05 | Auto |
+| A3 | Exception | Regularisation approved / HR correction (RG-10, DP-08) / bulk regularisation (RG-11) / flag decided / waiver (LA-17) | Provisional (or stays Exception if another remains) | SYS after the approving actor | Period open; RG-04 window | New DayResult; counters rebuilt | Auto |
+| A4 | Exception | Missed-punch cut-off reached unresolved | Provisional (MP-03 outcome recorded) | SYS | Cut-off definition → #8 follow-up (G-K) | New DayResult with MP-03 explanation | Auto |
+| A5 | Absence pending | Leave approved within hold | Provisional | SYS | — | Absence classified informed (LM-R6) | Auto |
+| A6 | Absence pending | N days elapse | Provisional | SYS (no TSD job named) | DS-10 N; calendar/working → OQ-C06-05 | LOP or auto-debit per DS-10 (D-07; debit order → follow-up); LedgerPoster keyed by day | Auto |
+| A7 | Provisional / Exception / Absence pending | Period locked | Locked | SYS on SM-PERIOD P5 | PL-05 decides treatment of Exception / pending days | Current DayResult frozen; pending at lock → OQ-C06-05, OQ-C12-03 | Auto |
+| A8 | Locked | Period unlocked | prior state re-evaluated | SYS on SM-PERIOD P7 | PL-06 ≠ never | → OQ-C12-07 | Auto |
+| A9 | Locked | Any changed input | Locked (unchanged) | SYS | — | PeriodAdjustment created (SM-ADJ); days assumed present under PL-03 → OQ-C12-02 | Auto |
+| A10 | Any non-Locked | Recalculation, same fingerprint | unchanged | SYS | — | Skipped (BR-02, AT5) | Auto |
 
-- Terminal: Locked (except unlock A9).
+- Terminal: Locked (except unlock A8).
 - Idempotency: J1 twice for the same date → no change; recalculation work item keyed (org, employee, date); identical inputs → no new DayResult.
 - Illegal: new current DayResult while Locked (BR-06); editing a DayResult (BRX-03); setting a day status by hand outside regularisation / HR correction (BR-01, RG-10); treating a missing check-out as early (BR-09).
-- Gaps: DP-04, DP-05, DP-06, DP-08, OQ-C06-03, OQ-C06-05, OQ-C06-07, OQ-C12-02, OQ-C12-03, OQ-C12-07, OQ-C14-05, GAP-SM-07.
+- Gaps: DP-08, OQ-C06-05, OQ-C06-07, OQ-C12-02, OQ-C12-03, OQ-C12-07, OQ-C14-05, #8 cut-off. Decided: D-04, D-05, D-07, D-17.
 
 ---
 
@@ -446,7 +446,7 @@ Scheduled → In force → Superseded are **date-derived**: PolicyResolver picks
 | GAP-SM-04 | When enrolment returns to "not enrolled" (unmap, exit, device replaced), and whether status is per employee or per device mapping. |
 | GAP-SM-05 | Device offline threshold (PC-10 is only the alert delay), initial state before first contact, and deregistration / branch move / replacement. |
 | GAP-SM-06 | Can a punch-flag decision be reversed; with several flags on one punch, does it count only when all are accepted? |
-| GAP-SM-07 | "Finalised" day (BRD §2, TSD J1) is undefined: what finalisation changes and what a day is before it. |
+| GAP-SM-07 | ~~"Finalised" day undefined~~ **Closed by D-17 (2026-11-16):** finalised = locked. |
 | GAP-SM-08 | Requests: no draft state, no withdraw-vs-cancel distinction, no resubmission after rejection. |
 | GAP-SM-09 | Cancellation rules for RegularisationRequest, CompOffClaim and ShiftChangeRequest. |
 | GAP-SM-10 | Does the timeout action apply at level 2 too, and may the original approver still act after escalation? |

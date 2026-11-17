@@ -15,3 +15,5 @@
 | Gate | Scope | Decision | By | Date | Conditions |
 |---|---|---|---|---|---|
 | 3 Database | `docs/database/` (DATA_MODEL, migrations 0001–0005, DATA_DICTIONARY, MIGRATIONS, tests/tenant_isolation.sql) | Approved | Project owner (in session) | 2026-11-15 | Supabase deployment checks in MIGRATIONS.md §3 still to be run before the first test-environment migration. "?" permission cells seeded as not granted. |
+| 4 API | `docs/api/` (309→308 operations, conventions, error catalog, checks); amendments: migration 0005 edit (`manual`→`approver`), migrations 0006 and 0007, lifecycles SM-CONTACT and SM-SETCHG, reads mapped to the nearest permission code, Firebase sign-in contract | Approved | Project owner (in session) | 2026-11-16 | Migration 0008 (D-08 cut-off, D-09 overtime nullable) was written after this approval and needs its own OK. BRD v0.8 / TSD v0.2 formal sign-off still pending (D-01). |
+| 3 Database (amendment) | Migration 0008 (D-08 missed-punch cut-off, D-09 overtime nullable) | Approved | Project owner (in session) | 2026-11-17 | — |
