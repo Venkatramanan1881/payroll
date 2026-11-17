@@ -15,5 +15,6 @@ anyhow = "1"
 domain-iam = { path = "../domain-iam" }
 
 [dev-dependencies]
+async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

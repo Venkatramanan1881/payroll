@@ -10,6 +10,9 @@ pub enum ApiError {
     Forbidden,
     OrgSuspended,
     NotFound,
+    ValidationFailed(String),
+    /// Phone verified for several organisations: (choice token, [(candidate_ref, display_name)]).
+    OrganisationChoiceRequired(String, Vec<(String, String)>),
     Internal(anyhow::Error),
 }
 
@@ -20,6 +23,8 @@ impl ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "FORBIDDEN", "Not allowed"),
             ApiError::OrgSuspended => (StatusCode::FORBIDDEN, "ORG_SUSPENDED", "Organisation is suspended"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", "Not found"),
+            ApiError::ValidationFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Request is not valid"),
+            ApiError::OrganisationChoiceRequired(..) => (StatusCode::CONFLICT, "ORGANISATION_CHOICE_REQUIRED", "Choose an organisation"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Internal error"),
         }
     }
@@ -31,13 +36,21 @@ impl IntoResponse for ApiError {
         if let ApiError::Internal(e) = &self {
             eprintln!("internal error: {e:#}"); // logged, never returned to the caller
         }
-        let body = json!({
+        let mut body = json!({
             "type": format!("https://errors.payroll.example/{code}"),
             "title": title,
             "status": status.as_u16(),
             "code": code,
             "correlation_id": uuid::Uuid::new_v4(),
         });
+        match self {
+            ApiError::ValidationFailed(detail) => body["detail"] = json!(detail),
+            ApiError::OrganisationChoiceRequired(choice_token, cands) => {
+                body["choice_token"] = json!(choice_token);
+                body["candidates"] = cands.iter().map(|(r, n)| json!({ "candidate_ref": r, "display_name": n })).collect();
+            }
+            _ => {}
+        }
         (status, [(header::CONTENT_TYPE, "application/problem+json")], body.to_string()).into_response()
     }
 }

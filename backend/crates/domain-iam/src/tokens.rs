@@ -13,6 +13,9 @@ pub const ACCESS_TTL_SECS: i64 = 900;
 pub struct AccessClaims {
     pub sub: Uuid,
     pub org: Uuid,
+    /// Session that issued the token; sign-out revokes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Uuid>,
     pub iat: i64,
     pub exp: i64,
 }
@@ -20,8 +23,8 @@ pub struct AccessClaims {
 #[derive(Debug)]
 pub struct TokenError;
 
-pub fn issue_access(secret: &[u8], user_id: Uuid, org_id: Uuid, now: i64) -> String {
-    let claims = AccessClaims { sub: user_id, org: org_id, iat: now, exp: now + ACCESS_TTL_SECS };
+pub fn issue_access(secret: &[u8], user_id: Uuid, org_id: Uuid, sid: Option<Uuid>, now: i64) -> String {
+    let claims = AccessClaims { sub: user_id, org: org_id, sid, iat: now, exp: now + ACCESS_TTL_SECS };
     encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).expect("HS256 encoding cannot fail")
 }
 
@@ -57,6 +60,30 @@ pub fn parse_refresh(token: &str) -> Option<(Uuid, [u8; 32])> {
     Some((org, hash_refresh(secret_part)))
 }
 
+
+/// Short-lived (300 s) proof that a phone number was verified, listing the (organisation, user) pairs it may pick (OQ-C03-05).
+#[derive(Debug, Serialize, Deserialize)]
+struct ChoiceClaims {
+    cands: Vec<(Uuid, Uuid)>,
+    exp: i64,
+}
+
+pub fn issue_choice(secret: &[u8], cands: Vec<(Uuid, Uuid)>, now: i64) -> String {
+    encode(&Header::new(Algorithm::HS256), &ChoiceClaims { cands, exp: now + 300 }, &EncodingKey::from_secret(secret))
+        .expect("HS256 encoding cannot fail")
+}
+
+pub fn verify_choice(secret: &[u8], token: &str, now: i64) -> Result<Vec<(Uuid, Uuid)>, TokenError> {
+    let mut v = Validation::new(Algorithm::HS256);
+    v.validate_exp = false;
+    v.required_spec_claims.clear();
+    let c = decode::<ChoiceClaims>(token, &DecodingKey::from_secret(secret), &v).map_err(|_| TokenError)?.claims;
+    if now > c.exp {
+        return Err(TokenError);
+    }
+    Ok(c.cands)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,21 +94,22 @@ mod tests {
     #[test]
     fn access_roundtrip() {
         let (u, o) = (Uuid::new_v4(), Uuid::new_v4());
-        let t = issue_access(SECRET, u, o, 1_000);
+        let sid = Some(Uuid::new_v4());
+        let t = issue_access(SECRET, u, o, sid, 1_000);
         let c = verify_access(SECRET, &t, 1_000).unwrap();
-        assert_eq!((c.sub, c.org, c.exp), (u, o, 1_000 + ACCESS_TTL_SECS));
+        assert_eq!((c.sub, c.org, c.sid, c.exp), (u, o, sid, 1_000 + ACCESS_TTL_SECS));
     }
 
     #[test]
     fn access_expired_rejected() {
-        let t = issue_access(SECRET, Uuid::new_v4(), Uuid::new_v4(), 1_000);
+        let t = issue_access(SECRET, Uuid::new_v4(), Uuid::new_v4(), None, 1_000);
         assert!(verify_access(SECRET, &t, 1_000 + ACCESS_TTL_SECS).is_ok());
         assert!(verify_access(SECRET, &t, 1_000 + ACCESS_TTL_SECS + 1).is_err());
     }
 
     #[test]
     fn access_wrong_secret_rejected() {
-        let t = issue_access(SECRET, Uuid::new_v4(), Uuid::new_v4(), 1_000);
+        let t = issue_access(SECRET, Uuid::new_v4(), Uuid::new_v4(), None, 1_000);
         assert!(verify_access(b"other", &t, 1_000).is_err());
     }
 

@@ -35,7 +35,7 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap, is_write: bool)
         Some("suspended") if is_write => return Err(ApiError::OrgSuspended), // VC-R4: view and export only
         _ => {}
     }
-    Ok((Principal { user_id: claims.sub, org_id: claims.org, employee_id }, tx))
+    Ok((Principal { user_id: claims.sub, org_id: claims.org, employee_id, session_id: claims.sid }, tx))
 }
 
 /// Axum extractor for authenticated routes. Writes are anything other than GET/HEAD.

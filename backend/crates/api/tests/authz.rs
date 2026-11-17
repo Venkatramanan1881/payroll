@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 fn state(pool: PgPool) -> AppState {
-    AppState { pool, jwt_secret: common::JWT_SECRET.to_vec() }
+    common::state(pool)
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]

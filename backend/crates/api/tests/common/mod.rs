@@ -9,8 +9,34 @@ use uuid::Uuid;
 
 pub const JWT_SECRET: &[u8] = b"test-secret-not-for-production";
 
+/// Test verifier: a token "phone:<E.164>" verifies to that number; anything else is rejected.
+pub struct FakeVerifier;
+
+#[async_trait::async_trait]
+impl domain_iam::firebase::PhoneTokenVerifier for FakeVerifier {
+    async fn verify(&self, id_token: &str) -> Result<String, domain_iam::tokens::TokenError> {
+        id_token.strip_prefix("phone:").map(str::to_string).ok_or(domain_iam::tokens::TokenError)
+    }
+}
+
+pub fn state(pool: PgPool) -> api::AppState {
+    api::AppState { pool, jwt_secret: JWT_SECRET.to_vec(), phone_verifier: std::sync::Arc::new(FakeVerifier) }
+}
+
 pub fn app(pool: PgPool) -> axum::Router {
-    api::router(api::AppState { pool, jwt_secret: JWT_SECRET.to_vec() })
+    api::router(state(pool))
+}
+
+pub fn post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::post(uri).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()
+}
+
+/// An employee-style user who signs in with a mobile number (Firebase).
+pub async fn seed_mobile_user(pool: &PgPool, org_id: Uuid, mobile: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO iam.user_account (org_id, id, login_kind, mobile) VALUES ($1, $2, 'mobile_otp', $3)")
+        .bind(org_id).bind(id).bind(mobile).execute(pool).await.unwrap();
+    id
 }
 
 pub async fn send(app: &axum::Router, req: Request<Body>) -> (Response<Body>, serde_json::Value) {
@@ -60,7 +86,7 @@ pub fn now() -> i64 {
 }
 
 pub fn token(user_id: Uuid, org_id: Uuid) -> String {
-    domain_iam::tokens::issue_access(JWT_SECRET, user_id, org_id, now())
+    domain_iam::tokens::issue_access(JWT_SECRET, user_id, org_id, None, now())
 }
 
 pub fn bearer(token: &str) -> axum::http::HeaderMap {

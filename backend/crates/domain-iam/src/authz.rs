@@ -8,6 +8,7 @@ pub struct Principal {
     pub user_id: Uuid,
     pub org_id: Uuid,
     pub employee_id: Option<Uuid>,
+    pub session_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

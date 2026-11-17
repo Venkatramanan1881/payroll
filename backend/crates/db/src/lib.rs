@@ -36,3 +36,26 @@ pub async fn begin_org(pool: &PgPool, org_id: Uuid) -> sqlx::Result<OrgTx<'stati
     sqlx::query("SELECT app.set_org($1)").bind(org_id).execute(&mut *tx).await?;
     Ok(OrgTx(tx))
 }
+
+/// Writes one insert-only audit entry in the caller's transaction, so it commits or rolls back with the change (TSD §3.3).
+pub async fn audit(
+    tx: &mut OrgTx<'_>,
+    actor_id: Uuid,
+    action: &str,
+    target_type: &str,
+    target_id: Option<Uuid>,
+    after: Option<serde_json::Value>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO audit.audit_entry (org_id, actor_kind, actor_id, action, target_type, target_id, after_value)
+         VALUES (app.current_org(), 'user', $1, $2, $3, $4, $5)",
+    )
+    .bind(actor_id)
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(after)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(())
+}
