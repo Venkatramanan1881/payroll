@@ -142,3 +142,70 @@ pub async fn publish(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: Heade
     let body = version::get_version(&mut tx, id).await?;
     done(tx, key, StatusCode::OK, body).await
 }
+
+use axum::extract::Query;
+use domain_policy::assignment;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewAssignment {
+    policy_set_id: Uuid,
+    level: String,
+    branch_id: Option<Uuid>,
+    list_entry_id: Option<Uuid>,
+    shift_id: Option<Uuid>,
+    employee_id: Option<Uuid>,
+    valid_from: NaiveDate,
+    valid_to: Option<NaiveDate>,
+    reason: String,
+}
+
+pub async fn create_assignment(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    require(&mut tx, &p, "POL-04").await?;
+    let (key, replay) = start(&mut tx, &headers, "POST /v1/policy-assignments", &raw).await?;
+    if let Some(r) = replay {
+        return Ok(r);
+    }
+    let r: NewAssignment = parse(&raw)?;
+    let targets: Vec<Uuid> = [r.branch_id, r.list_entry_id, r.shift_id, r.employee_id].into_iter().flatten().collect();
+    if targets.len() > 1 {
+        return Err(ApiError::ValidationFailed("give at most one target id".into()));
+    }
+    let new = assignment::NewAssignment { policy_set_id: r.policy_set_id, level: r.level, target: targets.first().copied(), valid_from: r.valid_from, valid_to: r.valid_to, reason: r.reason };
+    let id = assignment::create_assignment(&mut tx, p.user_id, new).await?;
+    let body = assignment::get_assignment(&mut tx, id).await?;
+    done(tx, key, StatusCode::CREATED, body).await
+}
+
+#[derive(Deserialize)]
+pub struct AssignmentFilter {
+    policy_set_id: Option<Uuid>,
+    level: Option<String>,
+    target_id: Option<Uuid>,
+    on_date: Option<NaiveDate>,
+}
+
+pub async fn list_assignments(Auth(p, mut tx): Auth, Query(f): Query<AssignmentFilter>) -> Result<Json<Value>, ApiError> {
+    require(&mut tx, &p, "POL-07").await?;
+    let items = assignment::list_assignments(&mut tx, f.policy_set_id, f.level.as_deref(), f.target_id, f.on_date).await?;
+    Ok(Json(json!({ "items": items, "next_cursor": null })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndRequest {
+    valid_to: NaiveDate,
+    reason: String,
+}
+
+pub async fn end_assignment(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    require(&mut tx, &p, "POL-04").await?;
+    let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/policy-assignments/{id}/end"), &raw).await?;
+    if let Some(r) = replay {
+        return Ok(r);
+    }
+    let r: EndRequest = parse(&raw)?;
+    assignment::end_assignment(&mut tx, p.user_id, id, r.valid_to, &r.reason).await?;
+    let body = assignment::get_assignment(&mut tx, id).await?;
+    done(tx, key, StatusCode::OK, body).await
+}

@@ -79,8 +79,11 @@ pub async fn expected_day(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, b
     Ok(day)
 }
 
+/// (kind, weekly_days, alt_day, alt_weeks) of sched.weekly_off_pattern.
+type PatternRow = (String, Option<Vec<i16>>, Option<i16>, Option<Vec<i16>>);
+
 async fn pattern_is_off(tx: &mut OrgTx<'_>, pattern: Uuid, date: NaiveDate) -> Result<bool, DomainError> {
-    let (kind, days, alt_day, alt_weeks): (String, Option<Vec<i16>>, Option<i16>, Option<Vec<i16>>) =
+    let (kind, days, alt_day, alt_weeks): PatternRow =
         sqlx::query_as("SELECT kind, weekly_days, alt_day, alt_weeks FROM sched.weekly_off_pattern WHERE id = $1")
             .bind(pattern)
             .fetch_one(&mut ***tx)
@@ -98,17 +101,18 @@ const SCHEDULE_JSON: &str = "jsonb_build_object('id', s.id, 'employee_id', s.emp
     'weekly_off_pattern_id', s.weekly_off_pattern_id, 'valid_from', lower(s.valid), 'valid_to', upper(s.valid),
     'reason', s.reason, 'created_at', s.created_at, 'created_by', s.created_by)";
 
+pub struct NewSchedule {
+    pub employee: Uuid,
+    pub source: String,
+    pub shift: Option<Uuid>,
+    pub pattern: Option<Uuid>,
+    pub from: NaiveDate,
+    pub reason: String,
+}
+
 /// Dated schedule (fixed shift or roster). A change ends the current range at `from` and starts the next one.
-pub async fn assign_schedule(
-    tx: &mut OrgTx<'_>,
-    actor: Uuid,
-    employee: Uuid,
-    source: &str,
-    shift: Option<Uuid>,
-    pattern: Option<Uuid>,
-    from: NaiveDate,
-    reason: &str,
-) -> Result<Value, DomainError> {
+pub async fn assign_schedule(tx: &mut OrgTx<'_>, actor: Uuid, s: NewSchedule) -> Result<Value, DomainError> {
+    let NewSchedule { employee, source, shift, pattern, from, reason } = s;
     if reason.trim().is_empty() {
         return Err(invalid("reason"));
     }
@@ -130,7 +134,7 @@ pub async fn assign_schedule(
     );
     let row: Value = sqlx::query_scalar(&sql)
         .bind(employee)
-        .bind(source)
+        .bind(&source)
         .bind(shift)
         .bind(pattern)
         .bind(from)

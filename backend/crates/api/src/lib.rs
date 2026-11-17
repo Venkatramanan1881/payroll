@@ -47,6 +47,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/policy-versions/{id}/rule-groups/{rule_group}", get(routes::policy::get_rule_group).put(routes::policy::put_rule_group))
         .route("/v1/policy-versions/{id}/rule-groups/{rule_group}/switch", post(routes::policy::switch_rule_group))
         .route("/v1/policy-versions/{id}/publish", post(routes::policy::publish))
+        .route("/v1/policy-assignments", post(routes::policy::create_assignment).get(routes::policy::list_assignments))
+        .route("/v1/policy-assignments/{id}/end", post(routes::policy::end_assignment))
         .route("/v1/employees", post(routes::employees::create))
         .route("/v1/employees/{employee_id}", get(routes::employees::get).patch(routes::employees::patch))
         .route("/v1/employees/{employee_id}/assignments", get(routes::employees::list_assignments))

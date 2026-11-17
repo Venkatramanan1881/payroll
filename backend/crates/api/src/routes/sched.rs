@@ -326,7 +326,8 @@ pub async fn assign_schedule(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Byt
     }
     let r: NewSchedule = parse(&raw)?;
     load_in_scope(&mut tx, &p, r.employee_id, "SCH-02", true).await?;
-    let body = schedule::assign_schedule(&mut tx, p.user_id, r.employee_id, &r.source, r.shift_id, r.weekly_off_pattern_id, r.valid_from, &r.reason).await?;
+    let new = schedule::NewSchedule { employee: r.employee_id, source: r.source, shift: r.shift_id, pattern: r.weekly_off_pattern_id, from: r.valid_from, reason: r.reason };
+    let body = schedule::assign_schedule(&mut tx, p.user_id, new).await?;
     done(tx, key, StatusCode::CREATED, body).await
 }
 
