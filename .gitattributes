@@ -1,0 +1,2 @@
+# SQLx checksums migration bytes: line endings must never change between checkouts.
+backend/crates/db/migrations/*.sql text eol=lf

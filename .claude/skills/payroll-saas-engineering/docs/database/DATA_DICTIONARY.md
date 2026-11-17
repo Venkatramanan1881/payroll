@@ -1,6 +1,6 @@
 # Data dictionary (V1)
 
-Generated from the validated schema (migrations 0001–0006, PostgreSQL 16). Do not edit by hand: change the migration and regenerate.
+Generated from the validated schema (migrations 0001–0008, PostgreSQL 16). Do not edit by hand: change the migration and regenerate.
 
 100 tables and views. Constraints listed: CHECK, UNIQUE, EXCLUDE (full text). Primary and foreign keys are in the migration files.
 
@@ -103,7 +103,7 @@ Constraints:
 | org_id | uuid NOT NULL |  |
 
 Constraints:
-- `attendance_day_processing_state_check`: `CHECK ((processing_state = ANY (ARRAY['provisional'::text, 'exception'::text, 'absence_pending'::text, 'finalised'::text, 'locked'::text])))`
+- `attendance_day_processing_state_check`: `CHECK ((processing_state = ANY (ARRAY['provisional'::text, 'exception'::text, 'absence_pending'::text, 'locked'::text])))` (0007)
 - `attendance_day_org_id_employee_id_attendance_date_key`: `UNIQUE (org_id, employee_id, attendance_date)`
 - `attendance_day_org_id_id_employee_id_attendance_date_key`: `UNIQUE (org_id, id, employee_id, attendance_date)`
 
@@ -165,7 +165,7 @@ Append-only (BRX-03). Inserts for a date inside period.lock_coverage are refused
 | flags | text[] NOT NULL |  |
 | early_mark | boolean NOT NULL |  |
 | late_mark | boolean NOT NULL |  |
-| overtime_identified_minutes | integer NOT NULL |  |
+| overtime_identified_minutes | integer | D-09: NULL when the Overtime module (M01, V3) is off. (0008) |
 | early_arrival_minutes | integer NOT NULL |  |
 | early_minutes | integer NOT NULL |  |
 | late_minutes | integer NOT NULL |  |
@@ -1224,7 +1224,7 @@ Constraints:
 | frozen_at | timestamp with time zone NOT NULL |  |
 | pay_hold | boolean NOT NULL |  |
 | branch_days | jsonb NOT NULL |  |
-| overtime_identified_minutes | integer NOT NULL |  |
+| overtime_identified_minutes | integer | D-09: NULL when the Overtime module (M01, V3) is off. (0008) |
 | early_minutes | integer NOT NULL |  |
 | late_minutes | integer NOT NULL |  |
 | deduction_lines | jsonb NOT NULL |  |
@@ -1922,6 +1922,7 @@ Constraints:
 | window_after_min | integer NOT NULL |  |
 | is_night_shift | boolean NOT NULL |  |
 | night_attendance_date | text NOT NULL |  |
+| missed_punch_cutoff | time without time zone NOT NULL | D-08: MP-03 applies at this time on the day after the shift end date (branch zone). Default 02:30. (0008) |
 | updated_at | timestamp with time zone NOT NULL |  |
 | created_at | timestamp with time zone NOT NULL |  |
 | half_day_split | text NOT NULL |  |

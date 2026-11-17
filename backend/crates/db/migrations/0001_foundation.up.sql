@@ -9,7 +9,10 @@ DECLARE r text;
 BEGIN
   FOREACH r IN ARRAY ARRAY['app_owner','app_api','app_gateway','app_jobs','app_vendor','app_relay'] LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
-      EXECUTE format('CREATE ROLE %I NOLOGIN NOBYPASSRLS', r);
+      BEGIN
+        EXECUTE format('CREATE ROLE %I NOLOGIN NOBYPASSRLS', r);
+      EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;  -- roles are cluster-wide; another database may create it concurrently
+      END;
     END IF;
   END LOOP;
 END $$;

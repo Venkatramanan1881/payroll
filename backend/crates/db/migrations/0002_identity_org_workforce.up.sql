@@ -303,7 +303,10 @@ $$;
 -- Owned by a non-login role allowed to bypass RLS, with SELECT on exactly these two tables (tables force RLS even for their owner).
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_resolver') THEN
-    CREATE ROLE app_resolver NOLOGIN BYPASSRLS;
+    BEGIN
+      CREATE ROLE app_resolver NOLOGIN BYPASSRLS;
+    EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;  -- roles are cluster-wide; another database may create it concurrently
+    END;
   END IF;
 END $$;
 GRANT USAGE ON SCHEMA iam, platform TO app_resolver;

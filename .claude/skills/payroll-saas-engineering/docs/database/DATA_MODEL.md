@@ -2,7 +2,7 @@
 
 Status: Draft for Approval Gate 3
 Sources: `docs/domain/DOMAIN_MODEL.md`, `STATE_MACHINES.md`, `PERMISSION_MATRIX.md` (Gate 2 approved 2026-11-15); TSD v0.1 §4, §5.3, §6, §17; BRD v0.7 TB-01..09
-Physical schema: `migrations/*.up.sql` (PostgreSQL 16, standard features only: TB-06, TSD §17). It is validated on a throwaway local cluster, and no shared or live database was touched.
+Physical schema: `backend/crates/db/migrations/*.up.sql` (moved there in Phase 5) (PostgreSQL 16, standard features only: TB-06, TSD §17). It is validated on a throwaway local cluster, and no shared or live database was touched.
 
 ---
 
@@ -60,6 +60,7 @@ Purpose and key constraints of each table are in the migration file and in `COMM
 | perm | `permission_type`, `permission_type_version`, `permission_usage_entry`, `permission_request`, `on_duty_request` | 0004 |
 | shared requests | `app.approval_step` (one row per approval action for any request type; BR-07 enforced by CHECK) | 0004 |
 | notify | `notification_rule`, `notification` | 0004 |
+| added in 0009 (Phase 5) | `app.idempotency_key` (API_CONVENTIONS §5) | 0009 |
 | added in 0006 (Phase 4) | `workforce.contact_change_request` (SM-CONTACT), `org.settings_change_request` (SM-SETCHG), `period.unlock_request` (SM-REQ), `notify.push_device`; new columns: VC-03 flag, notification `read_at`, comp-off `employee_choice` | 0006 |
 
 ## 4. Tenancy and access
@@ -110,8 +111,8 @@ Partitioning (TSD §4.6): not in V1. The keys are chosen so `raw_punch`, `day_re
 
 | Item | How the schema stays open |
 |---|---|
-| DP-01 period cycle owner | `period.attendance_cycle.owner_kind IN ('organisation','branch','policy_set')` + `owner_id`. V2 adds `payroll_group`. Locks are materialised per employee (§5.3), so the answer does not change the lock rule. |
-| DP-03 policy precedence | No schema impact: `policy_assignment.level` is stored and ranking is resolver logic. |
+| DP-01 period cycle owner | **Decided D-02: organisation.** V1 uses only `owner_kind = 'organisation'`; `branch` and `policy_set` stay allowed by the CHECK but unused (no migration needed). V2 adds `payroll_group`. |
+| DP-03 policy precedence | **Decided D-03:** employee > shift > department > category > branch > organisation; resolver logic, no schema impact. |
 | DP-04 schedule time zone | `day_result.schedule_tz` records the zone actually used. |
 | DP-05 flag counts before decision | `punch_flag.counts_before_decision` is captured when the flag is raised. |
 | DP-06 DS-10 vs LM-28 | No schema impact (rule logic). `attendance_day.processing_state` includes `absence_pending`. |
