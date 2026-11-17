@@ -50,7 +50,8 @@ PC-03 (fences) lives in `org.geo_fence`; PC-09/PC-17 (WFH, on-duty) wait for tho
 ## File Structure
 
 ```
-backend/crates/domain-timecap/src/{lib,settings,evaluate,punch,flags}.rs
+backend/crates/domain-policy/src/pc.rs            (typed PC settings; lives with policy so timecap can depend on it)
+backend/crates/domain-timecap/src/{lib,evaluate,punch,flags}.rs
 backend/crates/api/src/routes/punches.rs
 backend/crates/api/tests/{punch_settings,punches,punch_sync,punch_flags,manual_attendance}.rs
 ```
@@ -72,6 +73,13 @@ List (`state`, `reason`, `employee_id`, dates; scope), accept/reject (reject nee
 
 ### Task 6: Manual attendance and reads
 `POST /v1/manual-attendance` (TCP-04; PC-01 `hr_entry`): manual punches with reason and entered_by (BR-01), each employee in scope, branch given. `GET /v1/punches` (scope; location fields only with TCP-08), `GET /v1/punches/{id}`, `GET /v1/punch-attempts` (TCP-09). Tests, then `cargo test --workspace` and clippy clean.
+
+## Rulings taken in this slice (neutral items kept open)
+- App punch with no location (OQ-C04-10): flagged `location_unavailable`, not blocked.
+- IP check failure (OQ-C04-11): flagged `ip_check_failed`; PC-15 `either` lets a passing fence or IP clear both.
+- Who decides a flag (G-16): anyone with TCP-06 in scope; managers (`approve`) for their direct reports. Per-reason deciders from D-05c wait for the approval engine.
+- Manual attendance with PC-01 `hr_entry` off (OQ-C04-07) and PC-11 delegation: not enforced yet.
+- Org settings keys follow slice 1 (`"EM-06"`: master_only / chosen_branches / all_branches; `"EM-07"`: block / record_and_flag).
 
 ## Not in this slice
 Devices, enrolment and the device gateway (eSSL adapter blocked on Q15); selfie upload links (files slice); WFH/on-duty fence exemptions (PC-09/PC-17, DP-09); bulk device-outage regularisation (TCP-05, with regularisation).

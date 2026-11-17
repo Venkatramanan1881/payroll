@@ -138,7 +138,7 @@ pub async fn seed_worker(pool: &PgPool, app: &axum::Router, s: &SeedOrg, name: &
     let user_id = Uuid::new_v4();
     let role_id = Uuid::new_v4();
     sqlx::query("INSERT INTO iam.user_account (org_id, id, employee_id, login_kind, mobile) VALUES ($1, $2, $3, 'mobile_otp', $4)")
-        .bind(s.org_id).bind(user_id).bind(employee_id).bind(format!("+9190{}", &user_id.simple().to_string()[..8].bytes().map(|b| (b % 10).to_string()).collect::<String>()))
+        .bind(s.org_id).bind(user_id).bind(employee_id).bind(format!("+91{}", 6_000_000_000u64 + (user_id.as_u128() % 1_000_000_000) as u64))
         .execute(pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name) VALUES ($1, $2, $3)").bind(s.org_id).bind(role_id).bind(format!("Employee {role_id}")).execute(pool).await.unwrap();
     for op in ["TCP-03", "TCP-07", "TCP-09"] {
