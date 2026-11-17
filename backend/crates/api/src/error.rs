@@ -12,6 +12,8 @@ pub enum ApiError {
     NotFound,
     ValidationFailed(String),
     PreconditionRequired,
+    PreconditionFailed,
+    PeriodLocked,
     IdempotencyConflict,
     EmployeeLimitReached,
     /// Phone verified for several organisations: (choice token, [(candidate_ref, display_name)]).
@@ -26,6 +28,8 @@ impl ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "FORBIDDEN", "Not allowed"),
             ApiError::OrgSuspended => (StatusCode::FORBIDDEN, "ORG_SUSPENDED", "Organisation is suspended"),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", "Not found"),
+            ApiError::PreconditionFailed => (StatusCode::PRECONDITION_FAILED, "PRECONDITION_FAILED", "Resource changed since it was read"),
+            ApiError::PeriodLocked => (StatusCode::CONFLICT, "PERIOD_LOCKED", "Date is in a locked period"),
             ApiError::PreconditionRequired => (StatusCode::PRECONDITION_REQUIRED, "PRECONDITION_REQUIRED", "Required header missing"),
             ApiError::IdempotencyConflict => (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT", "Idempotency-Key reused with a different body"),
             ApiError::EmployeeLimitReached => (StatusCode::CONFLICT, "EMPLOYEE_LIMIT_REACHED", "Employee limit reached"),
@@ -82,6 +86,7 @@ impl From<domain_workforce::employee::WorkforceError> for ApiError {
         match e {
             W::Validation(m) => ApiError::ValidationFailed(m),
             W::LimitReached => ApiError::EmployeeLimitReached,
+            W::PeriodLocked => ApiError::PeriodLocked,
             W::Db(e) => e.into(),
         }
     }

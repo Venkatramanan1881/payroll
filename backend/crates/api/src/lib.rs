@@ -25,6 +25,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/auth/refresh", post(routes::auth::refresh))
         .route("/v1/auth/sign-out", post(routes::auth::sign_out))
         .route("/v1/employees", post(routes::employees::create))
+        .route("/v1/employees/{employee_id}", get(routes::employees::get).patch(routes::employees::patch))
+        .route("/v1/employees/{employee_id}/assignments", get(routes::employees::list_assignments))
+        .route("/v1/employees/{employee_id}/change-assignment", post(routes::employees::change_assignment))
         .fallback(|| async { ApiError::NotFound })
         .with_state(state)
 }

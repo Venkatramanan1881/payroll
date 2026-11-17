@@ -9,6 +9,26 @@ use uuid::Uuid;
 
 pub const JWT_SECRET: &[u8] = b"test-secret-not-for-production";
 
+/// A request with a bearer token and optional JSON body / extra headers.
+pub fn req(method: &str, uri: &str, token: &str, body: Option<serde_json::Value>, headers: &[(&str, String)]) -> Request<Body> {
+    let mut b = Request::builder().method(method).uri(uri).header("authorization", format!("Bearer {token}"));
+    for (k, v) in headers {
+        b = b.header(*k, v);
+    }
+    match body {
+        Some(json) => b.header("content-type", "application/json").body(Body::from(json.to_string())).unwrap(),
+        None => b.body(Body::empty()).unwrap(),
+    }
+}
+
+/// Creates an employee in the seed organisation's HQ branch through the API; returns its JSON.
+pub async fn create_employee(app: &axum::Router, s: &SeedOrg, name: &str) -> serde_json::Value {
+    let body = serde_json::json!({ "full_name": name, "joining_date": "2026-01-01", "employment_status": "active", "master_branch_id": s.branch_id });
+    let (res, json) = send(app, req("POST", "/v1/employees", &s.hr_token, Some(body), &[("idempotency-key", Uuid::new_v4().to_string())])).await;
+    assert_eq!(res.status(), axum::http::StatusCode::CREATED, "{json}");
+    json
+}
+
 /// Test verifier: a token "phone:<E.164>" verifies to that number; anything else is rejected.
 pub struct FakeVerifier;
 

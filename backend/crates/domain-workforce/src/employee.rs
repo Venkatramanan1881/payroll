@@ -10,6 +10,7 @@ use uuid::Uuid;
 pub enum WorkforceError {
     Validation(String),
     LimitReached,
+    PeriodLocked,
     Db(sqlx::Error),
 }
 
@@ -253,4 +254,61 @@ pub async fn load_employee(tx: &mut OrgTx<'_>, id: Uuid, today: NaiveDate) -> Re
     .fetch_optional(&mut ***tx)
     .await?;
     Ok(row)
+}
+
+/// Weak ETag of an employee record (workforce.yaml): changes whenever the row or its assignments change.
+pub fn etag(employee: &Value) -> String {
+    format!("W/\"{}\"", employee["updated_at"].as_str().unwrap_or_default())
+}
+
+/// PATCH fields (workforce.yaml): personal and contact details. Absent = unchanged, null = cleared where allowed.
+const PATCHABLE: [&str; 7] = ["full_name", "date_of_birth", "mobile", "email", "address", "emergency_contact", "employee_code"];
+
+pub async fn update_employee(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, fields: serde_json::Map<String, Value>, today: NaiveDate) -> Result<(), WorkforceError> {
+    if fields.is_empty() {
+        return Err(invalid("at least one field"));
+    }
+    if let Some(k) = fields.keys().find(|k| !PATCHABLE.contains(&k.as_str())) {
+        return Err(invalid(k)); // includes custom_fields, not supported yet
+    }
+    if let Some(v) = fields.get("full_name") {
+        let ok = v.as_str().is_some_and(|n| !n.trim().is_empty() && n.chars().count() <= 200);
+        if !ok {
+            return Err(invalid("full_name"));
+        }
+    }
+    if let Some(v) = fields.get("mobile").filter(|v| !v.is_null()) {
+        let digits = v.as_str().and_then(|m| m.strip_prefix('+')).unwrap_or("");
+        if !(7..=15).contains(&digits.len()) || !digits.chars().all(|c| c.is_ascii_digit()) || digits.starts_with('0') {
+            return Err(invalid("mobile"));
+        }
+    }
+    if let Some(v) = fields.get("employee_code") {
+        let mode: Option<String> = sqlx::query_scalar(
+            "SELECT settings->>'EM-01' FROM org.organisation_settings_version WHERE effective_from <= $1 ORDER BY effective_from DESC LIMIT 1",
+        )
+        .bind(today)
+        .fetch_optional(&mut ***tx)
+        .await?
+        .flatten();
+        let ok = mode.as_deref() == Some("manual") && v.as_str().is_some_and(|c| !c.is_empty() && c.chars().count() <= 30);
+        if !ok {
+            return Err(invalid("employee_code (only when EM-01 = manual)"));
+        }
+    }
+    // Column names come from PATCHABLE above, never from input text; values are bound from one jsonb parameter.
+    let sets: Vec<String> = fields
+        .keys()
+        .map(|k| match k.as_str() {
+            "date_of_birth" => format!("{k} = ($2->>'{k}')::date"),
+            "emergency_contact" => format!("{k} = $2->'{k}'"),
+            _ => format!("{k} = $2->>'{k}'"),
+        })
+        .collect();
+    let sql = format!("UPDATE workforce.employee SET {}, updated_by = $3 WHERE id = $1", sets.join(", "));
+    let before: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(e) FROM workforce.employee e WHERE id = $1").bind(id).fetch_optional(&mut ***tx).await?;
+    sqlx::query(&sql).bind(id).bind(Value::Object(fields.clone())).bind(actor).execute(&mut ***tx).await?;
+    let change = serde_json::json!({ "before": before, "changed": fields });
+    db::audit(tx, actor, "employee.update", "employee", Some(id), Some(change)).await?;
+    Ok(())
 }
