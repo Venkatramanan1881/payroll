@@ -1,6 +1,8 @@
 mod error;
+mod extract;
 
 pub use error::ApiError;
+pub use extract::{authenticate, unix_now, Auth};
 
 use axum::{routing::get, Json, Router};
 use sqlx::PgPool;

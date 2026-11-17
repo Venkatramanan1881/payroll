@@ -25,6 +25,7 @@ pub struct SeedOrg {
     pub org_id: Uuid,
     pub branch_id: Uuid,
     pub hr_user_id: Uuid,
+    pub hr_token: String,
 }
 
 /// One organisation, one branch "HQ", and an HR Manager with WRK-01/02/03/08 scoped to all branches.
@@ -50,5 +51,20 @@ pub async fn seed_org(pool: &PgPool) -> SeedOrg {
         .bind(org_id).bind(hr_user_id).bind(role_id).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO iam.user_scope (org_id, user_id, scope_kind) VALUES ($1, $2, 'all')")
         .bind(org_id).bind(hr_user_id).execute(pool).await.unwrap();
-    SeedOrg { org_id, branch_id, hr_user_id }
+    let hr_token = token(hr_user_id, org_id);
+    SeedOrg { org_id, branch_id, hr_user_id, hr_token }
+}
+
+pub fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+pub fn token(user_id: Uuid, org_id: Uuid) -> String {
+    domain_iam::tokens::issue_access(JWT_SECRET, user_id, org_id, now())
+}
+
+pub fn bearer(token: &str) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    h
 }

@@ -12,6 +12,7 @@ uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow = "1"
+domain-iam = { path = "../domain-iam" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
