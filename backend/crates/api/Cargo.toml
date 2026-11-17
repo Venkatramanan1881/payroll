@@ -15,6 +15,7 @@ anyhow = "1"
 domain-iam = { path = "../domain-iam" }
 domain-workforce = { path = "../domain-workforce" }
 domain-sched = { path = "../domain-sched" }
+domain-policy = { path = "../domain-policy" }
 chrono.workspace = true
 sha2 = "0.10"
 
