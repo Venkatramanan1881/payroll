@@ -141,3 +141,15 @@ async fn pc_rule_group_is_typed(pool: PgPool) {
     let (st, body) = put_group(&app, &s, &v, "PC", json!({ "PC-03": 200, "PC-09": "always", "PC-04": "block", "PC-14": { "threshold_m": 50, "action": "flag" } })).await;
     assert_eq!(st, StatusCode::OK, "{body}");
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn attendance_groups_typed_with_warnings(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool);
+    let v = new_set(&app, &s, "Factory", "2026-01-01").await["versions"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(put_group(&app, &s, &v, "LA", json!({ "LA-03": 200 })).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(put_group(&app, &s, &v, "MP", json!({ "MP-03": "flag" })).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, b) = put_group(&app, &s, &v, "LA", json!({ "LA-03": 15, "LA-06": true })).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    assert_eq!(b["warnings"], json!(["LA-06 is stored but not evaluated yet"]));
+}

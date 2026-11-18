@@ -132,6 +132,9 @@ pub async fn record(Auth(p, mut tx): Auth, conn: Conn, headers: HeaderMap, raw: 
             Err(ApiError::PunchRefused(rule_ref.to_string(), attempt_id, message))
         }
         Outcome::Stored { punch_id, flags, duplicate } => {
+            if !duplicate {
+                domain_attendance::recalculate_around(&mut tx, employee, now, "punch", Some(punch_id)).await?;
+            }
             let loc = location_scope(&mut tx, &p).await?;
             let body = json!({
                 "outcome": if flags.is_empty() { "accepted" } else { "flagged" },
@@ -147,7 +150,7 @@ pub async fn record(Auth(p, mut tx): Auth, conn: Conn, headers: HeaderMap, raw: 
 // Scope
 
 /// Employees the caller may see for `op`: None = every employee. Scope is by today's assignment, as for employees.
-async fn visible_employees(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<Option<Vec<Uuid>>, ApiError> {
+pub(crate) async fn visible_employees(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<Option<Vec<Uuid>>, ApiError> {
     let g = require(tx, p, op).await?;
     let today = crate::routes::employees::today();
     let by_assignment = |kind: &'static str, column: &'static str| {
@@ -169,7 +172,7 @@ async fn visible_employees(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Resul
     Ok(Some(ids))
 }
 
-fn sees(visible: &Option<Vec<Uuid>>, employee: Option<Uuid>) -> bool {
+pub(crate) fn sees(visible: &Option<Vec<Uuid>>, employee: Option<Uuid>) -> bool {
     match visible {
         None => true,
         Some(ids) => employee.is_some_and(|e| ids.contains(&e)),
@@ -177,7 +180,7 @@ fn sees(visible: &Option<Vec<Uuid>>, employee: Option<Uuid>) -> bool {
 }
 
 /// Narrows the visible set to one requested employee (outside scope = empty result, never an error).
-fn narrow(visible: Option<Vec<Uuid>>, wanted: Option<Uuid>) -> Option<Vec<Uuid>> {
+pub(crate) fn narrow(visible: Option<Vec<Uuid>>, wanted: Option<Uuid>) -> Option<Vec<Uuid>> {
     match (visible, wanted) {
         (v, None) => v,
         (None, Some(e)) => Some(vec![e]),
@@ -248,6 +251,7 @@ pub async fn sync(Auth(p, mut tx): Auth, conn: Conn, headers: HeaderMap, raw: By
     }
     // Stored in the original time order for recalculation (PC-R7).
     items.sort_by_key(|(_, (o, _))| o.client_time);
+    let mut stored: Vec<(Uuid, DateTime<Utc>)> = Vec::new();
     for (i, (o, loc)) in items {
         let key = json!(o.idempotency_key);
         // PC-08: the uptime clock says how long ago the punch happened; a phone clock that disagrees was changed.
@@ -272,6 +276,9 @@ pub async fn sync(Auth(p, mut tx): Auth, conn: Conn, headers: HeaderMap, raw: By
         };
         sqlx::query("SAVEPOINT sync_item").execute(&mut **tx).await?;
         let outcome = punch::record(&mut tx, p.user_id, employee, &cap).await;
+        if let Ok(Outcome::Stored { punch_id, duplicate: false, .. }) = &outcome {
+            stored.push((*punch_id, cap.event_at));
+        }
         let sp = if outcome.is_err() { "ROLLBACK TO SAVEPOINT sync_item" } else { "RELEASE SAVEPOINT sync_item" };
         sqlx::query(sp).execute(&mut **tx).await?;
         results[i] = match outcome {
@@ -286,6 +293,9 @@ pub async fn sync(Auth(p, mut tx): Auth, conn: Conn, headers: HeaderMap, raw: By
             Err(db::DomainError::IdempotencyConflict) => item_problem(&key, "VALIDATION_FAILED", None, "idempotency_key is already used".into()),
             Err(e) => return Err(e.into()),
         };
+    }
+    for (punch_id, at) in stored {
+        domain_attendance::recalculate_around(&mut tx, employee, at, "punch_sync", Some(punch_id)).await?;
     }
     tx.commit().await?;
     Ok(Json(json!({ "results": results })))
@@ -385,7 +395,7 @@ pub struct DecisionIn {
 
 async fn decide(p: Principal, mut tx: OrgTx<'static>, id: Uuid, headers: HeaderMap, raw: Bytes, accept: bool) -> Result<Response, ApiError> {
     let visible = visible_employees(&mut tx, &p, "TCP-06").await?;
-    let employee = flags::flag_employee(&mut tx, id).await?;
+    let (employee, punch_at) = flags::flag_punch(&mut tx, id).await?;
     if !sees(&visible, Some(employee)) {
         return Err(ApiError::NotFound);
     }
@@ -399,7 +409,9 @@ async fn decide(p: Principal, mut tx: OrgTx<'static>, id: Uuid, headers: HeaderM
     }
     let r: DecisionIn = if raw.is_empty() { DecisionIn { comment: None, reason: None } } else { parse(&raw)? };
     let note = if accept { r.comment.as_deref() } else { r.reason.as_deref() };
-    flags::decide(&mut tx, p.user_id, id, accept, note).await?;
+    if flags::decide(&mut tx, p.user_id, id, accept, note).await? {
+        domain_attendance::recalculate_around(&mut tx, employee, punch_at, "flag_decision", Some(id)).await?;
+    }
     let body = flags::get_flag(&mut tx, id).await?;
     done(tx, key, StatusCode::OK, body).await
 }
@@ -459,6 +471,9 @@ pub async fn manual(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Re
     }
     let entries: Vec<(Uuid, DateTime<Utc>)> = r.entries.iter().map(|e| (e.employee_id, e.event_at)).collect();
     let ids = punch::record_manual(&mut tx, p.user_id, key, r.branch_id, r.device_id, &r.reason, &entries).await?;
+    for ((employee, at), id) in entries.iter().zip(&ids) {
+        domain_attendance::recalculate_around(&mut tx, *employee, *at, "manual_attendance", Some(*id)).await?;
+    }
     let mut punches = Vec::with_capacity(ids.len());
     for id in ids {
         punches.push(punch::get_punch(&mut tx, id, false).await?); // manual punches carry no location

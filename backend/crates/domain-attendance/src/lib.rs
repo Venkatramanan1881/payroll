@@ -1,0 +1,327 @@
+//! Attendance days: gathers each day's inputs, runs the engine and stores an append-only, explained result (C06).
+
+use chrono::{DateTime, NaiveDate, Utc};
+use db::{DomainError, OrgTx};
+use domain_timecap::punch::{branch_tz, master_branch_on};
+use engine::day::{compute_day, fingerprint, DayInput, Expected, PunchIn, ENGINE_VERSION};
+use engine::settings::{AttendanceSettings, GROUPS};
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+/// Settings of a policy version for the engine. A switched-off LA, EC or BK group evaluates nothing (G2, BR-14);
+/// the other groups cannot be "off" for a day, so their defaults apply.
+pub async fn load_settings(tx: &mut OrgTx<'_>, version: Uuid) -> Result<AttendanceSettings, DomainError> {
+    let rows: Vec<(String, bool, Value)> =
+        sqlx::query_as("SELECT rule_group, enabled, settings FROM policy.policy_rule_group WHERE policy_version_id = $1 AND rule_group = ANY($2)")
+            .bind(version)
+            .bind(GROUPS.to_vec())
+            .fetch_all(&mut ***tx)
+            .await?;
+    let mut s = AttendanceSettings::default();
+    for (group, enabled, doc) in rows {
+        if enabled {
+            s.apply(&group, &doc).map_err(db::invalid)?;
+        } else {
+            match group.as_str() {
+                "LA" => s.late_on = false,
+                "EC" => s.early_on = false,
+                "BK" => s.break_deduct = false,
+                _ => {}
+            }
+        }
+    }
+    Ok(s)
+}
+
+/// start, end, window before, window after, cut-off, required minutes, shift type.
+type ShiftRow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>, i32, i32, Option<DateTime<Utc>>, i32, String);
+
+struct ShiftTimes {
+    start_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+    window_from: DateTime<Utc>,
+    window_to: DateTime<Utc>,
+    cutoff_at: DateTime<Utc>,
+    required_min: i64,
+    flexible: bool,
+}
+
+/// The shift version's local times on `date` as instants in `tz` (BR-11). None for a shift without set times.
+async fn shift_times(tx: &mut OrgTx<'_>, version: Uuid, date: NaiveDate, tz: &str) -> Result<Option<ShiftTimes>, DomainError> {
+    // A shift crossing midnight ends the next day (SH-06 default: dated by its start); D-08: the missed-punch cut-off is
+    // that time of day on the calendar day after the shift's end date.
+    let row: Option<ShiftRow> = sqlx::query_as(
+        "SELECT (($2::date + v.start_time) AT TIME ZONE $3),
+                (($2::date + v.end_time + CASE WHEN v.crosses_midnight THEN interval '1 day' ELSE interval '0' END) AT TIME ZONE $3),
+                v.window_before_min, v.window_after_min,
+                (($2::date + CASE WHEN v.crosses_midnight THEN 2 ELSE 1 END + v.missed_punch_cutoff) AT TIME ZONE $3),
+                coalesce(v.required_minutes, 480), v.shift_type
+         FROM sched.shift_version v WHERE v.id = $1",
+    )
+    .bind(version)
+    .bind(date)
+    .bind(tz)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let Some((Some(start_at), Some(end_at), before, after, Some(cutoff_at), required, kind)) = row else { return Ok(None) };
+    Ok(Some(ShiftTimes {
+        start_at,
+        end_at,
+        window_from: start_at - chrono::Duration::minutes(before.into()),
+        window_to: end_at + chrono::Duration::minutes(after.into()),
+        cutoff_at,
+        required_min: required.into(),
+        flexible: matches!(kind.as_str(), "flexible" | "flexible_core" | "open"),
+    }))
+}
+
+async fn local_bounds(tx: &mut OrgTx<'_>, date: NaiveDate, tz: &str) -> Result<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>), DomainError> {
+    Ok(sqlx::query_as(
+        "SELECT ($1::date::timestamp AT TIME ZONE $2), (($1::date + 1)::timestamp AT TIME ZONE $2), ((($1::date + 1) + time '02:30') AT TIME ZONE $2)",
+    )
+    .bind(date)
+    .bind(tz)
+    .fetch_one(&mut ***tx)
+    .await?)
+}
+
+/// Recalculates one employee's day (BR-03). Returns the new result id, or None when nothing was written:
+/// unchanged inputs (BR-02, SM-DAY A11), a locked date (BR-06; adjustments come with period close), not employed,
+/// or no policy version in force (the day is marked `exception`).
+pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_kind: &str, trigger_ref: Option<Uuid>) -> Result<Option<Uuid>, DomainError> {
+    if db::employee_locked(tx, employee, date, date.succ_opt()).await? {
+        return Ok(None);
+    }
+    let Some(master) = master_branch_on(tx, employee, date).await? else { return Ok(None) };
+    let noon = date.and_hms_opt(12, 0, 0).expect("valid time").and_utc();
+    let tz = branch_tz(tx, master, noon).await?;
+
+    sqlx::query("INSERT INTO attendance.attendance_day (org_id, employee_id, attendance_date) VALUES (app.current_org(), $1, $2) ON CONFLICT DO NOTHING")
+        .bind(employee)
+        .bind(date)
+        .execute(&mut ***tx)
+        .await?;
+    let (day_id, current): (Uuid, Option<Uuid>) =
+        sqlx::query_as("SELECT id, current_result_id FROM attendance.attendance_day WHERE employee_id = $1 AND attendance_date = $2 FOR UPDATE")
+            .bind(employee)
+            .bind(date)
+            .fetch_one(&mut ***tx)
+            .await?;
+
+    let resolved = domain_policy::assignment::resolve_policy(tx, employee, date, master).await?;
+    let Some(policy_version) = resolved.and_then(|r| r.version_id) else {
+        sqlx::query("UPDATE attendance.attendance_day SET processing_state = 'exception', updated_at = now() WHERE id = $1 AND current_result_id IS NULL")
+            .bind(day_id)
+            .execute(&mut ***tx)
+            .await?;
+        return Ok(None);
+    };
+    let settings = load_settings(tx, policy_version).await?;
+
+    // Punches of the local day (wide window first), to find where the employee punched for the holiday calendar (D-04).
+    let (day_from, day_to, plain_cutoff) = local_bounds(tx, date, &tz).await?;
+    let punch_branch: Option<Uuid> = sqlx::query_scalar(
+        "SELECT branch_id FROM timecap.raw_punch WHERE employee_id = $1 AND event_at >= $2 AND event_at < $3 AND branch_id IS NOT NULL ORDER BY event_at LIMIT 1",
+    )
+    .bind(employee)
+    .bind(day_from)
+    .bind(day_to)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let day = domain_sched::schedule::expected_day(tx, employee, date, punch_branch.unwrap_or(master)).await?;
+    let shift = match (day.weekly_off || day.holiday.is_some(), day.shift_version_id) {
+        (false, Some(v)) => shift_times(tx, v, date, &tz).await?,
+        _ => None,
+    };
+    let (expected, window_from, window_to, cutoff_at) = match &shift {
+        _ if day.holiday.is_some() => (Expected::Holiday, day_from, day_to, plain_cutoff),
+        _ if day.weekly_off => (Expected::WeeklyOff, day_from, day_to, plain_cutoff),
+        Some(t) => (
+            Expected::Working { start_at: t.start_at, end_at: t.end_at, required_min: t.required_min, flexible: t.flexible },
+            t.window_from,
+            t.window_to,
+            t.cutoff_at,
+        ),
+        None => (Expected::Unscheduled, day_from, day_to, plain_cutoff),
+    };
+
+    // D-05c: a rejected flag, or a raised flag that does not count before its decision, keeps the punch out.
+    let rows: Vec<(Uuid, DateTime<Utc>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.event_at,
+                (SELECT 'flag_' || f.reason || '_' || f.state FROM timecap.punch_flag f
+                 WHERE f.punch_id = p.id AND (f.state = 'rejected' OR (f.state = 'raised' AND NOT f.counts_before_decision))
+                 ORDER BY f.state DESC, f.reason LIMIT 1)
+         FROM timecap.raw_punch p WHERE p.employee_id = $1 AND p.event_at >= $2 AND p.event_at <= $3 ORDER BY p.event_at, p.id",
+    )
+    .bind(employee)
+    .bind(window_from)
+    .bind(window_to)
+    .fetch_all(&mut ***tx)
+    .await?;
+    let input = DayInput {
+        expected,
+        punches: rows.into_iter().map(|(id, at, excluded)| PunchIn { id, at, excluded }).collect(),
+        cutoff_passed: Utc::now() >= cutoff_at,
+        settings,
+    };
+    let print = fingerprint(&input);
+    if let Some(c) = current {
+        let same: bool = sqlx::query_scalar("SELECT input_fingerprint = $2 AND policy_version_id = $3 FROM attendance.day_result WHERE id = $1")
+            .bind(c)
+            .bind(&print)
+            .bind(policy_version)
+            .fetch_one(&mut ***tx)
+            .await?;
+        if same {
+            return Ok(None);
+        }
+    }
+    let out = compute_day(&input);
+    let costed_branch = punch_branch.unwrap_or(master); // EM-08 default: the branch worked
+    let result: Uuid = sqlx::query_scalar(
+        "INSERT INTO attendance.day_result (org_id, attendance_day_id, employee_id, attendance_date, supersedes_result_id, policy_version_id,
+           shift_version_id, schedule_tz, costed_branch_id, input_fingerprint, engine_version, trigger_kind, trigger_ref,
+           gross_minutes, break_minutes, net_minutes, late_minutes, early_minutes, early_arrival_minutes, overtime_identified_minutes,
+           late_mark, early_mark, day_status, day_fraction_present, flags, sessions, explanation)
+         VALUES (app.current_org(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NULL,
+           $19, $20, $21, $22::numeric / 100, $23, $24, $25) RETURNING id",
+    )
+    .bind(day_id)
+    .bind(employee)
+    .bind(date)
+    .bind(current)
+    .bind(policy_version)
+    .bind(shift.as_ref().and(day.shift_version_id))
+    .bind(&tz)
+    .bind(costed_branch)
+    .bind(&print)
+    .bind(ENGINE_VERSION)
+    .bind(trigger_kind)
+    .bind(trigger_ref)
+    .bind(out.gross_min as i32)
+    .bind(out.break_min as i32)
+    .bind(out.net_min as i32)
+    .bind(out.late_min as i32)
+    .bind(out.early_min as i32)
+    .bind(out.early_arrival_min as i32)
+    .bind(out.late_mark)
+    .bind(out.early_mark)
+    .bind(out.status)
+    .bind(out.fraction_pct as i32)
+    .bind(&out.flags)
+    .bind(json!(out.sessions))
+    .bind(json!(out.explanation))
+    .fetch_one(&mut ***tx)
+    .await?;
+    for u in &out.punches_used {
+        sqlx::query(
+            "INSERT INTO attendance.day_result_punch (org_id, result_id, raw_punch_id, assigned_direction, session_no, excluded, excluded_reason)
+             VALUES (app.current_org(), $1, $2, $3, $4, $5, $6)",
+        )
+        .bind(result)
+        .bind(u.id)
+        .bind(u.direction)
+        .bind(u.session_no.map(|n| n as i16))
+        .bind(u.excluded.is_some())
+        .bind(&u.excluded)
+        .execute(&mut ***tx)
+        .await?;
+    }
+    for e in &out.effects {
+        sqlx::query(
+            "INSERT INTO attendance.day_effect (org_id, result_id, effect_kind, days, minutes, reason_code, rule_ref)
+             VALUES (app.current_org(), $1, $2, $3::numeric / 100, $4, $5, $6)",
+        )
+        .bind(result)
+        .bind(e.kind)
+        .bind(e.days_pct.map(|d| d as i32))
+        .bind(e.minutes.map(|m| m as i32))
+        .bind(&e.reason_code)
+        .bind(e.rule_ref)
+        .execute(&mut ***tx)
+        .await?;
+    }
+    sqlx::query("UPDATE attendance.attendance_day SET current_result_id = $2, processing_state = $3, updated_at = now() WHERE id = $1")
+        .bind(day_id)
+        .bind(result)
+        .bind(out.state)
+        .execute(&mut ***tx)
+        .await?;
+    sqlx::query("INSERT INTO app.outbox (org_id, event_type, aggregate_id, payload) VALUES (app.current_org(), 'DayResultChanged', $1, $2)")
+        .bind(day_id)
+        .bind(json!({ "employee_id": employee, "attendance_date": date, "result_id": result }))
+        .execute(&mut ***tx)
+        .await?;
+    Ok(Some(result))
+}
+
+/// Recalculates the days a punch at `at` can belong to: its local date and the day before (a night shift started then).
+// shortcut: inline, in the caller's transaction; moves behind the Cloud Tasks queue (TSD §5.2) with the deployment slice.
+pub async fn recalculate_around(tx: &mut OrgTx<'_>, employee: Uuid, at: DateTime<Utc>, trigger_kind: &str, trigger_ref: Option<Uuid>) -> Result<(), DomainError> {
+    let Some(master) = master_branch_on(tx, employee, at.date_naive()).await? else { return Ok(()) };
+    let tz = branch_tz(tx, master, at).await?;
+    let local: NaiveDate = sqlx::query_scalar("SELECT ($1::timestamptz AT TIME ZONE $2)::date").bind(at).bind(&tz).fetch_one(&mut ***tx).await?;
+    for d in [local.pred_opt(), Some(local)].into_iter().flatten() {
+        recalculate(tx, employee, d, trigger_kind, trigger_ref).await?;
+    }
+    Ok(())
+}
+
+const RESULT_JSON: &str = "jsonb_build_object('id', r.id, 'attendance_date', r.attendance_date, 'is_current', r.id IS NOT DISTINCT FROM d.current_result_id,
+    'supersedes_result_id', r.supersedes_result_id, 'day_status', r.day_status, 'day_fraction_present', to_char(r.day_fraction_present, 'FM990.00'),
+    'gross_minutes', r.gross_minutes, 'break_minutes', r.break_minutes, 'net_minutes', r.net_minutes, 'late_minutes', r.late_minutes,
+    'early_minutes', r.early_minutes, 'early_arrival_minutes', r.early_arrival_minutes, 'overtime_identified_minutes', r.overtime_identified_minutes,
+    'late_mark', r.late_mark, 'early_mark', r.early_mark, 'flags', to_jsonb(r.flags), 'sessions', r.sessions,
+    'punches_used', (SELECT coalesce(jsonb_agg(jsonb_build_object('raw_punch_id', u.raw_punch_id, 'assigned_direction', u.assigned_direction,
+        'session_no', u.session_no, 'excluded', u.excluded, 'excluded_reason', u.excluded_reason) ORDER BY u.session_no NULLS LAST, u.raw_punch_id), '[]')
+        FROM attendance.day_result_punch u WHERE u.result_id = r.id),
+    'day_effects', (SELECT coalesce(jsonb_agg(jsonb_build_object('effect_kind', e.effect_kind, 'days', to_char(e.days, 'FM990.00'), 'minutes', e.minutes,
+        'reason_code', e.reason_code, 'rule_ref', e.rule_ref) ORDER BY e.created_at, e.id), '[]') FROM attendance.day_effect e WHERE e.result_id = r.id),
+    'explanation', r.explanation, 'policy_version_id', r.policy_version_id, 'shift_version_id', r.shift_version_id, 'schedule_tz', r.schedule_tz,
+    'costed_branch_id', r.costed_branch_id, 'engine_version', r.engine_version, 'trigger_kind', r.trigger_kind, 'trigger_ref', r.trigger_ref,
+    'for_adjustment', r.for_adjustment, 'produced_at', r.produced_at)";
+
+/// AttendanceDay: current result and the superseded ones, newest first (BRX-03).
+pub async fn get_day(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) -> Result<Value, DomainError> {
+    let day: Option<(Uuid, String)> = sqlx::query_as("SELECT id, processing_state FROM attendance.attendance_day WHERE employee_id = $1 AND attendance_date = $2")
+        .bind(employee)
+        .bind(date)
+        .fetch_optional(&mut ***tx)
+        .await?;
+    let (id, state) = day.ok_or(DomainError::NotFound)?;
+    let sql = format!(
+        "SELECT {RESULT_JSON} FROM attendance.day_result r JOIN attendance.attendance_day d ON d.id = r.attendance_day_id
+         WHERE r.attendance_day_id = $1 AND NOT r.for_adjustment ORDER BY r.produced_at DESC, r.id"
+    );
+    let mut results: Vec<Value> = sqlx::query_scalar(&sql).bind(id).fetch_all(&mut ***tx).await?;
+    let pos = results.iter().position(|r| r["is_current"] == true);
+    let current = pos.map(|i| results.remove(i));
+    Ok(json!({
+        "id": id, "employee_id": employee, "attendance_date": date, "processing_state": state, "period_id": null,
+        "current_result": current, "history": results,
+        "permission_conversion_suggested": null, "check_in_held": false, "open_regularisation_request_ids": [],
+    }))
+}
+
+// shortcut: no cursor paging, first 500 by employee code.
+/// Daily rows (R1) for the given employees (None = all) on a date.
+pub async fn daily(tx: &mut OrgTx<'_>, employees: Option<Vec<Uuid>>, date: NaiveDate, status: Option<&str>) -> Result<Vec<Value>, DomainError> {
+    Ok(sqlx::query_scalar(
+        "SELECT jsonb_build_object('employee_id', e.id, 'employee_code', e.employee_code, 'employee_name', e.full_name,
+           'branch_id', (SELECT a.branch_id FROM workforce.employee_assignment a WHERE a.employee_id = e.id AND a.kind = 'master_branch' AND a.valid @> $2::date),
+           'department_id', (SELECT a.list_entry_id FROM workforce.employee_assignment a WHERE a.employee_id = e.id AND a.kind = 'department' AND a.valid @> $2::date),
+           'attendance_date', d.attendance_date, 'processing_state', d.processing_state, 'day_status', r.day_status,
+           'first_in_at', r.sessions->0->'in_at', 'last_out_at', r.sessions->-1->'out_at',
+           'net_minutes', coalesce(r.net_minutes, 0), 'late_minutes', coalesce(r.late_minutes, 0), 'early_minutes', coalesce(r.early_minutes, 0),
+           'flags', coalesce(to_jsonb(r.flags), '[]'))
+         FROM attendance.attendance_day d JOIN workforce.employee e ON e.id = d.employee_id
+         LEFT JOIN attendance.day_result r ON r.id = d.current_result_id
+         WHERE d.attendance_date = $2 AND ($1::uuid[] IS NULL OR d.employee_id = ANY($1)) AND ($3::text IS NULL OR r.day_status = $3)
+         ORDER BY e.employee_code LIMIT 500",
+    )
+    .bind(employees)
+    .bind(date)
+    .bind(status)
+    .fetch_all(&mut ***tx)
+    .await?)
+}

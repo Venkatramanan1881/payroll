@@ -184,7 +184,7 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
 
     // Missed punches (MP-01/02 before the cut-off, MP-03 at it). BR-09: a missing out is never an early check-out.
     let open = merged.iter().any(|p| p.out.is_none());
-    let mp_action = open.then(|| if input.cutoff_passed { s.mp_cutoff } else if kept.len() == 1 { s.mp_single } else { s.mp_odd });
+    let mp_action = open.then_some(if input.cutoff_passed { s.mp_cutoff } else if kept.len() == 1 { s.mp_single } else { s.mp_odd });
     let working = match &input.expected {
         Expected::Working { start_at, end_at, required_min, flexible } => Some((*start_at, *end_at, *required_min, *flexible)),
         _ => None,

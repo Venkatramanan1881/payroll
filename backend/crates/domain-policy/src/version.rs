@@ -160,11 +160,17 @@ pub async fn get_document(tx: &mut OrgTx<'_>, version: Uuid, group: &str) -> Res
 }
 
 /// Replaces one rule group's settings in a draft. A new group starts switched on.
-pub async fn put_document(tx: &mut OrgTx<'_>, actor: Uuid, version: Uuid, group: &str, schema_version: i32, settings: Value) -> Result<Value, DomainError> {
+/// Returns the stored document and warnings for keys stored but not evaluated yet.
+pub async fn put_document(tx: &mut OrgTx<'_>, actor: Uuid, version: Uuid, group: &str, schema_version: i32, settings: Value) -> Result<(Value, Vec<String>), DomainError> {
     check_document(group, &settings)?;
     if group == "PC" {
         crate::pc::PcSettings::parse(&settings).map_err(invalid)?;
     }
+    let warnings = if engine::settings::GROUPS.contains(&group) {
+        engine::settings::AttendanceSettings::default().apply(group, &settings).map_err(invalid)?
+    } else {
+        vec![]
+    };
     if schema_version < 1 {
         return Err(invalid("schema_version"));
     }
@@ -183,7 +189,7 @@ pub async fn put_document(tx: &mut OrgTx<'_>, actor: Uuid, version: Uuid, group:
     .execute(&mut ***tx)
     .await?;
     db::audit(tx, actor, "policy_rule_group.put", "policy_version", Some(version), Some(json!({ "rule_group": group, "settings": settings }))).await?;
-    get_document(tx, version, group).await
+    Ok((get_document(tx, version, group).await?, warnings))
 }
 
 /// G2 master switch for one rule group of a draft.
