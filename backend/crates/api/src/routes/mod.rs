@@ -5,3 +5,4 @@ pub mod policy;
 pub mod sched;
 pub mod punches;
 pub mod regularisation;
+pub mod leave;
