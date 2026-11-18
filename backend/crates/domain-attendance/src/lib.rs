@@ -3,11 +3,13 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use db::{DomainError, OrgTx};
 use domain_timecap::punch::{branch_tz, master_branch_on};
-use engine::day::{compute_day, fingerprint, DayInput, Expected, PunchIn, ENGINE_VERSION};
+use engine::day::{compute_day, fingerprint, DayInput, Effect, Expected, LeaveCover, PunchIn, ENGINE_VERSION};
 use engine::settings::{AttendanceSettings, GROUPS};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+pub mod approval;
+pub mod leave;
 pub mod regularisation;
 
 /// Settings of a policy version for the engine. A switched-off LA, EC or BK group evaluates nothing (G2, BR-14);
@@ -204,10 +206,35 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
     if cur.expected == Expected::Unscheduled && rows.is_empty() && existing.is_none() {
         return Ok(None); // nothing expected, nothing punched
     }
+    // Approved leave on the day (full, or a half with the shift's SH-11 split point).
+    let leave = match leave::leave_on(tx, employee, date).await? {
+        None => None,
+        Some(None) => Some(LeaveCover { half: None, split_at: None }),
+        Some(Some(half)) => {
+            let split_at: Option<DateTime<Utc>> = match cur.shift_version {
+                Some(v) => sqlx::query_scalar(
+                    "SELECT CASE WHEN half_day_split = 'fixed_time' AND half_day_split_time IS NOT NULL
+                                 THEN (($2::date + half_day_split_time) AT TIME ZONE $3) END FROM sched.shift_version WHERE id = $1",
+                )
+                .bind(v)
+                .bind(date)
+                .bind(&tz)
+                .fetch_one(&mut ***tx)
+                .await?,
+                None => None,
+            };
+            Some(LeaveCover { half: Some(half), split_at })
+        }
+    };
+    // DS-10: an absence is charged once its waiting days have passed, never on the day itself (D-07b).
+    let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE $1)::date").bind(&tz).fetch_one(&mut ***tx).await?;
+    let absence_due = (today - date).num_days() >= settings.absence_wait_days().max(1);
     let input = DayInput {
         expected: cur.expected,
         punches: rows.into_iter().map(|(id, at, excluded)| PunchIn { id, at, excluded }).collect(),
         cutoff_passed: Utc::now() >= cur.cutoff_at,
+        leave,
+        absence_due,
         settings,
     };
     let print = fingerprint(&input);
@@ -241,7 +268,8 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
             return Ok(None);
         }
     }
-    let out = compute_day(&input);
+    let mut out = compute_day(&input);
+    settle_absence_debit(tx, employee, date, day_id, &input.settings.leave_debit_order, &mut out).await?;
     let costed_branch = branch; // EM-08 default: the branch worked
     let result: Uuid = sqlx::query_scalar(
         "INSERT INTO attendance.day_result (org_id, attendance_day_id, employee_id, attendance_date, supersedes_result_id, policy_version_id,
@@ -318,6 +346,89 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
         .execute(&mut ***tx)
         .await?;
     Ok(Some(result))
+}
+
+/// DS-10 auto-debit (D-07b, LV-04): an absence due for charging debits one day from the first leave type in the
+/// LV-04 order that has the balance; with none, it is loss of pay. A day that stops being such an absence gets its
+/// debit reversed. One debit per day ever (the ledger key is the attendance day); once reversed, a later absence on
+/// the same day is loss of pay.
+async fn settle_absence_debit(
+    tx: &mut OrgTx<'_>,
+    employee: Uuid,
+    date: NaiveDate,
+    day_id: Uuid,
+    order: &[Uuid],
+    out: &mut engine::day::DayOutput,
+) -> Result<(), DomainError> {
+    let open_debit: Option<Uuid> = sqlx::query_scalar(
+        "SELECT e.id FROM leave.leave_ledger_entry e
+         WHERE e.cause_kind = 'attendance_day' AND e.cause_id = $1 AND e.entry_kind = 'absence_auto_debit'
+           AND NOT EXISTS (SELECT 1 FROM leave.leave_ledger_entry r WHERE r.reverses_entry_id = e.id)",
+    )
+    .bind(day_id)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    // Hundredths of a day due: a whole absent day, or the other half of a half-day leave.
+    let due_pct: i64 = if out.flags.iter().any(|f| f == "absence_charge_due") {
+        100
+    } else if out.flags.iter().any(|f| f == "absence_charge_due_half") {
+        50
+    } else {
+        0
+    };
+    out.flags.retain(|f| f != "absence_charge_due" && f != "absence_charge_due_half");
+    let due = due_pct > 0;
+    if !due {
+        if let Some(debit) = open_debit {
+            sqlx::query(
+                "INSERT INTO leave.leave_ledger_entry (org_id, account_id, entry_date, entry_kind, quantity, cause_kind, cause_id, reverses_entry_id, reason)
+                 SELECT app.current_org(), account_id, entry_date, 'reversal', -quantity, 'attendance_day', $2, id, 'the day is no longer an absence'
+                 FROM leave.leave_ledger_entry WHERE id = $1",
+            )
+            .bind(debit)
+            .bind(day_id)
+            .execute(&mut ***tx)
+            .await?;
+        }
+        return Ok(());
+    }
+    if open_debit.is_some() {
+        out.flags.push("absence_auto_debited".into());
+        return Ok(());
+    }
+    // One debit per day ever: after a reversal the day is loss of pay, never a debit from the next type.
+    let debited_before: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM leave.leave_ledger_entry WHERE cause_kind = 'attendance_day' AND cause_id = $1 AND entry_kind = 'absence_auto_debit')")
+        .bind(day_id)
+        .fetch_one(&mut ***tx)
+        .await?;
+    for leave_type in order.iter().filter(|_| !debited_before) {
+        let Some(v) = leave::version_on(tx, *leave_type, date).await? else { continue };
+        if !v.paid {
+            continue;
+        }
+        let account = leave::lock_account(tx, employee, *leave_type).await?;
+        if leave::balance_pct(tx, account).await? < due_pct {
+            continue;
+        }
+        let posted = sqlx::query(
+            "INSERT INTO leave.leave_ledger_entry (org_id, account_id, entry_date, entry_kind, quantity, cause_kind, cause_id, reason)
+             VALUES (app.current_org(), $1, $2, 'absence_auto_debit', -($4::numeric / 100), 'attendance_day', $3, 'absent with no leave (DS-10, LV-04)')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(account)
+        .bind(date)
+        .bind(day_id)
+        .bind(due_pct as i32)
+        .execute(&mut ***tx)
+        .await?
+        .rows_affected();
+        if posted == 1 {
+            out.flags.push("absence_auto_debited".into());
+            return Ok(());
+        }
+    }
+    out.effects.push(Effect { kind: "absence_lop", days_pct: Some(due_pct), minutes: None, reason_code: "absent_no_leave_balance".into(), rule_ref: "DS-10" });
+    Ok(())
 }
 
 /// Recalculates the days a punch at `at` can belong to: its local date and its neighbours.

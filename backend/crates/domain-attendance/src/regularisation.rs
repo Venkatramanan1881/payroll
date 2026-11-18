@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use db::{invalid, DomainError, OrgTx};
-use domain_iam::authz::{employee_in_scope, require, AuthzError, GrantKind, Principal};
+use domain_iam::authz::Principal;
 use domain_policy::rg::{self, RgSettings};
 use domain_timecap::punch::{branch_tz, master_branch_on};
 use serde_json::{json, Value};
@@ -103,27 +103,8 @@ async fn check_shape(tx: &mut OrgTx<'_>, r: &NewRequest, master: Uuid) -> Result
     Ok(())
 }
 
-/// AC-02 approver for a level: a user, or None for the HR pool (anyone holding the level's grant with the employee in scope).
-// shortcut: department_head routes to the HR pool until departments carry heads (OQ-C01).
 async fn route(tx: &mut OrgTx<'_>, employee: Uuid, level: i16, today: NaiveDate) -> Result<Option<Uuid>, DomainError> {
-    let rule: Option<(String, Option<Uuid>)> = sqlx::query_as("SELECT source, named_user_id FROM iam.approver_rule WHERE request_type = $1 AND level = $2")
-        .bind(KIND)
-        .bind(level)
-        .fetch_optional(&mut ***tx)
-        .await?;
-    let source = rule.as_ref().map_or(if level == 1 { "reporting_manager" } else { "hr" }, |r| r.0.as_str());
-    Ok(match source {
-        "named_user" => rule.and_then(|r| r.1),
-        "reporting_manager" => sqlx::query_scalar(
-            "SELECT u.id FROM workforce.employee_assignment a JOIN iam.user_account u ON u.employee_id = a.manager_employee_id AND u.active
-             WHERE a.employee_id = $1 AND a.kind = 'reporting_manager' AND a.valid @> $2::date ORDER BY u.created_at LIMIT 1",
-        )
-        .bind(employee)
-        .bind(today)
-        .fetch_optional(&mut ***tx)
-        .await?,
-        _ => None,
-    })
+    crate::approval::route(tx, KIND, employee, level, today).await
 }
 
 fn audit_step(action: &str, level: i16, comment: Option<&str>, on_behalf_of: Option<Uuid>) -> Value {
@@ -341,40 +322,7 @@ async fn may_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, employee: Uuid,
         (_, true) => "ATT-05",
         _ => "ATT-04",
     };
-    let grant = match require(tx, p, op).await {
-        Ok(g) => g,
-        Err(AuthzError::Forbidden) => return Err(DomainError::NotFound),
-        Err(AuthzError::Db(e)) => return Err(e.into()),
-    };
-    match approver {
-        Some(a) if a == p.user_id => Ok(None),
-        Some(a) => {
-            // AC-03 off (organisation setting) means delegations are not honoured; the BRD gives no default, so on.
-            let delegated: bool = sqlx::query_scalar(
-                "SELECT coalesce((SELECT (settings->>'AC-03')::boolean FROM org.organisation_settings_version WHERE effective_from <= current_date
-                                  ORDER BY effective_from DESC LIMIT 1), true)
-                    AND EXISTS (SELECT 1 FROM iam.delegation WHERE approver_user_id = $1 AND delegate_user_id = $2 AND valid @> now())",
-            )
-                .bind(a)
-                .bind(p.user_id)
-                .fetch_one(&mut ***tx)
-                .await?;
-            if delegated { Ok(Some(a)) } else { Err(DomainError::NotFound) }
-        }
-        None => {
-            let today = Utc::now().date_naive();
-            let job: Vec<(String, Option<Uuid>, Option<Uuid>)> =
-                sqlx::query_as("SELECT kind, branch_id, list_entry_id FROM workforce.employee_assignment WHERE employee_id = $1 AND valid @> $2::date AND kind IN ('master_branch','department')")
-                    .bind(employee)
-                    .bind(today)
-                    .fetch_all(&mut ***tx)
-                    .await?;
-            let master = job.iter().find(|j| j.0 == "master_branch").and_then(|j| j.1);
-            let dept = job.iter().find(|j| j.0 == "department").and_then(|j| j.2);
-            let in_scope = matches!(grant.kind, GrantKind::All | GrantKind::Scoped) && master.is_some_and(|m| employee_in_scope(&grant.scope, m, dept));
-            if in_scope { Ok(None) } else { Err(DomainError::NotFound) }
-        }
-    }
+    crate::approval::may_decide(tx, p, employee, op, approver).await
 }
 
 /// SM-REQ R4/R5 (approve) and R6 (reject). The same decision again changes nothing.

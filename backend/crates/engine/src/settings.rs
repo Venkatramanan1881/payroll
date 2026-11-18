@@ -43,6 +43,16 @@ pub enum MpAction {
     Absent,
 }
 
+/// DS-10: what an absent working day with no leave becomes (D-07, D-07b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AbsenceMode {
+    /// Held as pending for `absence_pending_days`, then loss of pay.
+    Pending,
+    LossOfPay,
+    /// Debit leave in the LV-04 order; loss of pay when no type has balance.
+    AutoDebit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Basis {
     Shift,
@@ -82,6 +92,10 @@ pub struct AttendanceSettings {
     pub shortfall_deducts_minutes: bool, // DS-05 deduct actual minutes (else half day)
     pub quarter_days: bool,         // DS-06
     pub below_half_proportional: bool, // DS-07
+    pub absence_mode: AbsenceMode,  // DS-10
+    pub absence_pending_days: i64,  // DS-10
+    pub flag_punches_on_leave: bool, // LV-01 (ignore vs flag)
+    pub leave_debit_order: Vec<uuid::Uuid>, // LV-04
 }
 
 impl Default for AttendanceSettings {
@@ -117,12 +131,16 @@ impl Default for AttendanceSettings {
             shortfall_deducts_minutes: false,
             quarter_days: false,
             below_half_proportional: false,
+            absence_mode: AbsenceMode::Pending,
+            absence_pending_days: 3,
+            flag_punches_on_leave: true,
+            leave_debit_order: vec![],
         }
     }
 }
 
 /// The rule groups this module types.
-pub const GROUPS: [&str; 7] = ["PR", "BK", "LA", "EC", "EA", "MP", "DS"];
+pub const GROUPS: [&str; 8] = ["PR", "BK", "LA", "EC", "EA", "MP", "DS", "LV"];
 
 fn int(v: &Value, key: &str, min: i64, max: i64) -> Result<i64, String> {
     v.as_i64().filter(|n| (min..=max).contains(n)).ok_or(format!("{key} must be a whole number from {min} to {max}"))
@@ -186,6 +204,11 @@ fn mp(v: &Value, key: &str, cutoff: bool) -> Result<MpAction, String> {
 }
 
 impl AttendanceSettings {
+    /// Days an absence waits before it is charged (only "pending" waits; D-07b).
+    pub fn absence_wait_days(&self) -> i64 {
+        if self.absence_mode == AbsenceMode::Pending { self.absence_pending_days } else { 0 }
+    }
+
     /// Applies one rule group's document. Returns warnings for keys stored but not evaluated yet.
     /// A switched-off group is simply not applied (defaults stay).
     pub fn apply(&mut self, group: &str, doc: &Value) -> Result<Vec<String>, String> {
@@ -253,6 +276,34 @@ impl AttendanceSettings {
                 }
                 ("DS", "DS-06") => self.quarter_days = boolean(v, key)?,
                 ("DS", "DS-07") => self.below_half_proportional = pick(v, key, &["absent", "proportional"])? == "proportional",
+                ("DS", "DS-10") => {
+                    let o = v.as_object().ok_or("DS-10 must be an object")?;
+                    if let Some(k) = o.keys().find(|k| !["action", "pending_days"].contains(&k.as_str())) {
+                        return Err(format!("DS-10.{k} is not a known field"));
+                    }
+                    self.absence_mode = match pick(o.get("action").unwrap_or(&Value::Null), "DS-10.action", &["pending", "loss_of_pay", "auto_debit"])? {
+                        "pending" => AbsenceMode::Pending,
+                        "loss_of_pay" => AbsenceMode::LossOfPay,
+                        _ => AbsenceMode::AutoDebit,
+                    };
+                    if let Some(d) = o.get("pending_days") {
+                        self.absence_pending_days = int(d, "DS-10.pending_days", 0, 60)?;
+                    }
+                }
+                ("LV", "LV-01") => {
+                    let k = pick(v, key, &["ignore", "flag", "auto_cancel"])?;
+                    if k == "auto_cancel" {
+                        w.push("LV-01: auto_cancel is evaluated as flag until leave auto-cancellation is built".into());
+                    }
+                    self.flag_punches_on_leave = k != "ignore";
+                }
+                ("LV", "LV-04") => {
+                    let list = v.as_array().ok_or("LV-04 must be a list of leave type ids")?;
+                    self.leave_debit_order = list
+                        .iter()
+                        .map(|x| x.as_str().and_then(|s| s.parse().ok()).ok_or(format!("LV-04: {x} is not a leave type id")))
+                        .collect::<Result<_, _>>()?;
+                }
                 _ => w.push(format!("{key} is stored but not evaluated yet")),
             }
         }
@@ -280,6 +331,17 @@ mod tests {
         assert_eq!(s.late_grace, 15);
         assert_eq!(s.late_slabs[1].action, SlabAction::FullDay);
         assert_eq!(w, ["LA-06 is stored but not evaluated yet"]);
+    }
+
+    #[test]
+    fn ds10_and_lv_settings() {
+        let mut s = AttendanceSettings::default();
+        assert_eq!((s.absence_mode, s.absence_wait_days()), (AbsenceMode::Pending, 3));
+        let id = uuid::Uuid::from_u128(7);
+        s.apply("DS", &json!({ "DS-10": { "action": "auto_debit" } })).unwrap();
+        s.apply("LV", &json!({ "LV-01": "ignore", "LV-04": [id.to_string()] })).unwrap();
+        assert_eq!((s.absence_mode, s.absence_wait_days(), s.flag_punches_on_leave, s.leave_debit_order.clone()), (AbsenceMode::AutoDebit, 0, false, vec![id]));
+        assert!(AttendanceSettings::default().apply("LV", &json!({ "LV-04": ["x"] })).is_err());
     }
 
     #[test]
