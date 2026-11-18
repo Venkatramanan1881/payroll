@@ -167,7 +167,11 @@ pub fn evaluate(input: &PunchInput, ctx: &PunchContext) -> Decision {
 
     let location_needed = if web { s.web_location } else { s.app_location };
     if location_needed && input.location.is_none() {
-        if web && s.web_location_unavailable == "block" {
+        if !web {
+            // OQ-C04-10 ruling: app punches need a location when PC-02 location is on.
+            return refuse(d, "PC-02", "Your location is needed to punch from the app. Turn on location and try again.");
+        }
+        if s.web_location_unavailable == "block" {
             return refuse(d, "PC-13", "Your location is needed to punch from the browser. Allow location access and try again.");
         }
         d.flags.push(flag("location_unavailable", json!({})));
@@ -304,8 +308,11 @@ mod tests {
     }
 
     #[test]
-    fn app_without_location_is_flagged_not_blocked() {
-        assert_eq!(reasons(&evaluate(&input("app", None), &ctx())), ["location_unavailable"]);
+    fn app_without_location_is_blocked() {
+        assert_eq!(evaluate(&input("app", None), &ctx()).refused.map(|r| r.0), Some("PC-02"));
+        let mut c = ctx();
+        c.settings.as_mut().unwrap().app_location = false;
+        assert!(evaluate(&input("app", None), &c).refused.is_none(), "PC-02 location off: no location needed");
     }
 
     #[test]

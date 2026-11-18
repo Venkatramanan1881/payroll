@@ -75,7 +75,7 @@ List (`state`, `reason`, `employee_id`, dates; scope), accept/reject (reject nee
 `POST /v1/manual-attendance` (TCP-04; PC-01 `hr_entry`): manual punches with reason and entered_by (BR-01), each employee in scope, branch given. `GET /v1/punches` (scope; location fields only with TCP-08), `GET /v1/punches/{id}`, `GET /v1/punch-attempts` (TCP-09). Tests, then `cargo test --workspace` and clippy clean.
 
 ## Rulings taken in this slice (neutral items kept open)
-- App punch with no location (OQ-C04-10): flagged `location_unavailable`, not blocked.
+- App punch with no location (OQ-C04-10): blocked (`PUNCH_REFUSED`, rule_ref PC-02) when PC-02 location is on — decided by the product owner 2026-11-18. Offline items without location are refused the same way.
 - IP check failure (OQ-C04-11): flagged `ip_check_failed`; PC-15 `either` lets a passing fence or IP clear both.
 - Who decides a flag (G-16): anyone with TCP-06 in scope; managers (`approve`) for their direct reports. Per-reason deciders from D-05c wait for the approval engine.
 - Manual attendance with PC-01 `hr_entry` off (OQ-C04-07) and PC-11 delegation: not enforced yet.
