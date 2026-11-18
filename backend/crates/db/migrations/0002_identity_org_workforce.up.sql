@@ -311,7 +311,12 @@ DO $$ BEGIN
 END $$;
 GRANT USAGE ON SCHEMA iam, platform TO app_resolver;
 GRANT SELECT ON iam.user_account, platform.organisation TO app_resolver;
+-- PostgreSQL 16+: a non-superuser migrator (Supabase "postgres") may only hand ownership to a role it can SET ROLE to,
+-- and the new owner needs CREATE on the schema at that moment; it is taken back straight after.
+GRANT app_resolver TO CURRENT_USER;
+GRANT CREATE ON SCHEMA iam TO app_resolver;
 ALTER FUNCTION iam.resolve_login(text, text) OWNER TO app_resolver;
+REVOKE CREATE ON SCHEMA iam FROM app_resolver;
 REVOKE ALL ON FUNCTION iam.resolve_login(text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION iam.resolve_login(text, text) TO app_api;
 

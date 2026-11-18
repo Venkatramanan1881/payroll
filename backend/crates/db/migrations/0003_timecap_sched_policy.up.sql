@@ -62,7 +62,10 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
 $$;
 GRANT USAGE ON SCHEMA timecap TO app_resolver;
 GRANT SELECT ON timecap.device TO app_resolver;
+-- PostgreSQL 16+ (non-superuser migrator): the new owner needs CREATE on the schema while ownership changes (see 0002).
+GRANT CREATE ON SCHEMA app TO app_resolver;
 ALTER FUNCTION app.resolve_device_org(text) OWNER TO app_resolver;
+REVOKE CREATE ON SCHEMA app FROM app_resolver;
 REVOKE ALL ON FUNCTION app.resolve_device_org(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app.resolve_device_org(text) TO app_gateway;
 
