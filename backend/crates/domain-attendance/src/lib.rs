@@ -208,6 +208,8 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
         expected: cur.expected,
         punches: rows.into_iter().map(|(id, at, excluded)| PunchIn { id, at, excluded }).collect(),
         cutoff_passed: Utc::now() >= cur.cutoff_at,
+        leave: None,
+        absence_due: false,
         settings,
     };
     let print = fingerprint(&input);

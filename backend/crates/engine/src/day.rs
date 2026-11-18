@@ -1,7 +1,7 @@
 //! One employee's day: punches to sessions, worked minutes, late/early, missed punches, status and effects.
 //! Times are instants; the caller turns the shift's local times into instants in the schedule's zone.
 
-use crate::settings::{AttendanceSettings, Basis, MpAction, Slab, SlabAction};
+use crate::settings::{AbsenceMode, AttendanceSettings, Basis, MpAction, Slab, SlabAction};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Bump when a rule's meaning changes, so unchanged inputs are still recalculated (BR-02, AT5).
-pub const ENGINE_VERSION: &str = "1";
+pub const ENGINE_VERSION: &str = "2";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Expected {
@@ -37,7 +37,19 @@ pub struct DayInput {
     pub punches: Vec<PunchIn>,
     /// The missed-punch cut-off (D-08) has passed.
     pub cutoff_passed: bool,
+    /// Approved leave on the day, if any.
+    pub leave: Option<LeaveCover>,
+    /// An absence with no leave is due to be charged (DS-10 waiting days passed).
+    pub absence_due: bool,
     pub settings: AttendanceSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LeaveCover {
+    /// None = full day; "first_half" or "second_half".
+    pub half: Option<String>,
+    /// SH-11 split point for a half day; None = middle of the shift.
+    pub split_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -117,7 +129,48 @@ fn status_of(pct: i64, quarter_days: bool) -> &'static str {
     }
 }
 
+/// The day with approved leave applied: a full leave day is `leave`; a half day is calculated on the other half
+/// (start or end moved to the split point, E12, LA-20) and shown as `half_day_leave`.
 pub fn compute_day(input: &DayInput) -> DayOutput {
+    let Some(leave) = &input.leave else { return compute_core(input) };
+    let mut rest = input.clone();
+    rest.leave = None;
+    let Some(half) = &leave.half else {
+        let mut out = DayOutput { status: "leave", state: "provisional", ..DayOutput::default() };
+        for p in &input.punches {
+            out.punches_used.push(PunchUse { id: p.id, direction: None, session_no: None, excluded: Some("on_leave".into()) });
+        }
+        if input.settings.flag_punches_on_leave && input.punches.iter().any(|p| p.excluded.is_none()) {
+            out.flags.push("punched_on_leave".into());
+        }
+        step(&mut out.explanation, "LV-01", json!({ "punches": input.punches.len() }), "approved full-day leave".into());
+        return out;
+    };
+    match input.expected {
+        Expected::Working { start_at, end_at, required_min, flexible } => {
+            let split = leave.split_at.unwrap_or(start_at + (end_at - start_at) / 2);
+            let (s, e) = if half == "first_half" { (split, end_at) } else { (start_at, split) };
+            rest.expected = Expected::Working { start_at: s, end_at: e, required_min: required_min / 2, flexible };
+        }
+        Expected::HoursOnly { required_min } => rest.expected = Expected::HoursOnly { required_min: required_min / 2 },
+        _ => return compute_core(&rest),
+    }
+    let mut out = compute_core(&rest);
+    // The worked half is half the day; deductions computed on it are already in whole-day units.
+    let worked_half = out.fraction_pct;
+    out.fraction_pct = worked_half / 2;
+    for e in out.effects.iter_mut().filter(|e| e.kind == "absence_lop") {
+        e.days_pct = Some(50);
+    }
+    if worked_half == 0 {
+        out.flags.push("absent_other_half".into());
+    }
+    out.status = "half_day_leave";
+    step(&mut out.explanation, "LM-08", json!({ "half": half }), format!("half-day leave; the other half {}% present", worked_half));
+    out
+}
+
+fn compute_core(input: &DayInput) -> DayOutput {
     let s = &input.settings;
     let mut out = DayOutput { state: "provisional", ..DayOutput::default() };
 
@@ -261,8 +314,17 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
     }
     if kept.is_empty() {
         out.status = "absent";
-        out.state = "absence_pending";
-        step(&mut out.explanation, "DS-10", json!({}), "absent; pending (leave or loss of pay decided later)".into());
+        if !input.absence_due {
+            out.state = "absence_pending";
+            step(&mut out.explanation, "DS-10", json!({ "wait_days": s.absence_wait_days() }), "absent; pending (leave may still be applied)".into());
+        } else if s.absence_mode == AbsenceMode::AutoDebit {
+            // The caller debits leave in the LV-04 order, or charges loss of pay when no type has balance.
+            out.flags.push("absence_charge_due".into());
+            step(&mut out.explanation, "DS-10", json!({}), "absent; leave to be debited (LV-04)".into());
+        } else {
+            out.effects.push(Effect { kind: "absence_lop", days_pct: Some(100), minutes: None, reason_code: "absent_no_leave".into(), rule_ref: "DS-10" });
+            step(&mut out.explanation, "DS-10", json!({}), "absent with no leave: loss of pay".into());
+        }
         return out;
     }
     let has_pair = out.sessions.iter().any(|x| x.out_at.is_some());
@@ -396,6 +458,8 @@ mod tests {
             expected,
             punches: times.iter().enumerate().map(|(i, hm)| PunchIn { id: Uuid::from_u128(i as u128 + 1), at: t(hm), excluded: None }).collect(),
             cutoff_passed: false,
+            leave: None,
+            absence_due: false,
             settings: AttendanceSettings::default(),
         }
     }
@@ -495,6 +559,40 @@ mod tests {
         i.punches.push(PunchIn { id: Uuid::from_u128(9), at: t("22:00") + chrono::Duration::hours(8), excluded: None });
         let o = compute_day(&i);
         assert_eq!((o.status, o.late_mark, o.sessions.len()), ("present", false, 1));
+    }
+
+    #[test]
+    fn full_day_leave_ignores_punches_and_flags_them() {
+        let mut i = day(shift(), &["09:00", "18:00"]);
+        i.leave = Some(LeaveCover { half: None, split_at: None });
+        let o = compute_day(&i);
+        assert_eq!((o.status, o.fraction_pct, o.effects.len()), ("leave", 0, 0));
+        assert!(o.flags.contains(&"punched_on_leave".to_string()));
+    }
+
+    #[test]
+    fn e12_first_half_leave_late_against_the_second_half() {
+        let mut i = day(shift(), &["14:20", "18:00"]);
+        i.leave = Some(LeaveCover { half: Some("first_half".into()), split_at: Some(t("14:00")) });
+        let o = compute_day(&i);
+        assert_eq!((o.status, o.late_min, o.late_mark, o.fraction_pct), ("half_day_leave", 20, true, 50), "{o:?}");
+    }
+
+    #[test]
+    fn absence_is_charged_only_when_due() {
+        let mut i = day(shift(), &[]);
+        assert_eq!(compute_day(&i).state, "absence_pending");
+        i.absence_due = true;
+        let o = compute_day(&i);
+        assert_eq!((o.state, o.effects[0].kind, o.effects[0].days_pct), ("provisional", "absence_lop", Some(100)));
+        i.settings.absence_mode = AbsenceMode::AutoDebit;
+        let o = compute_day(&i);
+        assert!(o.effects.is_empty() && o.flags.contains(&"absence_charge_due".to_string()));
+        let mut h = day(shift(), &[]);
+        h.absence_due = true;
+        h.leave = Some(LeaveCover { half: Some("second_half".into()), split_at: None });
+        let o = compute_day(&h);
+        assert_eq!((o.status, o.effects[0].days_pct), ("half_day_leave", Some(50)), "half leave: half a day charged");
     }
 
     #[test]
