@@ -134,9 +134,10 @@ async fn pc_rule_group_is_typed(pool: PgPool) {
     let s = common::seed_org(&pool).await;
     let app = common::app(pool);
     let v = new_set(&app, &s, "Factory", "2026-01-01").await["versions"][0]["id"].as_str().unwrap().to_string();
-    for bad in [json!({ "PC-04": "maybe" }), json!({ "PC-07": "3" }), json!({ "PC-14": { "threshold_m": 0 } }), json!({ "PC-03": 200 })] {
+    for bad in [json!({ "PC-04": "maybe" }), json!({ "PC-07": "3" }), json!({ "PC-14": { "threshold_m": 0 } })] {
         assert_eq!(put_group(&app, &s, &v, "PC", bad.clone()).await.0, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
     }
-    let (st, body) = put_group(&app, &s, &v, "PC", json!({ "PC-04": "block", "PC-14": { "threshold_m": 50, "action": "flag" } })).await;
+    // PC-03 (fences) and PC-09 are BRD keys this version stores without evaluating.
+    let (st, body) = put_group(&app, &s, &v, "PC", json!({ "PC-03": 200, "PC-09": "always", "PC-04": "block", "PC-14": { "threshold_m": 50, "action": "flag" } })).await;
     assert_eq!(st, StatusCode::OK, "{body}");
 }

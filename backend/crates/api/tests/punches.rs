@@ -132,3 +132,31 @@ async fn hr_sees_location_with_tcp08(pool: PgPool) {
     assert_eq!(hr["location"]["fence_distance_m"], 60);
     assert_eq!(hr["location"]["inside_fence"], true);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn app_punch_without_location_blocked_pc02(pool: PgPool) {
+    let (_s, app, w) = setup(&pool).await;
+    let (st, r) = punch(&app, &w, &body("app", None)).await;
+    assert_eq!((st, r["code"].as_str(), r["rule_ref"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("PUNCH_REFUSED"), Some("PC-02")), "{r}");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM timecap.punch_attempt_refused WHERE rule_ref = 'PC-02'").fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 1);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn another_employees_key_is_409(pool: PgPool) {
+    let (s, app, w) = setup(&pool).await;
+    let other = common::seed_worker(&pool, &app, &s, "Ravi").await;
+    common::day_shift(&app, &s, other.employee_id).await;
+    let b = body("app", Some(10.0));
+    assert_eq!(punch(&app, &w, &b).await.0, StatusCode::CREATED);
+    let (st, r) = punch(&app, &other, &b).await;
+    assert_eq!((st, r["code"].as_str()), (StatusCode::CONFLICT, Some("IDEMPOTENCY_CONFLICT")), "{r}");
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn selfie_path_cannot_climb_out_of_the_organisation(pool: PgPool) {
+    let (s, app, w) = setup(&pool).await;
+    let mut b = body("app", Some(10.0));
+    b["selfie"] = json!({ "path": format!("{}/../{}/x.jpg", s.org_id, Uuid::new_v4()) });
+    assert_eq!(punch(&app, &w, &b).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+}

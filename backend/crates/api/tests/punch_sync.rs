@@ -66,17 +66,17 @@ async fn late_sync_after_pc07_days(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
-async fn changed_phone_clock_is_flagged_and_reboot_skips_the_check(pool: PgPool) {
+async fn changed_phone_clock_and_unmeasurable_restart_are_flagged(pool: PgPool) {
     let (_s, app, w) = setup(&pool).await;
     let now = Utc::now();
     let up = 10_000_000;
     // Captured 1 hour ago by the uptime clock, but the phone clock said 20 minutes later than that.
     let moved = item(now - Duration::hours(1) + Duration::minutes(20), up - 3_600_000);
-    // Uptime at capture larger than at sync: the phone restarted, so no comparison.
+    // Uptime at capture larger than at sync: the phone restarted, so the clock cannot be checked.
     let rebooted = item(now - Duration::minutes(30), up + 5_000_000);
     let (_, r) = sync(&app, &w, up, vec![moved, rebooted]).await;
     assert_eq!(r["results"][0]["flags"], json!(["clock_mismatch"]), "{r}");
-    assert_eq!(r["results"][1]["outcome"], "accepted", "{r}");
+    assert_eq!(r["results"][1]["flags"], json!(["clock_mismatch"]), "a restart cannot hide a changed clock: {r}");
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
@@ -113,7 +113,30 @@ async fn near_midnight_uses_local_date(pool: PgPool) {
     let up = 100_000_000_000; // ~3 years of uptime, longer than the punch age
     let age = |t: DateTime<Utc>| (Utc::now() - t).num_milliseconds();
     let (_, r) = sync(&app, &w, up, vec![item(local_holiday, up - age(local_holiday)), item(local_workday, up - age(local_workday))]).await;
-    let flags_of = |i: usize| r["results"][i]["flags"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect::<Vec<_>>();
-    assert!(flags_of(0).contains(&"no_shift_or_off_day".to_string()), "{r}");
-    assert!(!flags_of(1).contains(&"no_shift_or_off_day".to_string()), "{r}");
+    let flags_of = |r: &Value, i: usize| r["results"][i]["flags"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert!(flags_of(&r, 0).contains(&"no_shift_or_off_day".to_string()), "{r}");
+    assert!(!flags_of(&r, 1).contains(&"no_shift_or_off_day".to_string()), "{r}");
+    // A client zone far from the branch cannot move the punch off the holiday: the branch zone decides the date.
+    let mut far = item(local_holiday, up - age(local_holiday));
+    far["captured_tz"] = json!("Pacific/Pago_Pago");
+    let (_, r) = sync(&app, &w, up, vec![far]).await;
+    assert!(flags_of(&r, 0).contains(&"no_shift_or_off_day".to_string()), "{r}");
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn future_items_and_missing_location_are_refused_once(pool: PgPool) {
+    let (_s, app, w) = setup(&pool).await;
+    let now = Utc::now();
+    let up = 10_000_000;
+    let future = item(now + Duration::days(1), up);
+    let mut no_location = item(now - Duration::hours(1), up - 3_600_000);
+    no_location["location"] = Value::Null;
+    let (_, r) = sync(&app, &w, up, vec![future, no_location.clone()]).await;
+    assert_eq!(r["results"][0]["refusal"]["code"], "VALIDATION_FAILED", "{r}");
+    assert_eq!((r["results"][1]["refusal"]["code"].as_str(), r["results"][1]["refusal"]["rule_ref"].as_str()), (Some("PUNCH_REFUSED"), Some("PC-02")), "{r}");
+    sync(&app, &w, up + 1000, vec![no_location.clone()]).await;
+    let (n, at): (i64, Option<DateTime<Utc>>) = sqlx::query_as("SELECT count(*), max(attempted_at) FROM timecap.punch_attempt_refused").fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 1, "a retried batch does not record the refusal twice");
+    let captured: DateTime<Utc> = serde_json::from_value(no_location["client_time"].clone()).unwrap();
+    assert_eq!(at.map(|t| t.timestamp_millis()), Some(captured.timestamp_millis()), "attempted_at is when the employee tried");
 }

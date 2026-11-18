@@ -3,7 +3,9 @@
 use crate::routes::sched::{done, parse, start};
 use crate::{ApiError, Auth};
 use axum::body::Bytes;
-use axum::extract::{Path, Query};
+use axum::extract::{ConnectInfo, Path, Query};
+use axum::Extension;
+use std::net::SocketAddr;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
@@ -46,7 +48,7 @@ pub struct PunchIn {
 
 fn location(l: Option<LocationIn>) -> Result<Option<Loc>, ApiError> {
     let Some(l) = l else { return Ok(None) };
-    if !(-90.0..=90.0).contains(&l.latitude) || !(-180.0..=180.0).contains(&l.longitude) || l.accuracy_m < 0 {
+    if !(-90.0..=90.0).contains(&l.latitude) || !(-180.0..=180.0).contains(&l.longitude) || !(0..=100_000).contains(&l.accuracy_m) {
         return Err(ApiError::ValidationFailed("location is out of range".into()));
     }
     Ok(Some(Loc { lat: l.latitude, lon: l.longitude, accuracy_m: l.accuracy_m }))
@@ -62,18 +64,38 @@ fn check_common(reason: &Option<String>, client_ref: &Option<String>) -> Result<
     Ok(())
 }
 
-// shortcut: trusts the last X-Forwarded-For hop (the address our front proxy saw); set the trusted hop count at deployment.
-fn client_ip(headers: &HeaderMap) -> Option<String> {
-    let last = headers.get("x-forwarded-for")?.to_str().ok()?.rsplit(',').next()?.trim();
-    last.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string())
+type Conn = Option<Extension<ConnectInfo<SocketAddr>>>;
+
+/// The caller's address for PC-05. TRUSTED_PROXY_HOPS (default 1) says how many proxies we run in front of the API:
+/// the client is that many entries from the right of X-Forwarded-For (entries further left are client-supplied).
+/// 0, or no header, means the connection's own address.
+fn client_ip(headers: &HeaderMap, conn: &Conn) -> Option<String> {
+    static HOPS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let hops = *HOPS.get_or_init(|| std::env::var("TRUSTED_PROXY_HOPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1));
+    let forwarded = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).filter(|_| hops > 0);
+    let ip = match forwarded {
+        Some(list) => list.rsplit(',').nth(hops - 1)?.trim().parse::<std::net::IpAddr>().ok()?,
+        None => conn.as_ref()?.0 .0.ip(),
+    };
+    Some(ip.to_string())
 }
 
-/// Whether the caller holds an operation (for optional extras such as location, TCP-08).
-async fn holds(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<bool, ApiError> {
-    match require(tx, p, op).await {
-        Ok(_) => Ok(true),
-        Err(domain_iam::authz::AuthzError::Forbidden) => Ok(false),
-        Err(e) => Err(e.into()),
+/// Employees whose punch location the caller may see (TCP-08, within its own scope). Empty when not held.
+async fn location_scope(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Option<Vec<Uuid>>, ApiError> {
+    match visible_employees(tx, p, "TCP-08").await {
+        Err(ApiError::Forbidden) => Ok(Some(vec![])),
+        other => other,
+    }
+}
+
+/// Drops location (and flag evidence that holds distances) from a punch the caller may not see the location of.
+fn redact(item: &mut Value, loc: &Option<Vec<Uuid>>) {
+    let employee = item["employee_id"].as_str().and_then(|s| s.parse().ok());
+    if !sees(loc, employee) {
+        item["location"] = Value::Null;
+        if item.get("evidence").is_some() {
+            item["evidence"] = json!({});
+        }
     }
 }
 
@@ -84,7 +106,7 @@ async fn own_employee(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Uuid, ApiErro
 }
 
 /// POST /v1/punches (TCP-03).
-pub async fn record(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<(StatusCode, Json<Value>), ApiError> {
+pub async fn record(Auth(p, mut tx): Auth, conn: Conn, headers: HeaderMap, raw: Bytes) -> Result<(StatusCode, Json<Value>), ApiError> {
     let employee = own_employee(&mut tx, &p).await?;
     let r: PunchIn = parse(&raw)?;
     check_common(&r.location_unavailable_reason, &r.client_ref)?;
@@ -100,7 +122,7 @@ pub async fn record(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Re
         location_unavailable_reason: r.location_unavailable_reason,
         selfie_path: r.selfie.map(|f| f.path),
         client_ref: r.client_ref,
-        client_ip: client_ip(&headers),
+        client_ip: client_ip(&headers, &conn),
         device_uptime_ms: None,
         clock_skew_ms: Some((r.client_time - now).num_milliseconds()),
     };
@@ -110,10 +132,10 @@ pub async fn record(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Re
             Err(ApiError::PunchRefused(rule_ref.to_string(), attempt_id, message))
         }
         Outcome::Stored { punch_id, flags, duplicate } => {
-            let with_location = holds(&mut tx, &p, "TCP-08").await?;
+            let loc = location_scope(&mut tx, &p).await?;
             let body = json!({
                 "outcome": if flags.is_empty() { "accepted" } else { "flagged" },
-                "punch": punch::get_punch(&mut tx, punch_id, with_location).await?,
+                "punch": punch::get_punch(&mut tx, punch_id, sees(&loc, Some(employee))).await?,
             });
             tx.commit().await?;
             Ok((if duplicate { StatusCode::OK } else { StatusCode::CREATED }, Json(body)))
@@ -194,10 +216,13 @@ fn item_problem(key: &Value, code: &str, rule_ref: Option<&str>, message: String
             "refusal": { "code": code, "rule_ref": rule_ref, "message": message } })
 }
 
+/// Ten years of uptime: anything larger is not a phone reading.
+const MAX_UPTIME_MS: i64 = 10 * 365 * 86_400_000;
+
 fn parse_item(v: &Value) -> Result<(OfflineIn, Option<Loc>), String> {
     let mut o: OfflineIn = serde_json::from_value(v.clone()).map_err(|e| e.to_string())?;
-    if o.device_uptime_ms < 0 {
-        return Err("device_uptime_ms must not be negative".into());
+    if !(0..=MAX_UPTIME_MS).contains(&o.device_uptime_ms) {
+        return Err("device_uptime_ms is out of range".into());
     }
     check_common(&o.location_unavailable_reason, &o.client_ref).map_err(|_| "location_unavailable_reason or client_ref is not valid".to_string())?;
     let loc = location(o.location.take()).map_err(|_| "location is out of range".to_string())?;
@@ -205,14 +230,14 @@ fn parse_item(v: &Value) -> Result<(OfflineIn, Option<Loc>), String> {
 }
 
 /// POST /v1/punches/sync (TCP-03; TSD §9.3).
-pub async fn sync(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<Json<Value>, ApiError> {
+pub async fn sync(Auth(p, mut tx): Auth, conn: Conn, headers: HeaderMap, raw: Bytes) -> Result<Json<Value>, ApiError> {
     let employee = own_employee(&mut tx, &p).await?;
     let r: SyncIn = parse(&raw)?;
-    if r.punches.is_empty() || r.punches.len() > 500 || r.sync_uptime_ms < 0 {
+    if r.punches.is_empty() || r.punches.len() > 500 || !(0..=MAX_UPTIME_MS).contains(&r.sync_uptime_ms) {
         return Err(ApiError::ValidationFailed("punches must hold 1 to 500 items and sync_uptime_ms must not be negative".into()));
     }
     let now = Utc::now();
-    let ip = client_ip(&headers);
+    let ip = client_ip(&headers, &conn);
     let mut results: Vec<Value> = vec![Value::Null; r.punches.len()];
     let mut items = Vec::new();
     for (i, v) in r.punches.iter().enumerate() {
@@ -228,7 +253,9 @@ pub async fn sync(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Resu
         // PC-08: the uptime clock says how long ago the punch happened; a phone clock that disagrees was changed.
         // A smaller uptime at sync means the phone restarted, so the check cannot be made.
         let skew = (r.sync_uptime_ms >= o.device_uptime_ms)
-            .then(|| (o.client_time - (now - chrono::Duration::milliseconds(r.sync_uptime_ms - o.device_uptime_ms))).num_milliseconds());
+            .then(|| now.checked_sub_signed(chrono::Duration::milliseconds(r.sync_uptime_ms - o.device_uptime_ms)))
+            .flatten()
+            .map(|captured| (o.client_time - captured).num_milliseconds());
         let cap = Capture {
             idempotency_key: o.idempotency_key,
             source: "app".into(),
@@ -256,6 +283,7 @@ pub async fn sync(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Resu
             }),
             Ok(Outcome::Refused { rule_ref, message, .. }) => item_problem(&key, "PUNCH_REFUSED", Some(rule_ref), message),
             Err(db::DomainError::Validation(m)) => item_problem(&key, "VALIDATION_FAILED", None, m),
+            Err(db::DomainError::IdempotencyConflict) => item_problem(&key, "VALIDATION_FAILED", None, "idempotency_key is already used".into()),
             Err(e) => return Err(e.into()),
         };
     }
@@ -269,12 +297,13 @@ pub async fn sync(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Resu
 /// GET /v1/punches/{id} (TCP-07; location only with TCP-08). Outside scope → 404.
 pub async fn get(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
     let visible = visible_employees(&mut tx, &p, "TCP-07").await?;
-    let with_location = holds(&mut tx, &p, "TCP-08").await?;
-    let body = punch::get_punch(&mut tx, id, with_location).await?;
+    let loc = location_scope(&mut tx, &p).await?;
+    let mut body = punch::get_punch(&mut tx, id, true).await?;
     let employee = body["employee_id"].as_str().and_then(|s| s.parse().ok());
     if !sees(&visible, employee) {
         return Err(ApiError::NotFound);
     }
+    redact(&mut body, &loc);
     Ok(Json(body))
 }
 
@@ -291,9 +320,11 @@ pub struct PunchQuery {
 /// GET /v1/punches (TCP-07).
 pub async fn list(Auth(p, mut tx): Auth, Query(q): Query<PunchQuery>) -> Result<Json<Value>, ApiError> {
     let visible = visible_employees(&mut tx, &p, "TCP-07").await?;
-    let with_location = holds(&mut tx, &p, "TCP-08").await?;
+    let loc = location_scope(&mut tx, &p).await?;
     let f = punch::PunchFilter { employees: narrow(visible, q.employee_id), from: q.from, to: q.to, source: q.source, has_open_flag: q.has_open_flag };
-    Ok(Json(json!({ "items": punch::list_punches(&mut tx, &f, with_location).await?, "next_cursor": null })))
+    let mut items = punch::list_punches(&mut tx, &f, true).await?;
+    items.iter_mut().for_each(|i| redact(i, &loc));
+    Ok(Json(json!({ "items": items, "next_cursor": null })))
 }
 
 #[derive(Deserialize)]
@@ -307,9 +338,11 @@ pub struct AttemptQuery {
 /// GET /v1/punch-attempts (TCP-09).
 pub async fn attempts(Auth(p, mut tx): Auth, Query(q): Query<AttemptQuery>) -> Result<Json<Value>, ApiError> {
     let visible = visible_employees(&mut tx, &p, "TCP-09").await?;
-    let with_location = holds(&mut tx, &p, "TCP-08").await?;
+    let loc = location_scope(&mut tx, &p).await?;
     let f = punch::AttemptFilter { employees: narrow(visible, q.employee_id), from: q.from, to: q.to, rule_ref: q.rule_ref };
-    Ok(Json(json!({ "items": punch::list_attempts(&mut tx, &f, with_location).await?, "next_cursor": null })))
+    let mut items = punch::list_attempts(&mut tx, &f, true).await?;
+    items.iter_mut().for_each(|i| redact(i, &loc));
+    Ok(Json(json!({ "items": items, "next_cursor": null })))
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -327,7 +360,7 @@ pub struct FlagQuery {
 /// GET /v1/punch-flags (TCP-06), oldest first, each with its punch.
 pub async fn list_flags(Auth(p, mut tx): Auth, Query(q): Query<FlagQuery>) -> Result<Json<Value>, ApiError> {
     let visible = visible_employees(&mut tx, &p, "TCP-06").await?;
-    let with_location = holds(&mut tx, &p, "TCP-08").await?;
+    let loc = location_scope(&mut tx, &p).await?;
     let state = q.state.unwrap_or_else(|| "raised".into());
     if !["raised", "accepted", "rejected"].contains(&state.as_str()) {
         return Err(ApiError::ValidationFailed("state".into()));
@@ -336,7 +369,9 @@ pub async fn list_flags(Auth(p, mut tx): Auth, Query(q): Query<FlagQuery>) -> Re
     let mut items = flags::list_flags(&mut tx, &f).await?;
     for item in &mut items {
         let punch_id: Uuid = item["punch_id"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| ApiError::Internal(anyhow::anyhow!("flag without punch")))?;
-        item["punch"] = punch::get_punch(&mut tx, punch_id, with_location).await?;
+        item["punch"] = punch::get_punch(&mut tx, punch_id, true).await?;
+        redact(&mut item["punch"], &loc);
+        redact(item, &loc);
     }
     Ok(Json(json!({ "items": items, "next_cursor": null })))
 }
@@ -412,12 +447,21 @@ pub async fn manual(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Re
     if let Some(i) = r.entries.iter().position(|e| !sees(&visible, Some(e.employee_id))) {
         return Err(ApiError::ValidationFailed(format!("entries[{i}].employee_id is not an employee you manage")));
     }
+    // G-17 is open (who approves an HR manual entry), so nobody enters their own attendance meanwhile.
+    if let Some(i) = r.entries.iter().position(|e| Some(e.employee_id) == p.employee_id) {
+        return Err(ApiError::ValidationFailed(format!("entries[{i}]: you cannot record your own attendance")));
+    }
+    // The punches are costed to branch_id, so it must be a branch the caller manages.
+    if let Scope::Branches(b) = require(&mut tx, &p, "TCP-04").await?.scope {
+        if !b.contains(&r.branch_id) {
+            return Err(ApiError::ValidationFailed("branch_id is not a branch you manage".into()));
+        }
+    }
     let entries: Vec<(Uuid, DateTime<Utc>)> = r.entries.iter().map(|e| (e.employee_id, e.event_at)).collect();
     let ids = punch::record_manual(&mut tx, p.user_id, key, r.branch_id, r.device_id, &r.reason, &entries).await?;
-    let with_location = holds(&mut tx, &p, "TCP-08").await?;
     let mut punches = Vec::with_capacity(ids.len());
     for id in ids {
-        punches.push(punch::get_punch(&mut tx, id, with_location).await?);
+        punches.push(punch::get_punch(&mut tx, id, false).await?); // manual punches carry no location
     }
     done(tx, key, StatusCode::CREATED, json!({ "punches": punches })).await
 }

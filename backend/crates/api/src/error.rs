@@ -115,6 +115,7 @@ impl From<db::DomainError> for ApiError {
             D::IllegalTransition(m) => ApiError::IllegalTransition(m),
             D::VersionFrozen => ApiError::VersionFrozen,
             D::PeriodLocked => ApiError::PeriodLocked,
+            D::IdempotencyConflict => ApiError::IdempotencyConflict,
             D::Db(e) => e.into(),
         }
     }
