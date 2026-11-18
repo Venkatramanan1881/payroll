@@ -16,14 +16,17 @@ pub async fn get_flag(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainError
     sqlx::query_scalar(&sql).bind(id).fetch_optional(&mut ***tx).await?.ok_or(DomainError::NotFound)
 }
 
-/// The employee whose punch carries the flag (for the caller's scope and BR-07 checks).
-pub async fn flag_employee(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Uuid, DomainError> {
-    sqlx::query_scalar("SELECT p.employee_id FROM timecap.punch_flag f JOIN timecap.raw_punch p ON p.id = f.punch_id WHERE f.id = $1")
-        .bind(id)
-        .fetch_optional(&mut ***tx)
-        .await?
-        .flatten()
-        .ok_or(DomainError::NotFound)
+/// The employee whose punch carries the flag (for scope and BR-07) and the punch time (for recalculation).
+pub async fn flag_punch(tx: &mut OrgTx<'_>, id: Uuid) -> Result<(Uuid, chrono::DateTime<chrono::Utc>), DomainError> {
+    let row: Option<(Option<Uuid>, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as("SELECT p.employee_id, p.event_at FROM timecap.punch_flag f JOIN timecap.raw_punch p ON p.id = f.punch_id WHERE f.id = $1")
+            .bind(id)
+            .fetch_optional(&mut ***tx)
+            .await?;
+    match row {
+        Some((Some(e), at)) => Ok((e, at)),
+        _ => Err(DomainError::NotFound),
+    }
 }
 
 pub struct FlagFilter {

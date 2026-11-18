@@ -32,6 +32,7 @@ dependencies = [
  "axum",
  "chrono",
  "db",
+ "domain-attendance",
  "domain-iam",
  "domain-policy",
  "domain-sched",
@@ -354,6 +355,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "domain-attendance"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "db",
+ "domain-policy",
+ "domain-sched",
+ "domain-timecap",
+ "engine",
+ "serde_json",
+ "sqlx",
+ "uuid",
+]
+
+[[package]]
 name = "domain-iam"
 version = "0.1.0"
 dependencies = [
@@ -378,6 +394,7 @@ dependencies = [
  "chrono",
  "db",
  "domain-sched",
+ "engine",
  "serde_json",
  "sqlx",
  "uuid",
@@ -432,6 +449,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]

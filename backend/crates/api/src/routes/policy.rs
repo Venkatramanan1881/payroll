@@ -110,9 +110,9 @@ pub async fn put_rule_group(Auth(p, mut tx): Auth, Path((id, group)): Path<(Uuid
     sqlx::query("SELECT 1 FROM policy.policy_version WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **tx).await?;
     if_match(&headers, &version::get_version(&mut tx, id).await?)?;
     let r: RuleGroupPut = parse(&raw)?;
-    let document = version::put_document(&mut tx, p.user_id, id, &group, r.schema_version, r.settings).await?;
+    let (document, warnings) = version::put_document(&mut tx, p.user_id, id, &group, r.schema_version, r.settings).await?;
     tx.commit().await?;
-    Ok(Json(json!({ "document": document, "warnings": [] })))
+    Ok(Json(json!({ "document": document, "warnings": warnings })))
 }
 
 #[derive(Deserialize)]

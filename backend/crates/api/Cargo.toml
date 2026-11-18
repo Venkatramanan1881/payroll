@@ -17,6 +17,7 @@ domain-workforce = { path = "../domain-workforce" }
 domain-sched = { path = "../domain-sched" }
 domain-policy = { path = "../domain-policy" }
 domain-timecap = { path = "../domain-timecap" }
+domain-attendance = { path = "../domain-attendance" }
 chrono.workspace = true
 sha2 = "0.10"
 
