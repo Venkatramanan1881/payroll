@@ -47,9 +47,15 @@ async fn nightly_recalculation_charges_absences_once(pool: PgPool) {
     org_policy(&app, &s, &[("DS", json!({ "DS-10": { "action": "loss_of_pay" } }))]).await;
     let w = common::seed_worker(&pool, &app, &s, "Asha").await;
     common::day_shift(&app, &s, w.employee_id).await;
+    // A leaver who left two days ago is still inside the look-back window.
+    let gone = common::seed_worker(&pool, &app, &s, "Ravi").await;
+    common::day_shift(&app, &s, gone.employee_id).await;
+    sqlx::query("UPDATE workforce.employee SET employment_status = 'exited', exit_date = current_date - 2 WHERE id = $1")
+        .bind(gone.employee_id).execute(&pool).await.unwrap();
     let (st, r) = run(&app, "nightly-recalculation", Some(common::JOB_SECRET)).await;
     assert_eq!((st, r["organisations"].as_i64()), (StatusCode::OK, Some(1)), "{r}");
-    assert!(r["results"][0]["summary"]["results_written"].as_i64().unwrap() >= 1, "{r}");
+    assert_eq!((r["results"][0]["summary"]["employees"].as_i64(), r["results"][0]["summary"]["failed"].as_i64()), (Some(2), Some(0)), "{r}");
+    assert!(r["results"][0]["summary"]["results_written"].as_i64().unwrap() >= 2, "{r}");
     let yesterday = (Utc::now() + Duration::minutes(330)).date_naive() - Duration::days(1);
     let (_, d) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/attendance/employees/{}/days/{yesterday}", w.employee_id), None, &[]).await;
     assert_eq!(d["current_result"]["day_effects"][0]["effect_kind"], "absence_lop", "{d}");
@@ -114,4 +120,36 @@ async fn approval_timeouts_escalate_once_and_never_overdraw(pool: PgPool) {
     let (_, again) = run(&app, "approval-timeouts", Some(common::JOB_SECRET)).await;
     let sum = &again["results"][0]["summary"];
     assert_eq!((sum["regularisation"]["escalated"].as_i64(), sum["leave"]["escalated"].as_i64()), (Some(0), Some(0)), "never twice at one level: {again}");
+}
+
+/// An automatic approval never lands on a locked day (BR-06): the request is escalated to a person instead.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn auto_approve_on_a_locked_day_escalates(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, &[("RG", json!({ "RG-07": { "days": 1, "action": "auto_approve" } }))]).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let d = (Utc::now() + Duration::minutes(330)).date_naive() - Duration::days(3);
+    let reg = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO attendance.regularisation_request (org_id, id, employee_id, attendance_date, request_type, proposed_in_at, proposed_out_at, reason,
+           requested_by_user_id, created_at) VALUES ($1, $2, $3, $4, 'whole_day', $5, $6, 'x', $7, now() - interval '3 days')",
+    )
+    .bind(s.org_id).bind(reg).bind(w.employee_id).bind(d)
+    .bind(d.and_hms_opt(3, 30, 0).unwrap().and_utc()).bind(d.and_hms_opt(12, 30, 0).unwrap().and_utc()).bind(w.user_id)
+    .execute(&pool).await.unwrap();
+    let (cycle, period) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query("INSERT INTO period.attendance_cycle (org_id, id, owner_kind, owner_id, valid) VALUES ($1, $2, 'organisation', $1, daterange('2026-01-01', NULL))")
+        .bind(s.org_id).bind(cycle).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO period.attendance_period (org_id, id, cycle_id, period_start, period_end) VALUES ($1, $2, $3, $4, $4)")
+        .bind(s.org_id).bind(period).bind(cycle).bind(d).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO period.lock_coverage (org_id, period_id, employee_id, dates) VALUES ($1, $2, $3, daterange($4, $4 + 1))")
+        .bind(s.org_id).bind(period).bind(w.employee_id).bind(d).execute(&pool).await.unwrap();
+
+    let (st, r) = run(&app, "approval-timeouts", Some(common::JOB_SECRET)).await;
+    assert_eq!((st, r["results"][0]["ok"].as_bool()), (StatusCode::OK, Some(true)), "{r}");
+    let (state, escalated): (String, bool) =
+        sqlx::query_as("SELECT state, escalated FROM attendance.regularisation_request WHERE id = $1").bind(reg).fetch_one(&pool).await.unwrap();
+    assert_eq!((state.as_str(), escalated), ("pending_l1", true), "{r}");
 }

@@ -19,7 +19,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     let phone_verifier = std::sync::Arc::new(domain_iam::firebase::GoogleVerifier::new(&firebase_project));
     // JOB_SECRET enables /internal/jobs (Cloud Scheduler); unset in environments without timed jobs.
-    let job_secret = std::env::var("JOB_SECRET").ok().filter(|s| s.len() >= 32).map(String::into_bytes);
+    let job_secret = match std::env::var("JOB_SECRET").map(|s| s.trim().to_string()) {
+        Ok(s) if s.len() >= 32 => Some(s.into_bytes()),
+        Ok(_) => {
+            eprintln!("JOB_SECRET is shorter than 32 characters: /internal/jobs stays disabled");
+            None
+        }
+        Err(_) => None,
+    };
     let app = api::router(api::AppState { pool, jwt_secret, phone_verifier, job_secret });
     // The peer address backs PC-05 when no trusted proxy header is present.
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;

@@ -8,6 +8,8 @@
 - New crate `domain-org` (setup) and `domain-attendance::jobs` (J1, J3).
 - Job endpoints `POST /internal/jobs/{name}` are protected by a shared job secret (`JOB_SECRET`, from Secret Manager). Cloud Scheduler sends it as a bearer token.
 - Jobs list active organisations through the vendor role (`app_vendor` sees `platform.organisation`), then work per organisation as `app_api` under row-level security, exactly as requests do.
+- The jobs run as a separate Cloud Run service with its own login role (`jobs_login`, member of `app_api` and `app_vendor`). The internet-facing API's role (`api_login`) is a member of `app_api` only, and that service has no `JOB_SECRET`.
+- J1 works one short transaction per employee, using each employee's local date (master branch zone); J3 locks and re-checks each request and runs it in a savepoint.
 - Each run writes one `system_job` audit entry per organisation. A `job_runs` table would need a migration, which needs a Gate 3 amendment: deferred.
 - No new migration in this slice.
 
@@ -28,7 +30,7 @@
 - **Geo-fences (ORG-02):**
   - Created switched off.
   - "Test" measures a given point against the fence and records `tested_at` / `tested_by`.
-  - Switching on requires a test first (PC-R14).
+  - Switching on does not require a test: PC-R14 says a fence *can* be tested first, and the approved contract does not refuse an untested one. (Review fix: the first build refused it.)
 - **IP allow list (ORG-03):** replaced as a whole, with a reason; each entry must be a valid CIDR.
 - **Lists (ORG-04) and contractors (ORG-05):** create, rename, retire (never delete).
 - **J1 nightly recalculation:**
@@ -57,7 +59,7 @@
 
 ## Review focus
 1. No setup endpoint reaches another organisation's rows; scoped HR sees only their branches.
-2. A geo-fence cannot be switched on before a test.
+2. A geo-fence starts off; moving it switches it off and clears its test.
 3. A settings version in a locked period, or on an existing date, is refused.
 4. J1 is idempotent: a second run writes nothing new. J3 never escalates twice and never auto-approves without balance.
 5. The job endpoints refuse a missing or wrong secret, comparing it in constant time.

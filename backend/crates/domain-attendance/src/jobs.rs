@@ -1,5 +1,5 @@
-//! Timed jobs (TSD §10): J1 nightly recalculation and J3 approval timeouts. Each organisation is processed in its own
-//! organisation-scoped transaction (RLS), exactly like a request; one system audit entry records each run.
+//! Timed jobs (TSD §10): J1 nightly recalculation and J3 approval timeouts. Work runs in organisation-scoped
+//! transactions (RLS), exactly like a request: J1 one per employee, J3 one per organisation with a savepoint per request.
 
 use chrono::{Duration, NaiveDate, Utc};
 use db::{DomainError, OrgTx};
@@ -7,8 +7,9 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Active organisations. Only the vendor role sees every organisation row, so the listing runs as `app_vendor`
-/// (the job login role is a member of it; DEPLOYMENT.md). Nothing else is read under that role.
+/// Active organisations. Only the vendor role sees every organisation row, so the listing runs as `app_vendor`.
+/// That role reads every tenant's platform rows and audit log, so only the job service's login role (`jobs_login`)
+/// is a member of it; the internet-facing API's login role is not (DEPLOYMENT.md §3). Nothing else is read here.
 pub async fn active_organisations(pool: &PgPool) -> Result<Vec<Uuid>, DomainError> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL ROLE app_vendor").execute(&mut *tx).await?;
@@ -20,27 +21,84 @@ pub async fn active_organisations(pool: &PgPool) -> Result<Vec<Uuid>, DomainErro
 /// Days J1 looks back: open days whose missed-punch cut-off or DS-10 waiting time may have passed since the last run.
 const LOOKBACK_DAYS: i64 = 7;
 
-/// J1: recalculates the last `LOOKBACK_DAYS` days (today excluded) for every current employee of one organisation.
-/// Unchanged inputs write nothing (BR-02); locked and future days are skipped by `recalculate` itself.
-// shortcut: one transaction per organisation; split per employee into Cloud Tasks when organisations grow large.
-pub async fn nightly_recalculation(tx: &mut OrgTx<'_>, today: NaiveDate) -> Result<Value, DomainError> {
-    let employees: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM workforce.employee WHERE employment_status <> 'exited' AND joining_date < $1 ORDER BY id",
+/// "Today" for an employee: the date now in their master branch's zone (BR-11), so a 03:00 India run covers India's
+/// yesterday. A branch with no dated zone is read as India time (as `branch_tz`).
+async fn local_today(tx: &mut OrgTx<'_>, employee: Uuid) -> Result<NaiveDate, DomainError> {
+    Ok(sqlx::query_scalar(
+        "SELECT (now() AT TIME ZONE coalesce((SELECT t.tz FROM workforce.employee_assignment a JOIN org.branch_timezone t ON t.branch_id = a.branch_id
+                                              WHERE a.employee_id = $1 AND a.kind = 'master_branch' AND a.valid @> current_date AND t.valid @> current_date
+                                              LIMIT 1), 'Asia/Kolkata'))::date",
     )
-    .bind(today)
-    .fetch_all(&mut ***tx)
+    .bind(employee)
+    .fetch_one(&mut ***tx)
+    .await?)
+}
+
+async fn recalc_employee(tx: &mut OrgTx<'_>, employee: Uuid) -> Result<i64, DomainError> {
+    let today = local_today(tx, employee).await?;
+    let mut n = 0;
+    for back in (1..=LOOKBACK_DAYS).rev() {
+        if crate::recalculate(tx, employee, today - Duration::days(back), "j1_nightly", None).await?.is_some() {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// J1: recalculates the last `LOOKBACK_DAYS` days (today excluded) of every employee who is current or left within
+/// that window. Unchanged inputs write nothing (BR-02); locked and future days are skipped by `recalculate`.
+/// One short transaction per employee, so the run never holds request or balance locks for long, and one
+/// employee's failure never stops the others.
+// shortcut: one request walks every organisation; fan out one Cloud Task per organisation when runs near the scheduler deadline.
+pub async fn nightly_recalculation(pool: &PgPool, org: Uuid) -> Result<Value, DomainError> {
+    let mut tx = db::begin_org(pool, org).await?;
+    let employees: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM workforce.employee
+         WHERE joining_date <= current_date AND (employment_status <> 'exited' OR exit_date >= current_date - $1) ORDER BY id",
+    )
+    .bind(LOOKBACK_DAYS as i32 + 1)
+    .fetch_all(&mut **tx)
     .await?;
-    let mut written = 0;
+    tx.commit().await?;
+    let (mut written, mut failed) = (0, 0);
     for e in &employees {
-        for back in (1..=LOOKBACK_DAYS).rev() {
-            if crate::recalculate(tx, *e, today - Duration::days(back), "j1_nightly", None).await?.is_some() {
-                written += 1;
+        let mut tx = db::begin_org(pool, org).await?;
+        match recalc_employee(&mut tx, *e).await {
+            Ok(n) => {
+                tx.commit().await?;
+                written += n;
+            }
+            Err(err) => {
+                eprintln!("J1: employee {e} failed: {err:?}");
+                failed += 1;
             }
         }
     }
-    let summary = json!({ "employees": employees.len(), "results_written": written, "days_back": LOOKBACK_DAYS });
-    db::audit_system(tx, "job.j1_nightly_recalculation", "organisation", None, Some(summary.clone())).await?;
+    let summary = json!({ "employees": employees.len(), "results_written": written, "failed": failed, "days_back": LOOKBACK_DAYS });
+    let mut tx = db::begin_org(pool, org).await?;
+    db::audit_system(&mut tx, "job.j1_nightly_recalculation", "organisation", None, Some(summary.clone())).await?;
+    tx.commit().await?;
     Ok(summary)
+}
+
+/// Runs one J3 item inside a savepoint: a failing request is logged and skipped, the rest of the run stands.
+async fn savepoint(tx: &mut OrgTx<'_>) -> Result<(), DomainError> {
+    sqlx::query("SAVEPOINT j3_item").execute(&mut ***tx).await?;
+    Ok(())
+}
+
+async fn settle<T>(tx: &mut OrgTx<'_>, what: &str, id: Uuid, r: Result<Option<T>, DomainError>) -> Result<Option<T>, DomainError> {
+    match r {
+        Ok(v) => {
+            sqlx::query("RELEASE SAVEPOINT j3_item").execute(&mut ***tx).await?;
+            Ok(v)
+        }
+        Err(e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT j3_item").execute(&mut ***tx).await?;
+            eprintln!("J3: {what} {id} skipped: {e:?}");
+            Ok(None)
+        }
+    }
 }
 
 /// id, state, timeout days, timeout action, last step.
@@ -83,8 +141,9 @@ pub async fn approval_timeouts(tx: &mut OrgTx<'_>) -> Result<Value, DomainError>
         if Utc::now() - last < Duration::days(s.timeout_days) {
             continue;
         }
-        let level: i16 = if state == "pending_l2" { 2 } else { 1 };
-        if let Some(o) = regularisation_timeout(tx, id, level, &s.timeout_action).await? {
+        savepoint(tx).await?;
+        let r = regularisation_timeout(tx, id, &state, Duration::days(s.timeout_days), &s.timeout_action).await;
+        if let Some(o) = settle(tx, "regularisation", id, r).await? {
             bump(&mut counts, "regularisation", &o);
         }
     }
@@ -105,8 +164,9 @@ pub async fn approval_timeouts(tx: &mut OrgTx<'_>) -> Result<Value, DomainError>
         if Utc::now() - last < Duration::days(days.into()) {
             continue;
         }
-        let level: i16 = if state == "pending_l2" { 2 } else { 1 };
-        if let Some(o) = leave_timeout(tx, id, level, &action).await? {
+        savepoint(tx).await?;
+        let r = leave_timeout(tx, id, &state, Duration::days(days.into()), &action).await;
+        if let Some(o) = settle(tx, "leave", id, r).await? {
             bump(&mut counts, "leave", &o);
         }
     }
@@ -114,17 +174,23 @@ pub async fn approval_timeouts(tx: &mut OrgTx<'_>) -> Result<Value, DomainError>
     Ok(counts)
 }
 
-async fn regularisation_timeout(tx: &mut OrgTx<'_>, id: Uuid, level: i16, action: &str) -> Result<Option<Outcome>, DomainError> {
-    // Lock and re-check: a person may have decided since the list was read.
-    let (state, requester, employee): (String, Uuid, Uuid) =
-        sqlx::query_as("SELECT state, requested_by_user_id, employee_id FROM attendance.regularisation_request WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_one(&mut ***tx)
-            .await?;
-    if !matches!(state.as_str(), "pending_l1" | "pending_l2") {
+async fn regularisation_timeout(tx: &mut OrgTx<'_>, id: Uuid, listed: &str, timeout: Duration, action: &str) -> Result<Option<Outcome>, DomainError> {
+    // Lock, then re-check against the row: a person may have acted (or moved it a level) since the list was read.
+    let (state, requester, employee, date, last): (String, Uuid, Uuid, NaiveDate, chrono::DateTime<Utc>) = sqlx::query_as(
+        "SELECT q.state, q.requested_by_user_id, q.employee_id, q.attendance_date,
+                coalesce((SELECT max(a.occurred_at) FROM audit.audit_entry a WHERE a.target_type = 'regularisation_request' AND a.target_id = q.id), q.created_at)
+         FROM attendance.regularisation_request q WHERE q.id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut ***tx)
+    .await?;
+    if state != listed || Utc::now() - last < timeout {
         return Ok(None);
     }
+    let level: i16 = if state == "pending_l2" { 2 } else { 1 };
     let step = |action: &str| json!({ "action": action, "level": level, "comment": "approval timeout (RG-07)", "on_behalf_of": null });
+    // An automatic approval never lands on a locked day (BR-06): that request is escalated to a person instead.
+    let action = if action == "auto_approve" && db::employee_locked(tx, employee, date, date.succ_opt()).await? { "escalate" } else { action };
     match action {
         "auto_approve" | "auto_reject" => {
             let approve = action == "auto_approve";
@@ -167,15 +233,22 @@ async fn regularisation_timeout(tx: &mut OrgTx<'_>, id: Uuid, level: i16, action
     }
 }
 
-async fn leave_timeout(tx: &mut OrgTx<'_>, id: Uuid, level: i16, action: &str) -> Result<Option<Outcome>, DomainError> {
-    let (state, requester, employee, leave_type, from): (String, Uuid, Uuid, Uuid, NaiveDate) =
-        sqlx::query_as("SELECT state, requested_by, employee_id, leave_type_id, from_date FROM leave.leave_request WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_one(&mut ***tx)
-            .await?;
-    if !matches!(state.as_str(), "pending_l1" | "pending_l2") {
+/// state, requester, employee, leave type, first day, last step.
+type LeaveLocked = (String, Uuid, Uuid, Uuid, NaiveDate, chrono::DateTime<Utc>);
+
+async fn leave_timeout(tx: &mut OrgTx<'_>, id: Uuid, listed: &str, timeout: Duration, action: &str) -> Result<Option<Outcome>, DomainError> {
+    let (state, requester, employee, leave_type, from, last): LeaveLocked = sqlx::query_as(
+        "SELECT q.state, q.requested_by, q.employee_id, q.leave_type_id, q.from_date,
+                coalesce((SELECT max(s.acted_at) FROM app.approval_step s WHERE s.request_type = 'leave' AND s.request_id = q.id), q.submitted_at)
+         FROM leave.leave_request q WHERE q.id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut ***tx)
+    .await?;
+    if state != listed || Utc::now() - last < timeout {
         return Ok(None);
     }
+    let level: i16 = if state == "pending_l2" { 2 } else { 1 };
     let mut action = action;
     if action == "auto_approve" {
         // An automatic approval never overdraws the balance or touches a locked day: such a request is escalated instead.

@@ -5,7 +5,6 @@ use crate::{ApiError, AppState};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use chrono::Utc;
 use domain_attendance::jobs;
 use serde_json::{json, Value};
 
@@ -27,17 +26,20 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>, header
         return Err(ApiError::NotFound);
     }
     let orgs = jobs::active_organisations(&state.pool).await?;
-    let today = Utc::now().date_naive();
     let mut results = Vec::with_capacity(orgs.len());
     for org in &orgs {
-        let mut tx = db::begin_org(&state.pool, *org).await?;
         let outcome = match name.as_str() {
-            "nightly-recalculation" => jobs::nightly_recalculation(&mut tx, today).await,
-            _ => jobs::approval_timeouts(&mut tx).await,
+            "nightly-recalculation" => jobs::nightly_recalculation(&state.pool, *org).await,
+            _ => {
+                let mut tx = db::begin_org(&state.pool, *org).await?;
+                match jobs::approval_timeouts(&mut tx).await {
+                    Ok(s) => tx.commit().await.map(|_| s).map_err(Into::into),
+                    Err(e) => Err(e),
+                }
+            }
         };
         match outcome {
             Ok(summary) => {
-                tx.commit().await?;
                 results.push(json!({ "org_id": org, "ok": true, "summary": summary }));
             }
             Err(e) => {

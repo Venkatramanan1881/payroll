@@ -72,7 +72,7 @@ async fn branches_scope_and_isolation(pool: PgPool) {
     let role = Uuid::new_v4();
     sqlx::query("INSERT INTO iam.user_account (org_id, id, login_kind, email, password_hash) VALUES ($1, $2, 'password', 'hq@test.invalid', 'x')").bind(s.org_id).bind(user).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name) VALUES ($1, $2, 'HQ HR')").bind(s.org_id).bind(role).execute(&pool).await.unwrap();
-    for op in ["ORG-07", "ORG-01", "ORG-02"] {
+    for op in ["ORG-07", "ORG-01", "ORG-02", "ORG-04", "ORG-05", "ORG-06"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')").bind(s.org_id).bind(role).bind(op).execute(&pool).await.unwrap();
     }
     sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(s.org_id).bind(user).bind(role).execute(&pool).await.unwrap();
@@ -83,22 +83,27 @@ async fn branches_scope_and_isolation(pool: PgPool) {
     assert_eq!(common::as_user(&app, &hq, "GET", &format!("/v1/branches/{chn}"), None, &[]).await.0, StatusCode::NOT_FOUND);
     let (st, _) = common::as_user(&app, &hq, "POST", "/v1/branches", Some(json!({ "name": "Y", "code": "Y", "tz": "Asia/Kolkata", "time_zone_valid_from": "2026-01-01" })), &[("idempotency-key", Uuid::new_v4().to_string())]).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "a branch-scoped user cannot create branches");
+    // Lists, contractors and organisation settings are organisation-wide: a branch-scoped grant cannot write them.
+    for (uri, body) in [("/v1/lists/department", json!({ "name": "Stores" })), ("/v1/contractors", json!({ "name": "Acme" })),
+                        ("/v1/organisation-settings/versions", json!({ "effective_from": "2026-01-01", "reason": "x", "schema_version": 1, "settings": settings() }))] {
+        let (st, _) = common::as_user(&app, &hq, "POST", uri, Some(body), &[("idempotency-key", Uuid::new_v4().to_string())]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{uri}");
+    }
 
     let other = common::seed_org(&pool).await;
     assert_eq!(common::as_user(&app, &other.hr_token, "GET", &format!("/v1/branches/{chn}"), None, &[]).await.0, StatusCode::NOT_FOUND);
 }
 
-/// Review focus 2: a fence is switched on only after a test; moving it switches it off again.
+/// Review focus 2: a new fence starts off; the contract lets HR switch it on untested; moving it switches it off again.
 #[sqlx::test(migrator = "db::MIGRATOR")]
-async fn geo_fence_test_before_switch_on(pool: PgPool) {
+async fn geo_fence_test_and_switch_on(pool: PgPool) {
     let s = common::seed_org(&pool).await;
     let app = common::app(pool.clone());
     let (st, f) = post(&app, &s, &format!("/v1/branches/{}/geo-fences", s.branch_id), json!({ "name": "Gate", "latitude": 12.9716, "longitude": 77.5946, "radius_m": 200 })).await;
     assert_eq!((st, f["enabled"].as_bool()), (StatusCode::CREATED, Some(false)), "{f}");
     let id = f["id"].as_str().unwrap().to_string();
-    let (st, b) = post(&app, &s, &format!("/v1/geo-fences/{id}/switch-on"), json!({})).await;
-    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("ILLEGAL_TRANSITION")), "{b}");
-    let (st, t) = post(&app, &s, &format!("/v1/geo-fences/{id}/test"), json!({ "latitude": 12.9716 + 100.0 / 111_195.0, "longitude": 77.5946 })).await;
+    // /test needs no Idempotency-Key (a repeat just tests again).
+    let (st, t) = common::as_user(&app, &s.hr_token, "POST", &format!("/v1/geo-fences/{id}/test"), Some(json!({ "latitude": 12.9716 + 100.0 / 111_195.0, "longitude": 77.5946 })), &[]).await;
     assert_eq!((st, t["inside"].as_bool()), (StatusCode::OK, Some(true)), "{t}");
     assert!((t["distance_m"].as_f64().unwrap() - 100.0).abs() < 1.0);
     let (st, on) = post(&app, &s, &format!("/v1/geo-fences/{id}/switch-on"), json!({})).await;

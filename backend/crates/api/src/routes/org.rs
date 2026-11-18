@@ -33,6 +33,14 @@ async fn branch_in_scope(tx: &mut OrgTx<'_>, p: &Principal, op: &str, branch: Uu
     }
 }
 
+/// Organisation-wide writes (x-scope: org): only a caller whose scope is the whole organisation.
+async fn require_org_wide(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<(), ApiError> {
+    match require(tx, p, op).await?.scope {
+        Scope::All => Ok(()),
+        _ => Err(ApiError::Forbidden),
+    }
+}
+
 /// GET /v1/organisation (ORG-07).
 pub async fn organisation(Auth(p, mut tx): Auth) -> Result<Json<Value>, ApiError> {
     require(&mut tx, &p, "ORG-07").await?;
@@ -57,9 +65,7 @@ pub struct NewBranch {
 
 /// POST /v1/branches (ORG-01; a branch-scoped caller cannot create branches outside their scope, so only All may).
 pub async fn create_branch(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    if branch_scope(&mut tx, &p, "ORG-01").await?.is_some() {
-        return Err(ApiError::Forbidden);
-    }
+    require_org_wide(&mut tx, &p, "ORG-01").await?;
     let (key, replay) = start(&mut tx, &headers, "POST /v1/branches", &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -156,16 +162,13 @@ pub struct TestIn {
     accuracy_m: Option<f64>,
 }
 
-/// POST /v1/geo-fences/{id}/test (ORG-02, PC-R14).
-pub async fn test_fence(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+/// POST /v1/geo-fences/{id}/test (ORG-02, PC-R14). Naturally idempotent: a repeat just tests again.
+pub async fn test_fence(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, raw: Bytes) -> Result<Response, ApiError> {
     fence_in_scope(&mut tx, &p, "ORG-02", id).await?;
-    let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/geo-fences/{id}/test"), &raw).await?;
-    if let Some(r) = replay {
-        return Ok(r);
-    }
     let r: TestIn = parse(&raw)?;
     let body = org::test_fence(&mut tx, p.user_id, id, r.latitude, r.longitude).await?;
-    done(tx, key, StatusCode::OK, body).await
+    tx.commit().await?;
+    Ok(reply(StatusCode::OK, body))
 }
 
 async fn switch(p: Principal, mut tx: OrgTx<'static>, id: Uuid, headers: HeaderMap, raw: Bytes, on: bool) -> Result<Response, ApiError> {
@@ -238,7 +241,7 @@ pub struct EntryIn {
 
 /// POST /v1/lists/{kind} (ORG-04).
 pub async fn create_entry(Auth(p, mut tx): Auth, Path(kind): Path<String>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "ORG-04").await?;
+    require_org_wide(&mut tx, &p, "ORG-04").await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/lists/{kind}"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -251,7 +254,7 @@ pub async fn create_entry(Auth(p, mut tx): Auth, Path(kind): Path<String>, heade
 
 /// PATCH /v1/lists/{kind}/{id} (ORG-04, If-Match).
 pub async fn update_entry(Auth(p, mut tx): Auth, Path((kind, id)): Path<(String, Uuid)>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "ORG-04").await?;
+    require_org_wide(&mut tx, &p, "ORG-04").await?;
     sqlx::query("SELECT 1 FROM org.list_entry WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **tx).await?;
     if_match(&headers, &org::get_entry(&mut tx, &kind, id).await?)?;
     let r: EntryIn = parse(&raw)?;
@@ -263,7 +266,7 @@ pub async fn update_entry(Auth(p, mut tx): Auth, Path((kind, id)): Path<(String,
 
 /// POST /v1/lists/{kind}/{id}/retire (ORG-04).
 pub async fn retire_entry(Auth(p, mut tx): Auth, Path((kind, id)): Path<(String, Uuid)>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "ORG-04").await?;
+    require_org_wide(&mut tx, &p, "ORG-04").await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/lists/{kind}/{id}/retire"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -294,7 +297,7 @@ pub struct ContractorIn {
 
 /// POST /v1/contractors (ORG-05).
 pub async fn create_contractor(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "ORG-05").await?;
+    require_org_wide(&mut tx, &p, "ORG-05").await?;
     let (key, replay) = start(&mut tx, &headers, "POST /v1/contractors", &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -307,7 +310,7 @@ pub async fn create_contractor(Auth(p, mut tx): Auth, headers: HeaderMap, raw: B
 
 /// PATCH /v1/contractors/{id} (ORG-05, If-Match).
 pub async fn update_contractor(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "ORG-05").await?;
+    require_org_wide(&mut tx, &p, "ORG-05").await?;
     sqlx::query("SELECT 1 FROM org.contractor WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **tx).await?;
     if_match(&headers, &org::get_contractor(&mut tx, id).await?)?;
     let r: ContractorIn = parse(&raw)?;
@@ -319,7 +322,7 @@ pub async fn update_contractor(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, head
 
 /// POST /v1/contractors/{id}/retire (ORG-05).
 pub async fn retire_contractor(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "ORG-05").await?;
+    require_org_wide(&mut tx, &p, "ORG-05").await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/contractors/{id}/retire"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -357,7 +360,7 @@ pub struct SettingsIn {
 
 /// POST /v1/organisation-settings/versions (ORG-06; AC-04 "HR Manager only": saved directly, 201).
 pub async fn create_settings_version(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require(&mut tx, &p, "ORG-06").await?;
+    require_org_wide(&mut tx, &p, "ORG-06").await?;
     let (key, replay) = start(&mut tx, &headers, "POST /v1/organisation-settings/versions", &raw).await?;
     if let Some(r) = replay {
         return Ok(r);

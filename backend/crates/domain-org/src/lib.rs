@@ -131,7 +131,7 @@ fn check_fence(f: &FenceIn) -> Result<(), DomainError> {
     Ok(())
 }
 
-/// A new fence starts switched off: it is switched on only after a test (PC-R14).
+/// A new fence starts switched off; HR tests it from the branch and switches it on (PC-R14).
 pub async fn create_fence(tx: &mut OrgTx<'_>, actor: Uuid, branch: Uuid, f: FenceIn) -> Result<Uuid, DomainError> {
     check_fence(&f)?;
     get_branch(tx, branch).await?;
@@ -192,12 +192,10 @@ pub async fn test_fence(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, lat: f64, lon
     Ok(result)
 }
 
+/// PC-R14 says a fence "can" be tested first; the approved contract does not refuse an untested fence.
 pub async fn switch_fence(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, on: bool) -> Result<(), DomainError> {
-    let tested: Option<bool> = sqlx::query_scalar("SELECT tested_at IS NOT NULL FROM org.geo_fence WHERE id = $1 FOR UPDATE").bind(id).fetch_optional(&mut ***tx).await?;
-    let tested = tested.ok_or(DomainError::NotFound)?;
-    if on && !tested {
-        return Err(DomainError::IllegalTransition("test the fence from the branch before switching it on (PC-R14)".into()));
-    }
+    let found: Option<bool> = sqlx::query_scalar("SELECT true FROM org.geo_fence WHERE id = $1 FOR UPDATE").bind(id).fetch_optional(&mut ***tx).await?;
+    found.ok_or(DomainError::NotFound)?;
     sqlx::query("UPDATE org.geo_fence SET enabled = $2, updated_by = $3 WHERE id = $1").bind(id).bind(on).bind(actor).execute(&mut ***tx).await?;
     db::audit(tx, actor, if on { "geo_fence.switch_on" } else { "geo_fence.switch_off" }, "geo_fence", Some(id), None).await?;
     Ok(())

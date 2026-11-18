@@ -18,10 +18,10 @@ docker push asia-south1-docker.pkg.dev/<gcp-project>/payroll/api:<git-sha>
 
 | Variable | Source | Notes |
 |---|---|---|
-| `DATABASE_URL` | Secret Manager | Serving: connect as `api_login` (§3), never `postgres`. Migrating: the owner role. |
+| `DATABASE_URL` | Secret Manager | API service: `api_login`; jobs service: `jobs_login` (§3); never `postgres`. Migrating: the owner role. Use Supavisor **session mode** (port 5432) or a direct connection: transaction mode (6543) breaks prepared statements. |
 | `APP_JWT_SECRET` | Secret Manager | Signs access tokens. 32+ random bytes. |
 | `FIREBASE_PROJECT_ID` | plain env | Phone sign-in token audience (D-12). |
-| `JOB_SECRET` | Secret Manager | Enables `/internal/jobs/*`. 32+ characters, or the job endpoints stay off. |
+| `JOB_SECRET` | Secret Manager | **Jobs service only.** Enables `/internal/jobs/*`. 32+ characters (surrounding whitespace is trimmed), or the job endpoints stay off and a line is logged. |
 | `TRUSTED_PROXY_HOPS` | plain env | `1` behind the Cloud Run front end (PC-05 client IP). |
 | `PORT` | Cloud Run | Set by the platform. |
 
@@ -32,10 +32,10 @@ Secrets never go into git, images or chat.
 ### Roles
 
 - Migrations run as the project owner (`postgres`).
-- After migrations, run `docs/database/supabase_roles.sql` once per project. It creates `api_login`:
-  - a login role with no rights of its own;
-  - a member of `app_api` and `app_vendor`, so it can switch to them (SET), without inheriting their rights.
-- Every API transaction switches to `app_api`, so row-level security always applies.
+- After migrations, run `docs/database/supabase_roles.sql` once per project. It creates two login roles, neither with rights of its own (members with SET, without inheriting):
+  - `api_login` for the internet-facing API: a member of `app_api` only.
+  - `jobs_login` for the timed-jobs service: a member of `app_api` and `app_vendor`. `app_vendor` reads every tenant's platform rows, so only this private service holds it.
+- Every request transaction switches to `app_api`, so row-level security always applies.
 
 ### Migrations
 
@@ -64,7 +64,19 @@ gcloud run deploy payroll-api --image <image> --region asia-south1 \
   --min-instances 1 --cpu 1 --memory 512Mi
 ```
 
-`--min-instances 1` keeps punches fast (TSD §19.3).
+`--min-instances 1` keeps punches fast (TSD §19.3). The API service gets **no** `JOB_SECRET`, so `/internal/jobs/*` answers 404 there.
+
+The jobs run from a second service built from the same image, reachable only by Cloud Scheduler:
+
+```
+gcloud run deploy payroll-jobs --image <image> --region asia-south1 \
+  --service-account payroll-jobs@<gcp-project>.iam.gserviceaccount.com \
+  --set-secrets DATABASE_URL=jobs-db-url:latest,APP_JWT_SECRET=jwt-secret:latest,JOB_SECRET=job-secret:latest \
+  --set-env-vars FIREBASE_PROJECT_ID=<firebase-project>,TRUSTED_PROXY_HOPS=1 \
+  --allow-unauthenticated --min-instances 0 --timeout 1800
+```
+
+Until the OIDC upgrade (§5), the job secret is the only gate: Cloud Run IAM would claim the `Authorization` header the secret travels in. The API service never holds the secret, so a leak of the public service exposes nothing here.
 
 ## 5. Timed jobs (Cloud Scheduler, India time)
 
@@ -73,7 +85,9 @@ gcloud run deploy payroll-api --image <image> --region asia-south1 \
 | J1 nightly recalculation | `0 3 * * *` | `POST /internal/jobs/nightly-recalculation` |
 | J3 approval timeouts | `0 * * * *` | `POST /internal/jobs/approval-timeouts` |
 
-- Each request carries `Authorization: Bearer $JOB_SECRET`.
+- Requests go to the `payroll-jobs` service and carry the job secret as `Authorization: Bearer $JOB_SECRET`.
+- Set the scheduler's attempt deadline to 30 minutes (`--attempt-deadline 1800s`), matching the service timeout. One request walks every organisation in turn: J1 uses one short transaction per employee, J3 one per organisation with a savepoint per request, and one organisation's failure is reported without stopping the rest.
+- When a run nears the deadline, fan out one Cloud Task per organisation (marked `shortcut:` in the code).
 - Both jobs are idempotent, so a retried or doubled run changes nothing more:
   - J1 writes nothing when inputs are unchanged;
   - J3 escalates once per level.
@@ -86,4 +100,4 @@ gcloud run deploy payroll-api --image <image> --region asia-south1 \
 2. Migrations reviewed; any new one approved (Gate 3 amendment).
 3. `api migrate` run against the target database as the owner.
 4. Deploy the image; check `/health`.
-5. Scheduler jobs point at the new service URL.
+5. Scheduler jobs point at the `payroll-jobs` service URL.
