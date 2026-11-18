@@ -14,6 +14,8 @@ pub const ENGINE_VERSION: &str = "1";
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Expected {
     Working { start_at: DateTime<Utc>, end_at: DateTime<Utc>, required_min: i64, flexible: bool },
+    /// A shift without set times (open, or flexible without a band): status from hours only (DS-01 b).
+    HoursOnly { required_min: i64 },
     WeeklyOff,
     Holiday,
     /// No schedule applies.
@@ -184,27 +186,31 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
 
     // Missed punches (MP-01/02 before the cut-off, MP-03 at it). BR-09: a missing out is never an early check-out.
     let open = merged.iter().any(|p| p.out.is_none());
+    let mp_rule = if input.cutoff_passed { "MP-03" } else if kept.len() == 1 { "MP-02" } else { "MP-01" };
     let mp_action = open.then_some(if input.cutoff_passed { s.mp_cutoff } else if kept.len() == 1 { s.mp_single } else { s.mp_odd });
-    let working = match &input.expected {
-        Expected::Working { start_at, end_at, required_min, flexible } => Some((*start_at, *end_at, *required_min, *flexible)),
-        _ => None,
+    // (start, end) of a shift with set times; required minutes and flexibility for any working day.
+    let (times, required, flexible) = match &input.expected {
+        Expected::Working { start_at, end_at, required_min, flexible } => (Some((*start_at, *end_at)), *required_min, *flexible),
+        Expected::HoursOnly { required_min } => (None, *required_min, true),
+        _ => (None, 0, false),
     };
     if open {
         out.flags.push("missed_punch".into());
-        let rule = if input.cutoff_passed { "MP-03" } else if kept.len() == 1 { "MP-02" } else { "MP-01" };
-        step(&mut out.explanation, rule, json!({ "cutoff_passed": input.cutoff_passed }), format!("{:?}", mp_action.expect("open day has an action")));
+        step(&mut out.explanation, mp_rule, json!({ "cutoff_passed": input.cutoff_passed }), format!("{:?}", mp_action.expect("open day has an action")));
     }
     if mp_action == Some(MpAction::AutoClose) {
-        if let Some((_, end_at, _, _)) = working {
+        if let Some((_, end_at)) = times {
             for pr in merged.iter_mut().filter(|p| p.out.is_none() && p.in_at < end_at) {
                 pr.out = Some((pr.in_p, end_at)); // closed at shift end; the in punch stands for both ends
                 out.flags.push("auto_closed".into());
             }
         }
     }
+    // A missed punch still waiting for the employee holds early leaving back; once resolved, the last real check-out counts.
+    let pending = merged.iter().any(|p| p.out.is_none()) && mp_action == Some(MpAction::Flag);
 
     // Sessions and minutes. EA-01: work counts from shift start, or from the punch up to EA-02 minutes early.
-    let count_from = working.map(|(start, ..)| if s.ea_from_punch { start - chrono::Duration::minutes(s.ea_cap_min) } else { start });
+    let count_from = times.map(|(start, _)| if s.ea_from_punch { start - chrono::Duration::minutes(s.ea_cap_min) } else { start });
     for (i, pr) in merged.iter().enumerate() {
         let n = i as i64 + 1;
         out.punches_used.push(PunchUse { id: pr.in_p, direction: Some("in"), session_no: Some(n), excluded: None });
@@ -231,7 +237,7 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
     }
 
     let first_in = merged.first().map(|p| p.in_at);
-    let last_closed_out = merged.last().and_then(|p| p.out.map(|o| o.1));
+    let last_closed_out = merged.iter().rev().find_map(|p| p.out.map(|o| o.1));
 
     match &input.expected {
         Expected::WeeklyOff | Expected::Holiday => {
@@ -243,35 +249,39 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
             return out;
         }
         Expected::Unscheduled => {
+            // Nobody is expected to work, so no absence follows from no punches.
             out.flags.push("no_shift".into());
             out.fraction_pct = if out.net_min > 0 { 100 } else { 0 };
             out.status = status_of(out.fraction_pct, false);
-            out.state = if kept.is_empty() { "absence_pending" } else if open && !input.cutoff_passed { "exception" } else { "provisional" };
+            out.state = if open && !input.cutoff_passed { "exception" } else { "provisional" };
             step(&mut out.explanation, "DS-01", json!({ "net": out.net_min }), format!("no shift: {}", out.status));
             return out;
         }
-        Expected::Working { .. } => {}
+        Expected::Working { .. } | Expected::HoursOnly { .. } => {}
     }
-    let (start_at, end_at, required, flexible) = working.expect("working day");
     if kept.is_empty() {
         out.status = "absent";
         out.state = "absence_pending";
         step(&mut out.explanation, "DS-10", json!({}), "absent; pending (leave or loss of pay decided later)".into());
         return out;
     }
-    if let Some(fi) = first_in.filter(|fi| *fi < start_at) {
-        out.early_arrival_min = if s.ea_from_punch { minutes(fi, start_at).min(s.ea_cap_min) } else { 0 };
+    let has_pair = out.sessions.iter().any(|x| x.out_at.is_some());
+    if let (Some((start_at, _)), Some(fi)) = (times, first_in) {
+        if fi < start_at {
+            out.early_arrival_min = if s.ea_from_punch { minutes(fi, start_at).min(s.ea_cap_min) } else { 0 };
+        }
     }
-    let basis = s.basis.unwrap_or(if flexible { Basis::Hours } else { Basis::Shift });
-    let slabs_apply = basis != Basis::Hours;
+    let basis = if times.is_none() { Basis::Hours } else { s.basis.unwrap_or(if flexible { Basis::Hours } else { Basis::Shift }) };
+    // Slabs need a real in and out: a day with no pair is already not present (BR-04, no second penalty).
+    let slabs_apply = basis != Basis::Hours && has_pair;
 
-    // Late (LA-01..05, LA-23).
+    // Late (LA-01..05, LA-23). Slabs read raw minutes late (default slab 11-120 with grace 10); LA-02 sets what is reported.
     let mut slab_effects: Vec<Effect> = Vec::new();
-    if let (true, Some(fi)) = (s.late_on, first_in) {
+    if let (true, Some((start_at, _)), Some(fi)) = (s.late_on, times, first_in) {
         let raw = minutes(start_at, fi);
         if raw > s.late_grace {
             out.late_min = if s.late_from_grace_end { raw - s.late_grace } else { raw };
-            let slab = slab_for(&s.late_slabs, out.late_min).map(|x| x.action).unwrap_or(SlabAction::None);
+            let slab = slab_for(&s.late_slabs, raw).map(|x| x.action).unwrap_or(SlabAction::None);
             if slabs_apply {
                 apply_slab(slab, out.late_min, "late_slab", "LA-05", s.slab_cut_counts_as_mark, &mut out.late_mark, &mut slab_effects);
             }
@@ -279,9 +289,9 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
         }
     }
     // Early (EC-01..04, EC-15). BR-09: only from a real check-out.
-    if open {
+    if pending {
         step(&mut out.explanation, "BR-09", json!({}), "missing check-out is a missed punch, not an early check-out".into());
-    } else if let (true, Some(lo)) = (s.early_on, last_closed_out) {
+    } else if let (true, Some((_, end_at)), Some(lo)) = (s.early_on, times, last_closed_out) {
         let raw = minutes(lo, end_at);
         let hours_met = s.hours_met_override.unwrap_or(flexible) && out.net_min >= required;
         if raw > s.early_grace {
@@ -295,7 +305,6 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
     }
 
     // Status (DS-01..07) and BR-04: one shortfall, one effect — the larger.
-    let has_pair = out.sessions.iter().any(|x| x.out_at.is_some());
     let slab_days: i64 = slab_effects.iter().filter_map(|e| e.days_pct).sum();
     let shift_pct = if has_pair { (100 - slab_days).max(0) } else { 0 };
     let full = s.full_day_min.unwrap_or(if basis == Basis::Hybrid { required * 75 / 100 } else { required });
@@ -316,12 +325,15 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
         (0, Some((Some(100), None)))
     };
     let hours_eff = |(days, mins): (Option<i64>, Option<i64>)| Effect { kind: "hours_shortfall", days_pct: days, minutes: mins, reason_code: format!("short_{shortfall}_minutes"), rule_ref: "DS-05" };
+    // Hybrid compares both deductions in hundredths of a day; minutes count against the required day.
+    let cost = |e: &Effect| e.days_pct.unwrap_or(0) + e.minutes.unwrap_or(0) * 100 / required.max(1);
     let (pct, effects) = match basis {
         Basis::Shift => (shift_pct, slab_effects),
         Basis::Hours => (hours_pct, hours_effect.map(hours_eff).into_iter().collect()),
         Basis::Hybrid => {
-            if 100 - hours_pct > slab_days {
-                (hours_pct, hours_effect.map(hours_eff).into_iter().collect())
+            let hours: Vec<Effect> = hours_effect.map(hours_eff).into_iter().collect();
+            if hours.iter().map(cost).sum::<i64>() > slab_effects.iter().map(cost).sum::<i64>() {
+                (hours_pct, hours)
             } else {
                 (shift_pct, slab_effects)
             }
@@ -331,18 +343,22 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
     out.effects = effects;
     step(&mut out.explanation, "DS-01", json!({ "basis": format!("{basis:?}"), "net": out.net_min, "full_day_min": full, "half_day_min": half }), format!("{pct}% present"));
 
-    // MP half day / absent cut the day further.
-    let mp_cap = match mp_action {
-        Some(MpAction::HalfDay) => Some(50),
-        Some(MpAction::Absent) => Some(0),
-        _ => None,
-    };
-    if let Some(cap) = mp_cap.filter(|c| *c < out.fraction_pct) {
-        out.effects.push(Effect { kind: "missed_punch", days_pct: Some(out.fraction_pct - cap), minutes: None, reason_code: "unresolved_missed_punch".into(), rule_ref: "MP-03" });
-        out.fraction_pct = cap;
+    // MP half day sets the day to a half (also from nothing: "absent if none" belongs to pairs-only); absent clears it.
+    match mp_action {
+        Some(MpAction::HalfDay) => {
+            if out.fraction_pct > 50 {
+                out.effects.push(Effect { kind: "missed_punch", days_pct: Some(out.fraction_pct - 50), minutes: None, reason_code: "unresolved_missed_punch".into(), rule_ref: mp_rule });
+            }
+            out.fraction_pct = 50;
+        }
+        Some(MpAction::Absent) if out.fraction_pct > 0 => {
+            out.effects.push(Effect { kind: "missed_punch", days_pct: Some(out.fraction_pct), minutes: None, reason_code: "unresolved_missed_punch".into(), rule_ref: mp_rule });
+            out.fraction_pct = 0;
+        }
+        _ => {}
     }
     out.status = status_of(out.fraction_pct, s.quarter_days);
-    out.state = if open && !input.cutoff_passed { "exception" } else { "provisional" };
+    out.state = if pending { "exception" } else { "provisional" };
     out
 }
 
@@ -434,7 +450,7 @@ mod tests {
         let o = compute_day(&i);
         assert_eq!((o.state, o.status, o.fraction_pct), ("provisional", "absent", 0), "MP-03 pairs only: no pair -> absent");
         i.settings.mp_cutoff = MpAction::HalfDay;
-        assert_eq!(compute_day(&i).status, "absent", "half day cannot raise a day with no pairs");
+        assert_eq!(compute_day(&i).status, "half_day", "MP half day gives a half day; absent-if-none is pairs-only");
     }
 
     #[test]
@@ -479,6 +495,45 @@ mod tests {
         i.punches.push(PunchIn { id: Uuid::from_u128(9), at: t("22:00") + chrono::Duration::hours(8), excluded: None });
         let o = compute_day(&i);
         assert_eq!((o.status, o.late_mark, o.sessions.len()), ("present", false, 1));
+    }
+
+    #[test]
+    fn single_punch_gets_no_slab_on_top_of_absence() {
+        for t in ["11:30", "18:00"] {
+            let mut i = day(shift(), &[t]);
+            i.cutoff_passed = true;
+            let o = compute_day(&i);
+            assert_eq!((o.status, o.effects.len(), o.late_mark), ("absent", 0, false), "{t}: {o:?}");
+        }
+    }
+
+    #[test]
+    fn extra_unpaired_punch_does_not_hide_early_leaving() {
+        let mut i = day(shift(), &["09:00", "09:10", "17:00"]);
+        i.cutoff_passed = true;
+        let o = compute_day(&i);
+        assert_eq!((o.status, o.fraction_pct), ("half_day", 50), "pairs only: the last real check-out was 09:10: {o:?}");
+    }
+
+    #[test]
+    fn grace_end_measure_keeps_slab_boundaries_on_raw_minutes() {
+        let mut i = day(shift(), &["11:05", "18:00"]);
+        i.settings.late_from_grace_end = true;
+        let o = compute_day(&i);
+        assert_eq!((o.late_min, o.status), (115, "half_day"), "125 minutes late is in the 121+ slab");
+    }
+
+    #[test]
+    fn hours_only_shift_uses_required_hours() {
+        let o = compute_day(&day(Expected::HoursOnly { required_min: 480 }, &["09:00", "09:20"]));
+        assert_eq!((o.status, o.late_min), ("absent", 0), "{o:?}");
+        let o = compute_day(&day(Expected::HoursOnly { required_min: 480 }, &["09:00", "18:00"]));
+        assert_eq!(o.status, "present");
+    }
+
+    #[test]
+    fn unscheduled_day_without_punches_is_not_an_absence() {
+        assert_eq!(compute_day(&day(Expected::Unscheduled, &[])).state, "provisional");
     }
 
     #[test]

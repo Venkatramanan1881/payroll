@@ -34,6 +34,13 @@ Settings are typed and validated on `PUT .../rule-groups/{PR,BK,LA,EC,EA,MP,DS}`
 ## Rulings (to confirm)
 - **Recalculation runs inline** in the same transaction as the punch, flag decision or manual entry (that date, and the day before for night shifts). TSD §5.2 queues it through Cloud Tasks; the same function moves behind the queue in the deployment slice.
 - **The missed-punch cut-off (D-08)** is applied whenever a day is recalculated after it. The nightly job that recalculates open days at the cut-off comes with the deployment slice (Cloud Scheduler).
+- **Overlapping punch windows (OQ-C05-04):** each day's window is half-open and clipped by its neighbours, so no punch counts on two days. Two timed shifts split their overlap halfway between the first one's end and the next one's start; a timed shift keeps its whole window against an off day.
+- **Zone:** shift times, cut-off and `schedule_tz` use the zone of the branch punched at (D-04), else the master branch.
+- **Open shifts and shifts without set times** are hours-only days against their required minutes (DS-01 b), with no late or early.
+- **No result for a future date**, and none for a day with no schedule and no punches (nothing was expected).
+- **Slab ranges are raw minutes late** (default 11–120 with grace 10); LA-02 only changes the minutes reported.
+- **A day with no completed pair gets no late or early slab** on top of being absent (BR-04). MP half day sets the day to a half even from nothing; "absent if none" belongs to pairs-only (MP-03).
+- **A stored rule-group document that fails the newer typed checks** keeps that group's defaults instead of blocking punches (shortcut: no visible warning yet).
 - **A day with no policy version in force** gets no result (`day_result.policy_version_id` is required); the day shows `processing_state = exception`.
 
 ## Tasks

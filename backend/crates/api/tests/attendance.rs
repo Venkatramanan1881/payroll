@@ -136,3 +136,47 @@ async fn daily_view_scope_and_no_policy(pool: PgPool) {
     let (_, d) = day(&app2, &s2.hr_token, &w2, "2026-03-02").await;
     assert_eq!((d["processing_state"].as_str(), &d["current_result"]), (Some("exception"), &Value::Null), "no policy version: no result");
 }
+
+/// Review focus 5: a night shift (22:00-06:00) is one day, dated by its start; its 06:00 out never counts on the next day.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn night_shift_is_one_day_and_does_not_leak_into_the_next(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    let w = common::seed_worker(&pool, &app, &s, "Night").await;
+    org_policy(&app, &s).await;
+    let def = json!({ "shift_type": "night", "start_time": "22:00", "end_time": "06:00", "is_night_shift": true });
+    let (st, b, _) = common::call(&app, &s, "POST", "/v1/shifts", Some(json!({ "code": "N1", "name": "Night", "effective_from": "2026-01-01", "definition": def })), None).await;
+    assert_eq!(st, StatusCode::CREATED, "{b}");
+    let v = b["versions"][0]["id"].as_str().unwrap();
+    common::call(&app, &s, "POST", &format!("/v1/shift-versions/{v}/publish"), None, None).await;
+    let body = json!({ "employee_id": w.employee_id, "source": "fixed_shift", "shift_id": b["id"], "valid_from": "2026-01-01", "reason": "joining" });
+    assert_eq!(common::call(&app, &s, "POST", "/v1/employee-schedules", Some(body), None).await.0, StatusCode::CREATED);
+    // Mon 22:00 IST in, Tue 06:00 IST out.
+    manual(&app, &s, &w, &["2026-03-02T16:30:00Z", "2026-03-03T00:30:00Z"]).await;
+    let (_, mon) = day(&app, &s.hr_token, &w, "2026-03-02").await;
+    let r = &mon["current_result"];
+    assert_eq!((r["day_status"].as_str(), r["net_minutes"].as_i64(), r["late_mark"].as_bool()), (Some("present"), Some(420), Some(false)), "{mon}");
+    let (_, tue) = day(&app, &s.hr_token, &w, "2026-03-03").await;
+    assert_eq!(tue["current_result"]["punches_used"], json!([]), "Tuesday's night has not been worked: {tue}");
+    assert_eq!(tue["current_result"]["day_status"], "absent");
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn future_days_get_no_result_and_daily_filters_apply(pool: PgPool) {
+    let (s, app, w) = setup(&pool, true).await;
+    let today = (Utc::now() + chrono::Duration::minutes(330)).date_naive(); // India date
+    let body = json!({ "from": today, "to": today + chrono::Duration::days(5), "reason": "check", "branch_id": s.branch_id });
+    let (st, _) = common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/recalculations", Some(body), &[("idempotency-key", Uuid::new_v4().to_string())]).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let future: i64 = sqlx::query_scalar("SELECT count(*) FROM attendance.attendance_day WHERE attendance_date > (now() AT TIME ZONE 'Asia/Kolkata')::date")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(future, 0, "no absence is written for days not yet lived");
+
+    manual(&app, &s, &w, &["2026-03-02T03:30:00Z", "2026-03-02T12:30:00Z"]).await;
+    let get = |q: String| { let app = app.clone(); let t = s.hr_token.clone(); async move { common::as_user(&app, &t, "GET", &format!("/v1/attendance/daily?{q}"), None, &[]).await } };
+    let (_, rows) = get(format!("date=2026-03-02&branch_id={}&sort=-employee_code&processing_state=provisional", s.branch_id)).await;
+    assert_eq!(rows["items"].as_array().unwrap().len(), 1, "{rows}");
+    let (_, none) = get(format!("date=2026-03-02&branch_id={}", Uuid::new_v4())).await;
+    assert_eq!(none["items"], json!([]));
+    assert_eq!(get("date=2026-03-02&sort=name".into()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+}
