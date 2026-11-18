@@ -70,6 +70,11 @@ pub enum DomainError {
     PeriodLocked,
     /// A client key already used for something else (409).
     IdempotencyConflict,
+    /// A business rule refused the command (409) with its catalogue code, e.g. RULE_GROUP_DISABLED, LIMIT_EXCEEDED.
+    Refused(&'static str, String),
+    /// BR-07: nobody decides their own request.
+    SelfApproval,
+    Forbidden,
     Db(sqlx::Error),
 }
 

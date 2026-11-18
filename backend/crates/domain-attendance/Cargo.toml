@@ -9,6 +9,7 @@ engine = { path = "../engine" }
 domain-sched = { path = "../domain-sched" }
 domain-policy = { path = "../domain-policy" }
 domain-timecap = { path = "../domain-timecap" }
+domain-iam = { path = "../domain-iam" }
 sqlx.workspace = true
 uuid.workspace = true
 chrono.workspace = true

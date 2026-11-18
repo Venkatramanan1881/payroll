@@ -166,6 +166,9 @@ pub async fn put_document(tx: &mut OrgTx<'_>, actor: Uuid, version: Uuid, group:
     if group == "PC" {
         crate::pc::PcSettings::parse(&settings).map_err(invalid)?;
     }
+    if group == "RG" {
+        crate::rg::RgSettings::parse(&settings).map_err(invalid)?;
+    }
     let warnings = if engine::settings::GROUPS.contains(&group) {
         engine::settings::AttendanceSettings::default().apply(group, &settings).map_err(invalid)?
     } else {

@@ -8,6 +8,8 @@ use engine::settings::{AttendanceSettings, GROUPS};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+pub mod regularisation;
+
 /// Settings of a policy version for the engine. A switched-off LA, EC or BK group evaluates nothing (G2, BR-14);
 /// the other groups cannot be "off" for a day, so their defaults apply.
 pub async fn load_settings(tx: &mut OrgTx<'_>, version: Uuid) -> Result<AttendanceSettings, DomainError> {
@@ -169,12 +171,16 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
         window.1 = window.1.min(split(&cur, &n));
     }
 
-    // D-05c: a rejected flag, or a raised flag that does not count before its decision, keeps the punch out.
+    // A punch replaced by an approved correction stays as evidence but is left out (BR-01). D-05c: a rejected flag,
+    // or a raised flag that does not count before its decision, keeps the punch out.
     let rows: Vec<(Uuid, DateTime<Utc>, Option<String>)> = sqlx::query_as(
         "SELECT p.id, p.event_at,
-                (SELECT 'flag_' || f.reason || '_' || f.state FROM timecap.punch_flag f
-                 WHERE f.punch_id = p.id AND (f.state = 'rejected' OR (f.state = 'raised' AND NOT f.counts_before_decision))
-                 ORDER BY f.state DESC, f.reason LIMIT 1)
+                coalesce(
+                  (SELECT 'replaced_by_regularisation' FROM attendance.regularisation_request q
+                   WHERE q.target_raw_punch_id = p.id AND q.state = 'approved' LIMIT 1),
+                  (SELECT 'flag_' || f.reason || '_' || f.state FROM timecap.punch_flag f
+                   WHERE f.punch_id = p.id AND (f.state = 'rejected' OR (f.state = 'raised' AND NOT f.counts_before_decision))
+                   ORDER BY f.state DESC, f.reason LIMIT 1))
          FROM timecap.raw_punch p WHERE p.employee_id = $1 AND p.event_at >= $2 AND p.event_at < $3 ORDER BY p.event_at, p.id",
     )
     .bind(employee)
