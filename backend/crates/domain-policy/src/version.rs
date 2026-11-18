@@ -162,6 +162,9 @@ pub async fn get_document(tx: &mut OrgTx<'_>, version: Uuid, group: &str) -> Res
 /// Replaces one rule group's settings in a draft. A new group starts switched on.
 pub async fn put_document(tx: &mut OrgTx<'_>, actor: Uuid, version: Uuid, group: &str, schema_version: i32, settings: Value) -> Result<Value, DomainError> {
     check_document(group, &settings)?;
+    if group == "PC" {
+        crate::pc::PcSettings::parse(&settings).map_err(invalid)?;
+    }
     if schema_version < 1 {
         return Err(invalid("schema_version"));
     }

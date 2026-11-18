@@ -18,6 +18,9 @@ pub enum ApiError {
     IllegalTransition(String),
     IdempotencyConflict,
     EmployeeLimitReached,
+    /// E18: (rule_ref, attempt_id, message shown to the employee).
+    PunchRefused(String, uuid::Uuid, String),
+    SelfApprovalForbidden,
     /// Phone verified for several organisations: (choice token, [(candidate_ref, display_name)]).
     OrganisationChoiceRequired(String, Vec<(String, String)>),
     Internal(anyhow::Error),
@@ -37,6 +40,8 @@ impl ApiError {
             ApiError::PreconditionRequired => (StatusCode::PRECONDITION_REQUIRED, "PRECONDITION_REQUIRED", "Required header missing"),
             ApiError::IdempotencyConflict => (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT", "Idempotency-Key reused with a different body"),
             ApiError::EmployeeLimitReached => (StatusCode::CONFLICT, "EMPLOYEE_LIMIT_REACHED", "Employee limit reached"),
+            ApiError::PunchRefused(..) => (StatusCode::UNPROCESSABLE_ENTITY, "PUNCH_REFUSED", "Punch refused"),
+            ApiError::SelfApprovalForbidden => (StatusCode::FORBIDDEN, "SELF_APPROVAL_FORBIDDEN", "You cannot decide your own request"),
             ApiError::ValidationFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Request is not valid"),
             ApiError::OrganisationChoiceRequired(..) => (StatusCode::CONFLICT, "ORGANISATION_CHOICE_REQUIRED", "Choose an organisation"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Internal error"),
@@ -59,6 +64,11 @@ impl IntoResponse for ApiError {
         });
         match self {
             ApiError::ValidationFailed(detail) | ApiError::IllegalTransition(detail) => body["detail"] = json!(detail),
+            ApiError::PunchRefused(rule_ref, attempt_id, message) => {
+                body["rule_ref"] = json!(rule_ref);
+                body["attempt_id"] = json!(attempt_id);
+                body["detail"] = json!(message);
+            }
             ApiError::OrganisationChoiceRequired(choice_token, cands) => {
                 body["choice_token"] = json!(choice_token);
                 body["candidates"] = cands.iter().map(|(r, n)| json!({ "candidate_ref": r, "display_name": n })).collect();

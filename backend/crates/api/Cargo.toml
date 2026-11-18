@@ -16,6 +16,7 @@ domain-iam = { path = "../domain-iam" }
 domain-workforce = { path = "../domain-workforce" }
 domain-sched = { path = "../domain-sched" }
 domain-policy = { path = "../domain-policy" }
+domain-timecap = { path = "../domain-timecap" }
 chrono.workspace = true
 sha2 = "0.10"
 

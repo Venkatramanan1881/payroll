@@ -35,6 +35,7 @@ dependencies = [
  "domain-iam",
  "domain-policy",
  "domain-sched",
+ "domain-timecap",
  "domain-workforce",
  "http-body-util",
  "serde",
@@ -388,6 +389,19 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "db",
+ "serde_json",
+ "sqlx",
+ "uuid",
+]
+
+[[package]]
+name = "domain-timecap"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "db",
+ "domain-policy",
+ "domain-sched",
  "serde_json",
  "sqlx",
  "uuid",
