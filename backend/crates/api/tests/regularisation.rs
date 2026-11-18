@@ -198,3 +198,96 @@ async fn hr_correction_and_bulk_outage(pool: PgPool) {
     let (st, list) = common::as_user(&app, &w.token, "GET", "/v1/attendance/regularisation-requests", None, &[]).await;
     assert_eq!((st, list["items"].as_array().unwrap().len()), (StatusCode::OK, 1), "the employee sees their own request");
 }
+
+/// Review fix 1: approve/reject never reveals a request to someone who is not its decider.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn decided_requests_answer_only_to_their_decider(pool: PgPool) {
+    let (s, app, w, boss) = setup(&pool, None).await;
+    let d = yesterday();
+    let (_, r) = submit(&app, &w, json!({ "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at(d, "03:30"), "proposed_out_at": at(d, "12:30"), "reason": "x" })).await;
+    let id = r["id"].as_str().unwrap();
+    assert_eq!(post(&app, &boss.token, &format!("/v1/attendance/regularisation-requests/{id}/approve"), None).await.0, StatusCode::OK);
+    let stranger = common::seed_worker(&pool, &app, &s, "Ravi").await;
+    for action in ["approve", "reject"] {
+        let (st, b) = post(&app, &stranger.token, &format!("/v1/attendance/regularisation-requests/{id}/{action}"), Some(json!({ "reason": "x" }))).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{b}");
+    }
+    let (st, b) = common::as_user(&app, &stranger.token, "GET", &format!("/v1/attendance/regularisation-requests/{id}"), None, &[]).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{b}");
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn delegate_decides_and_is_recorded(pool: PgPool) {
+    let (s, app, w, boss) = setup(&pool, None).await;
+    let deputy = common::seed_worker(&pool, &app, &s, "Deputy").await;
+    grant(&pool, s.org_id, deputy.user_id, "ATT-03", "approve").await;
+    sqlx::query("INSERT INTO iam.delegation (org_id, approver_user_id, delegate_user_id, valid) VALUES ($1, $2, $3, tstzrange(now() - interval '1 day', NULL))")
+        .bind(s.org_id).bind(boss.user_id).bind(deputy.user_id).execute(&pool).await.unwrap();
+    let d = yesterday();
+    let (_, r) = submit(&app, &w, json!({ "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at(d, "03:30"), "proposed_out_at": at(d, "12:30"), "reason": "x" })).await;
+    let id = r["id"].as_str().unwrap();
+    let (_, queue) = common::as_user(&app, &deputy.token, "GET", "/v1/attendance/regularisation-requests/pending-approval", None, &[]).await;
+    assert_eq!(queue["items"].as_array().unwrap().len(), 1, "{queue}");
+    let (st, r) = post(&app, &deputy.token, &format!("/v1/attendance/regularisation-requests/{id}/approve"), None).await;
+    assert_eq!((st, r["state"].as_str()), (StatusCode::OK, Some("approved")), "{r}");
+    assert_eq!(r["approval_steps"][1]["on_behalf_of_user_id"], json!(boss.user_id));
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn auto_approve_block_limit_and_switched_off(pool: PgPool) {
+    let (s, app, w, _boss) = setup(&pool, Some(json!({ "RG-06": ["whole_day"], "RG-03": 1, "RG-08": "block", "RG-02": { "wrong_punch": false } }))).await;
+    let d = yesterday();
+    let whole = json!({ "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at(d, "03:30"), "proposed_out_at": at(d, "12:30"), "reason": "x" });
+    let (st, r) = submit(&app, &w, whole.clone()).await;
+    assert_eq!((st, r["state"].as_str(), r["decided_basis"].as_str()), (StatusCode::CREATED, Some("approved"), Some("auto_on_submit")), "{r}");
+    let actions: Vec<&str> = r["approval_steps"].as_array().unwrap().iter().map(|s| s["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, ["submitted", "auto_approved"]);
+    assert_eq!(day(&app, &s, &w, d).await["day_status"], "present");
+    let (st, b) = submit(&app, &w, whole).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("LIMIT_EXCEEDED")), "{b}");
+    let (st, b) = submit(&app, &w, json!({ "attendance_date": d, "request_type": "wrong_punch", "target_raw_punch_id": Uuid::new_v4(), "reason": "x" })).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("RULE_GROUP_DISABLED")), "{b}");
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn wrong_punch_target_must_be_on_the_day_and_whole_day_replaces_strays(pool: PgPool) {
+    let (s, app, w, boss) = setup(&pool, None).await;
+    let d = yesterday();
+    manual(&app, &s, &w, &[at(d - Duration::days(5), "03:30"), at(d, "03:40")]).await;
+    let old: Uuid = sqlx::query_scalar("SELECT id FROM timecap.raw_punch ORDER BY event_at LIMIT 1").fetch_one(&pool).await.unwrap();
+    let (st, _) = submit(&app, &w, json!({ "attendance_date": d, "request_type": "wrong_punch", "target_raw_punch_id": old, "reason": "x" })).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "a punch from another day cannot be targeted");
+
+    let (_, r) = submit(&app, &w, json!({ "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at(d, "03:30"), "proposed_out_at": at(d, "12:30"), "reason": "card" })).await;
+    let id = r["id"].as_str().unwrap();
+    post(&app, &boss.token, &format!("/v1/attendance/regularisation-requests/{id}/approve"), None).await;
+    let result = day(&app, &s, &w, d).await;
+    assert_eq!((result["day_status"].as_str(), result["late_minutes"].as_i64()), (Some("present"), Some(0)), "{result}");
+    assert!(result["punches_used"].as_array().unwrap().iter().any(|u| u["excluded_reason"] == "replaced_by_whole_day_correction"));
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn one_person_cannot_approve_both_levels_and_over_limit_needs_att05(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, Some(json!({ "RG-05": "two", "RG-03": 1 }))).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await; // no manager: level 1 goes to the HR pool
+    common::day_shift(&app, &s, w.employee_id).await;
+    let d = yesterday();
+    let whole = json!({ "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at(d, "03:30"), "proposed_out_at": at(d, "12:30"), "reason": "x" });
+    let (_, r) = submit(&app, &w, whole.clone()).await;
+    let id = r["id"].as_str().unwrap();
+    let (_, r) = post(&app, &s.hr_token, &format!("/v1/attendance/regularisation-requests/{id}/approve"), None).await;
+    assert_eq!(r["state"], "pending_l2", "{r}");
+    let (st, b) = post(&app, &s.hr_token, &format!("/v1/attendance/regularisation-requests/{id}/approve"), None).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("ILLEGAL_TRANSITION")), "{b}");
+
+    let (_, over) = submit(&app, &w, whole).await;
+    assert_eq!(over["state"], "pending_l2", "{over}");
+    let checker = common::seed_worker(&pool, &app, &s, "Checker").await;
+    grant(&pool, s.org_id, checker.user_id, "ATT-04", "scoped").await;
+    sqlx::query("INSERT INTO iam.user_scope (org_id, user_id, scope_kind) VALUES ($1, $2, 'all')").bind(s.org_id).bind(checker.user_id).execute(&pool).await.unwrap();
+    let oid = over["id"].as_str().unwrap();
+    assert_eq!(post(&app, &checker.token, &format!("/v1/attendance/regularisation-requests/{oid}/approve"), None).await.0, StatusCode::NOT_FOUND, "over-limit is ATT-05's");
+    assert_eq!(post(&app, &checker.token, &format!("/v1/attendance/regularisation-requests/{id}/approve"), None).await.0, StatusCode::OK, "a normal second level is ATT-04's");
+}

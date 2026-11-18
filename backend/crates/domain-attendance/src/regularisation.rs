@@ -78,13 +78,20 @@ async fn check_shape(tx: &mut OrgTx<'_>, r: &NewRequest, master: Uuid) -> Result
         }
     }
     if let Some(target) = r.target {
-        let own: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM timecap.raw_punch WHERE id = $1 AND employee_id = $2)")
-            .bind(target)
-            .bind(r.employee)
-            .fetch_one(&mut ***tx)
-            .await?;
+        // The disputed punch must be this employee's and belong to this day (or its edges), so a request can
+        // never reach into an old or locked day (RG-04).
+        let own: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM timecap.raw_punch WHERE id = $1 AND employee_id = $2
+                            AND (event_at AT TIME ZONE $4)::date BETWEEN $3::date - 1 AND $3::date + 1)",
+        )
+        .bind(target)
+        .bind(r.employee)
+        .bind(r.date)
+        .bind(&tz)
+        .fetch_one(&mut ***tx)
+        .await?;
         if !own {
-            return Err(invalid("target_raw_punch_id is not a punch of this employee"));
+            return Err(invalid("target_raw_punch_id is not a punch of this employee on attendance_date"));
         }
     }
     if let Some(path) = &r.attachment {
@@ -176,6 +183,12 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, r: NewRequest) -> Result<Uui
         return Err(refused("OUTSIDE_REQUEST_WINDOW", format!("requests are allowed for the last {} days and before the period is locked (RG-04)", s.window_days)));
     }
     // RG-03 per calendar month of the date. shortcut: calendar month, not the attendance cycle; switch when cycles are configurable.
+    // Two submissions at once must not both slip under the limit.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || to_char($2::date, 'YYYY-MM'), 0))")
+        .bind(r.employee)
+        .bind(r.date)
+        .execute(&mut ***tx)
+        .await?;
     let (overall, of_type): (i64, i64) = sqlx::query_as(
         "SELECT count(*), count(*) FILTER (WHERE request_type = $3) FROM attendance.regularisation_request
          WHERE employee_id = $1 AND origin = 'employee' AND state NOT IN ('rejected','cancelled')
@@ -186,7 +199,8 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, r: NewRequest) -> Result<Uui
     .bind(&r.request_type)
     .fetch_one(&mut ***tx)
     .await?;
-    let over = overall >= s.limit_overall || s.limit_per_type.get(&r.request_type).is_some_and(|l| of_type >= *l);
+    // A limit of 0 means no limit (RG-01 and RG-02 switch requests off).
+    let over = (s.limit_overall > 0 && overall >= s.limit_overall) || s.limit_per_type.get(&r.request_type).is_some_and(|l| *l > 0 && of_type >= *l);
     if over && s.over_limit_blocks {
         return Err(refused("LIMIT_EXCEEDED", "the regularisation limit for this period is reached (RG-03)"));
     }
@@ -285,6 +299,11 @@ async fn apply(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid) -> Result<(), DomainEr
         .await?;
     }
     crate::recalculate(tx, employee, date, "regularisation", Some(id)).await?;
+    if let Some(t) = replaced {
+        // The replaced punch may sit on the day's edge (a night shift): its own day is recalculated too.
+        let t_at: DateTime<Utc> = sqlx::query_scalar("SELECT event_at FROM timecap.raw_punch WHERE id = $1").bind(t).fetch_one(&mut ***tx).await?;
+        crate::recalculate_around(tx, employee, t_at, "regularisation", Some(id)).await?;
+    }
     Ok(())
 }
 
@@ -308,24 +327,34 @@ async fn lock(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Pending, DomainError> {
 
 /// Whether `p` may decide at `level`: Ok(Some(on_behalf_of)) when acting as a delegate (AC-03), Ok(None) as approver.
 /// Err(NotFound) out of scope, Err(Forbidden) in scope but not the routed approver.
-async fn may_decide(tx: &mut OrgTx<'_>, p: &Principal, employee: Uuid, level: i16, approver: Option<Uuid>) -> Result<Option<Uuid>, DomainError> {
-    let ops: &[&str] = if level == 1 { &["ATT-03"] } else { &["ATT-04", "ATT-05"] };
-    let mut grant = None;
-    for op in ops {
-        match require(tx, p, op).await {
-            Ok(g) => {
-                grant = Some(g);
-                break;
-            }
-            Err(AuthzError::Forbidden) => {}
-            Err(AuthzError::Db(e)) => return Err(e.into()),
-        }
-    }
-    let grant = grant.ok_or(DomainError::Forbidden)?;
+async fn may_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, employee: Uuid, level: i16, approver: Option<Uuid>) -> Result<Option<Uuid>, DomainError> {
+    // Level 2 reached over the limit (RG-08) is ATT-05's; a normal second level (RG-05) is ATT-04's.
+    let over_limit: bool = sqlx::query_scalar(
+        "SELECT coalesce(bool_or((after_value->>'over_limit')::boolean), false) FROM audit.audit_entry
+         WHERE target_type = 'regularisation_request' AND target_id = $1 AND action = 'regularisation.submit'",
+    )
+    .bind(id)
+    .fetch_one(&mut ***tx)
+    .await?;
+    let op = match (level, over_limit) {
+        (1, _) => "ATT-03",
+        (_, true) => "ATT-05",
+        _ => "ATT-04",
+    };
+    let grant = match require(tx, p, op).await {
+        Ok(g) => g,
+        Err(AuthzError::Forbidden) => return Err(DomainError::NotFound),
+        Err(AuthzError::Db(e)) => return Err(e.into()),
+    };
     match approver {
         Some(a) if a == p.user_id => Ok(None),
         Some(a) => {
-            let delegated: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM iam.delegation WHERE approver_user_id = $1 AND delegate_user_id = $2 AND valid @> now())")
+            // AC-03 off (organisation setting) means delegations are not honoured; the BRD gives no default, so on.
+            let delegated: bool = sqlx::query_scalar(
+                "SELECT coalesce((SELECT (settings->>'AC-03')::boolean FROM org.organisation_settings_version WHERE effective_from <= current_date
+                                  ORDER BY effective_from DESC LIMIT 1), true)
+                    AND EXISTS (SELECT 1 FROM iam.delegation WHERE approver_user_id = $1 AND delegate_user_id = $2 AND valid @> now())",
+            )
                 .bind(a)
                 .bind(p.user_id)
                 .fetch_one(&mut ***tx)
@@ -351,16 +380,36 @@ async fn may_decide(tx: &mut OrgTx<'_>, p: &Principal, employee: Uuid, level: i1
 /// SM-REQ R4/R5 (approve) and R6 (reject). The same decision again changes nothing.
 pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, note: Option<&str>) -> Result<(), DomainError> {
     let r = lock(tx, id).await?;
+    if p.user_id == r.requester || p.employee_id == Some(r.employee) {
+        return Err(DomainError::SelfApproval); // BR-07, delegates included
+    }
     let done = if approve { "approved" } else { "rejected" };
     let level: i16 = match r.state.as_str() {
         "pending_l1" => 1,
         "pending_l2" => 2,
-        s if s == done => return Ok(()),
-        s => return Err(DomainError::IllegalTransition(format!("request is {s}"))),
+        // A closed request answers only to whoever decided it (or, if cancelled, the approver it was waiting on).
+        s => {
+            let decider: Option<Uuid> = sqlx::query_scalar("SELECT coalesce(decided_by_user_id, current_approver_user_id) FROM attendance.regularisation_request WHERE id = $1").bind(id).fetch_one(&mut ***tx).await?;
+            if decider != Some(p.user_id) {
+                return Err(DomainError::NotFound);
+            }
+            return if s == done { Ok(()) } else { Err(DomainError::IllegalTransition(format!("request is {s}"))) };
+        }
     };
-    let on_behalf_of = may_decide(tx, p, r.employee, level, r.approver).await?;
-    if p.user_id == r.requester || p.employee_id == Some(r.employee) {
-        return Err(DomainError::SelfApproval); // BR-07, delegates included
+    let on_behalf_of = may_decide(tx, p, id, r.employee, level, r.approver).await?;
+    if level == 2 {
+        // SM-REQ: nobody approves a level twice; the second level is a second person.
+        let decided_l1: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM audit.audit_entry WHERE target_type = 'regularisation_request' AND target_id = $1
+                            AND action = 'regularisation.approve' AND actor_id = $2)",
+        )
+        .bind(id)
+        .bind(p.user_id)
+        .fetch_one(&mut ***tx)
+        .await?;
+        if decided_l1 {
+            return Err(DomainError::IllegalTransition("the first-level approver cannot also decide the second level".into()));
+        }
     }
     let note = note.map(str::trim).filter(|n| !n.is_empty());
     if !approve && note.is_none() {
@@ -410,7 +459,8 @@ pub async fn cancel(tx: &mut OrgTx<'_>, user: Uuid, id: Uuid, reason: Option<&st
         "pending_l1" | "pending_l2" => {}
         s => return Err(DomainError::IllegalTransition(format!("request is {s}"))),
     }
-    sqlx::query("UPDATE attendance.regularisation_request SET state = 'cancelled', current_approver_user_id = NULL, updated_at = now(), updated_by = $2 WHERE id = $1")
+    // The approver it was waiting on is kept: they may still ask about it (ILLEGAL_TRANSITION, not NOT_FOUND).
+    sqlx::query("UPDATE attendance.regularisation_request SET state = 'cancelled', updated_at = now(), updated_by = $2 WHERE id = $1")
         .bind(id)
         .bind(user)
         .execute(&mut ***tx)
@@ -482,10 +532,11 @@ const REQUEST_JSON: &str = "jsonb_build_object('id', q.id, 'employee_id', q.empl
     'proposed_in_at', q.proposed_in_at, 'proposed_out_at', q.proposed_out_at, 'target_raw_punch_id', q.target_raw_punch_id,
     'reason', q.reason, 'attachment', CASE WHEN q.attachment_path IS NOT NULL THEN jsonb_build_object('path', q.attachment_path) END,
     'requested_by_user_id', q.requested_by_user_id, 'decided_by_user_id', q.decided_by_user_id, 'decided_at', q.decided_at,
+    'decided_basis', q.decided_basis, 'current_approver_user_id', q.current_approver_user_id, 'submitted_at', q.created_at,
     'approval_steps', coalesce((SELECT jsonb_agg(jsonb_build_object('level', coalesce((a.after_value->>'level')::int, 1), 'action', a.after_value->>'action',
         'actor_user_id', CASE WHEN a.after_value->>'action' LIKE 'auto_%' THEN NULL ELSE a.actor_id END,
         'on_behalf_of_user_id', a.after_value->'on_behalf_of', 'comment', a.after_value->>'comment', 'acted_at', a.occurred_at)
-        ORDER BY a.occurred_at, a.id) FROM audit.audit_entry a WHERE a.target_type = 'regularisation_request' AND a.target_id = q.id), '[]'))";
+        ORDER BY a.occurred_at, CASE a.after_value->>'action' WHEN 'submitted' THEN 0 ELSE 1 END, a.id) FROM audit.audit_entry a WHERE a.target_type = 'regularisation_request' AND a.target_id = q.id), '[]'))";
 
 pub async fn get(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainError> {
     let sql = format!("SELECT {REQUEST_JSON} FROM attendance.regularisation_request q WHERE q.id = $1");
@@ -511,13 +562,39 @@ pub async fn list(tx: &mut OrgTx<'_>, f: &Filter) -> Result<Vec<Value>, DomainEr
     Ok(sqlx::query_scalar(&sql).bind(&f.employees).bind(&f.state).bind(&f.origin).bind(f.from).bind(f.to).fetch_all(&mut ***tx).await?)
 }
 
-// shortcut: checks each pending candidate in turn; fine for one organisation's queue, index it when queues grow.
-/// Pending requests the caller may decide now (never their own, BR-07).
+/// Whether the caller may decide this pending request now.
+pub async fn can_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<bool, DomainError> {
+    let row: Option<(Uuid, String, Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT employee_id, state, requested_by_user_id, current_approver_user_id FROM attendance.regularisation_request
+         WHERE id = $1 AND state IN ('pending_l1','pending_l2')",
+    )
+    .bind(id)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let Some((employee, state, requester, approver)) = row else { return Ok(false) };
+    if requester == p.user_id || p.employee_id == Some(employee) {
+        return Ok(false);
+    }
+    let level = if state == "pending_l1" { 1 } else { 2 };
+    match may_decide(tx, p, id, employee, level, approver).await {
+        Ok(_) => Ok(true),
+        Err(DomainError::NotFound | DomainError::Forbidden) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+// shortcut: the HR-pool rows are checked one by one for scope; index by branch when queues grow.
+/// Pending requests the caller may decide now (never their own, BR-07): routed to them, to someone who delegated
+/// to them, or to the HR pool.
 pub async fn pending_for(tx: &mut OrgTx<'_>, p: &Principal, level: Option<i16>) -> Result<Vec<Value>, DomainError> {
     let rows: Vec<(Uuid, Uuid, String, Uuid, Option<Uuid>)> = sqlx::query_as(
         "SELECT id, employee_id, state, requested_by_user_id, current_approver_user_id FROM attendance.regularisation_request
-         WHERE state IN ('pending_l1','pending_l2') ORDER BY created_at, id LIMIT 2000",
+         WHERE state IN ('pending_l1','pending_l2') AND requested_by_user_id <> $1
+           AND (current_approver_user_id IS NULL OR current_approver_user_id = $1
+                OR current_approver_user_id IN (SELECT approver_user_id FROM iam.delegation WHERE delegate_user_id = $1 AND valid @> now()))
+         ORDER BY created_at, id",
     )
+    .bind(p.user_id)
     .fetch_all(&mut ***tx)
     .await?;
     let mut out = Vec::new();
@@ -526,7 +603,7 @@ pub async fn pending_for(tx: &mut OrgTx<'_>, p: &Principal, level: Option<i16>) 
         if level.is_some_and(|w| w != l) || requester == p.user_id || p.employee_id == Some(employee) {
             continue;
         }
-        match may_decide(tx, p, employee, l, approver).await {
+        match may_decide(tx, p, id, employee, l, approver).await {
             Ok(_) => out.push(get(tx, id).await?),
             Err(DomainError::NotFound | DomainError::Forbidden) => {}
             Err(e) => return Err(e),

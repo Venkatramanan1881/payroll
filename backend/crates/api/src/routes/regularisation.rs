@@ -101,8 +101,7 @@ pub async fn get(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Val
         Err(ApiError::Forbidden) => false,
         Err(e) => return Err(e),
     };
-    let routed = reg::pending_for(&mut tx, &p, None).await?.iter().any(|r| r["id"] == body["id"]);
-    if visible || routed { Ok(Json(body)) } else { Err(ApiError::NotFound) }
+    if visible || reg::can_decide(&mut tx, &p, id).await? { Ok(Json(body)) } else { Err(ApiError::NotFound) }
 }
 
 #[derive(Deserialize)]

@@ -178,6 +178,12 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
                 coalesce(
                   (SELECT 'replaced_by_regularisation' FROM attendance.regularisation_request q
                    WHERE q.target_raw_punch_id = p.id AND q.state = 'approved' LIMIT 1),
+                  -- An approved whole-day correction stands for the whole day: only its own punches count.
+                  (SELECT 'replaced_by_whole_day_correction' FROM (
+                     SELECT q.id FROM attendance.regularisation_request q
+                     WHERE q.employee_id = p.employee_id AND q.attendance_date = $4 AND q.request_type = 'whole_day' AND q.state = 'approved'
+                     ORDER BY q.decided_at DESC, q.id LIMIT 1) w
+                   WHERE p.manual_approval_ref IS DISTINCT FROM w.id),
                   (SELECT 'flag_' || f.reason || '_' || f.state FROM timecap.punch_flag f
                    WHERE f.punch_id = p.id AND (f.state = 'rejected' OR (f.state = 'raised' AND NOT f.counts_before_decision))
                    ORDER BY f.state DESC, f.reason LIMIT 1))
@@ -186,6 +192,7 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
     .bind(employee)
     .bind(window.0)
     .bind(window.1)
+    .bind(date)
     .fetch_all(&mut ***tx)
     .await?;
     let existing: Option<Uuid> = sqlx::query_scalar("SELECT current_result_id FROM attendance.attendance_day WHERE employee_id = $1 AND attendance_date = $2")
