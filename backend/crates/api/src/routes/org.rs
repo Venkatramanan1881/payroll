@@ -34,7 +34,7 @@ async fn branch_in_scope(tx: &mut OrgTx<'_>, p: &Principal, op: &str, branch: Uu
 }
 
 /// Organisation-wide writes (x-scope: org): only a caller whose scope is the whole organisation.
-async fn require_org_wide(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<(), ApiError> {
+pub(crate) async fn require_org_wide(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<(), ApiError> {
     match require(tx, p, op).await?.scope {
         Scope::All => Ok(()),
         _ => Err(ApiError::Forbidden),

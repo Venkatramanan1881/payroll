@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub mod approval;
 pub mod jobs;
 pub mod leave;
+pub mod period;
 pub mod regularisation;
 
 /// Settings of a policy version for the engine. A switched-off LA, EC or BK group evaluates nothing (G2, BR-14);
@@ -266,6 +267,12 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
         .fetch_one(&mut ***tx)
         .await?;
         if same {
+            // After an unlock (SM-DAY A8) an unchanged day leaves `locked` for the state its inputs give.
+            sqlx::query("UPDATE attendance.attendance_day SET processing_state = $2, updated_at = now() WHERE id = $1 AND processing_state = 'locked'")
+                .bind(day_id)
+                .bind(compute_day(&input).state)
+                .execute(&mut ***tx)
+                .await?;
             return Ok(None);
         }
     }
