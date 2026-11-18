@@ -42,7 +42,7 @@ Every error is `application/problem+json` (RFC 9457), as defined by `Problem` in
 | `PUNCH_REFUSED` | 422 | Punch blocked; `rule_ref` is the setting that blocked it (PC-01 source off, PC-02 selfie/location required, PC-04, PC-05, PC-06, PC-09, PC-12, PC-13, PC-14, EM-07, MD-02 plan has no app) and is shown to the employee (E18). The refused attempt is recorded (`attempt_id`) | PC-xx |
 | `DEVICE_UNKNOWN` | 401 | Device push from an unregistered serial number | TSD §9.1 |
 | `DUPLICATE_PUNCH` | 200 (per item) | Offline batch item already stored; not an error for the batch | TSD §9.3 |
-| `PENDING_ITEMS_BLOCK_LOCK` | 409 | Lock refused because PL-05 = block and the checklist has items | PL-05 |
+| `PENDING_ITEMS_BLOCK_LOCK` | 409 | Lock refused because PL-05 = block and the checklist has items. `errors` lists the blocking ChecklistItems (period.yaml), not field errors | PL-05 |
 | `UNLOCK_NOT_ALLOWED` | 409 | PL-06 = never | PL-06 |
 | `CONFLICTING_SETTINGS` | 409 | Saving settings that conflict where the BRD requires a refusal | K4 |
 | `SETTINGS_WARNING` | 200 (warning list) | Settings saved, with warnings (e.g. PD/LA overlap, §10.3.4) | K4 |

@@ -84,6 +84,7 @@ Until the OIDC upgrade (§5), the job secret is the only gate: Cloud Run IAM wou
 |---|---|---|
 | J1 nightly recalculation | `0 3 * * *` | `POST /internal/jobs/nightly-recalculation` |
 | J3 approval timeouts | `0 * * * *` | `POST /internal/jobs/approval-timeouts` |
+| J7 period housekeeping | `30 0 * * *` | `POST /internal/jobs/period-housekeeping` |
 
 - Requests go to the `payroll-jobs` service and carry the job secret as `Authorization: Bearer $JOB_SECRET`.
 - Set the scheduler's attempt deadline to 30 minutes (`--attempt-deadline 1800s`), matching the service timeout. One request walks every organisation in turn: J1 uses one short transaction per employee, J3 one per organisation with a savepoint per request, and one organisation's failure is reported without stopping the rest.
@@ -91,7 +92,7 @@ Until the OIDC upgrade (§5), the job secret is the only gate: Cloud Run IAM wou
 - Both jobs are idempotent, so a retried or doubled run changes nothing more:
   - J1 writes nothing when inputs are unchanged;
   - J3 escalates once per level.
-- The other jobs in TSD §10 (J2, J4–J12) arrive with their slices.
+- The other jobs in TSD §10 (J2, J4–J6, J8–J12) arrive with their slices.
 - Planned upgrade: replace the shared secret with Cloud Scheduler OIDC tokens checked for the service's audience.
 
 ## 6. Release checklist

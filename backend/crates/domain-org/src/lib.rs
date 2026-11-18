@@ -349,9 +349,9 @@ pub async fn retire_contractor(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid) -> Res
 // ---------------------------------------------------------------------------------------------------------------------
 // Organisation settings (OR-01..04, EM-01..08), append-only versions (G5, G9)
 
-/// Access settings (AC-03..08) live in the same document under their own keys (identity.yaml AccessSettings);
-/// an organisation-settings version carries them forward unchanged.
-const ACCESS_KEYS: [&str; 5] = ["delegation_enabled", "settings_change_mode", "custom_roles_enabled", "admin_second_step", "employee_visibility"];
+/// Access settings (AC-03..08) and period settings (`period`, PL-03..07) live in the same document under their own keys
+/// (identity.yaml AccessSettings, period.yaml PeriodSettings); an organisation-settings version carries them forward unchanged.
+const ACCESS_KEYS: [&str; 6] = ["delegation_enabled", "settings_change_mode", "custom_roles_enabled", "admin_second_step", "employee_visibility", "period"];
 
 fn one_of(v: &Value, key: &str, allowed: &[&str]) -> Result<(), String> {
     match v.get(key).and_then(Value::as_str) {
@@ -422,7 +422,7 @@ fn version_json(row_alias: &str) -> String {
     let a = row_alias;
     format!(
         "jsonb_build_object('id', {a}.id, 'effective_from', {a}.effective_from, 'schema_version', {a}.schema_version,
-           'settings', {a}.settings - ARRAY['delegation_enabled','settings_change_mode','custom_roles_enabled','admin_second_step','employee_visibility'],
+           'settings', {a}.settings - ARRAY['delegation_enabled','settings_change_mode','custom_roles_enabled','admin_second_step','employee_visibility','period'],
            'reason', {a}.reason, 'created_at', {a}.created_at, 'created_by', {a}.created_by)"
     )
 }
