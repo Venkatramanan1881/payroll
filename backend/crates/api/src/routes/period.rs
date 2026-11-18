@@ -168,7 +168,7 @@ pub async fn request_unlock(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers
 
 /// GET /v1/periods/{id}/unlock-requests (PER-08).
 pub async fn list_unlocks(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
-    require(&mut tx, &p, "PER-08").await?;
+    require_org_wide(&mut tx, &p, "PER-08").await?; // x-scope: org
     Ok(Json(json!({ "items": period::list_unlocks(&mut tx, id).await?, "next_cursor": null })))
 }
 

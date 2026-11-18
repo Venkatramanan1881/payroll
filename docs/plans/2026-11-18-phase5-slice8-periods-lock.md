@@ -17,7 +17,7 @@
 - **Cycles (PER-01, AC-C12-01):**
   - Monthly only in V1; other frequencies → 422.
   - Calendar month, or a custom start day (e.g. 26th → 25th). A start day beyond a month's length uses that month's last day.
-  - Optional cut-off day (PL-02); the period's cut-off date is that day inside the period, clamped to the period.
+  - Optional cut-off day (PL-02); the period's cut-off date is the last date inside the period carrying that day number (26th-25th with cut-off 20 → the 20th of the end month; cut-off 28 → 28th of the start month). Clamped to the period.
   - **Owner:** `organisation` only. `branch` and `policy_set` → 422 until DP-01 is answered: their lock coverage depends on that answer.
   - Cycles of one owner never overlap (database exclusion → 422).
   - Creating a cycle generates its periods from `valid_from` through the period containing today (P1).
@@ -90,7 +90,18 @@
 4. Checklist and totals respect branch scope; nothing crosses organisations.
 5. Housekeeping is idempotent and dates are the organisation's (India) dates.
 
+## Review fixes
+- Absences still inside their DS-10 waiting days (`absence_pending`) are checklist `flagged_day` items, so PL-05 governs them (SM-DAY A7).
+- Every day of a multi-day pending leave is treated under PL-05, not only its first day.
+- A raised punch flag is dated by the attendance day whose result uses the punch (night shifts).
+- An employee cannot be created with a joining date in or before a locked period (BR-06, PERIOD_LOCKED).
+- Period settings cannot be changed while a later-dated organisation-settings version exists (it would undo the change): 409 ILLEGAL_TRANSITION.
+- Unlock-request lists are organisation-wide (x-scope: org).
+
 ## Not in this slice (next: slice 9)
+- PL-03 (days after the cut-off) is stored but not yet applied to totals; it belongs with adjustments (OQ-C12-02).
+- Effects measured only in minutes (DS-05 "deduct actual minutes") are not totalled; late and early minutes are.
+- Totals and checklist filters (branch, department) and paging beyond scope.
 - Period adjustments after lock (PL-R4, E15, SM-ADJ) and the recalculation path that measures them.
 - The payroll input export (MD-06) with its file and signed download link. This needs a storage decision (Supabase Storage bucket and signed URLs).
 - The automatic lock job (OQ-C12-08).

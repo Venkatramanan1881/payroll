@@ -20,10 +20,15 @@ fn month_start(back: i32) -> NaiveDate {
 }
 
 async fn org_policy(app: &axum::Router, s: &common::SeedOrg) {
+    policy_waiting(app, s, 0).await
+}
+
+/// DS-10: loss of pay at once (0), or absences left pending for `pending_days` waiting days.
+async fn policy_waiting(app: &axum::Router, s: &common::SeedOrg, pending_days: i64) {
     let (_, set, _) = common::call(app, s, "POST", "/v1/policy-sets", Some(json!({ "name": "Default", "effective_from": "2026-01-01" })), None).await;
     let v = set["versions"][0]["id"].as_str().unwrap().to_string();
     let (_, _, etag) = common::call(app, s, "GET", &format!("/v1/policy-versions/{v}"), None, None).await;
-    let doc = json!({ "schema_version": 1, "settings": { "DS-10": { "action": "loss_of_pay", "pending_days": 0 } } });
+    let doc = json!({ "schema_version": 1, "settings": { "DS-10": { "action": if pending_days > 0 { "pending" } else { "loss_of_pay" }, "pending_days": pending_days } } });
     let (st, b, _) = common::call(app, s, "PUT", &format!("/v1/policy-versions/{v}/rule-groups/DS"), Some(doc), etag.as_deref()).await;
     assert_eq!(st, StatusCode::OK, "{b}");
     common::call(app, s, "POST", &format!("/v1/policy-versions/{v}/publish"), None, None).await;
@@ -154,6 +159,88 @@ async fn lock_blocks_on_pending_then_freezes_days_and_totals(pool: PgPool) {
     assert_eq!(results, 3);
     let (_, snap) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/periods/{last}/checklist"), None, &[]).await;
     assert_eq!((snap["is_snapshot"].as_bool(), snap["counts"]["pending_request"].as_i64()), (Some(true), Some(1)), "{snap}");
+
+    // BR-06: nobody can be hired into the locked month afterwards.
+    let late = json!({ "full_name": "Ravi", "joining_date": first + Duration::days(3), "employment_status": "active", "master_branch_id": s.branch_id });
+    let (st, b) = common::as_user(&app, &s.hr_token, "POST", "/v1/employees", Some(late), &key()).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("PERIOD_LOCKED")), "{b}");
+    // AC-C12-04.9: another organisation's periods are untouched.
+    let other = common::seed_org(&pool).await;
+    let (_, theirs) = common::as_user(&app, &other.hr_token, "GET", "/v1/periods", None, &[]).await;
+    assert_eq!(theirs["items"], json!([]));
+}
+
+/// Review fix: absences still waiting under DS-10, and every day of a multi-day pending leave, are pending items (PL-05).
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn waiting_absences_and_multi_day_leave_are_pending(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    policy_waiting(&app, &s, 60).await;
+    org_settings(&pool, s.org_id).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let (last, _) = periods(&app, &s).await;
+    let first = month_start(1);
+    // The last two days of the month: always within the 60 waiting days.
+    let end = month_start(0) - Duration::days(1);
+    let body = json!({ "from": end - Duration::days(1), "to": end, "employee_ids": [w.employee_id], "reason": "check" });
+    common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/recalculations", Some(body), &key()).await;
+    let version = json!({ "effective_from": "2026-01-01", "reason": "setup", "paid": false, "eligibility": {}, "credit_method": "annual_grant",
+        "accrual_timing": "end", "proration": "none", "year_end": "lapse", "negative_allowed_days": "0.00", "half_day_allowed": true, "min_notice_days": 0,
+        "approval_levels": "manager", "timeout_days": 30, "timeout_action": "escalate", "during_notice": "allow", "combine_allowed": true });
+    let (st, t, _) = common::call(&app, &s, "POST", "/v1/leave/types", Some(json!({ "code": "UL", "name": "Unpaid", "version": version })), None).await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    let leave = Uuid::new_v4();
+    let from = first + Duration::days(10);
+    sqlx::query("INSERT INTO leave.leave_request (org_id, id, employee_id, leave_type_id, from_date, to_date, state, requested_by) VALUES ($1, $2, $3, $4, $5, $6, 'pending_l1', $7)")
+        .bind(s.org_id).bind(leave).bind(w.employee_id).bind(t["id"].as_str().unwrap().parse::<Uuid>().unwrap()).bind(from).bind(from + Duration::days(2)).bind(w.user_id)
+        .execute(&pool).await.unwrap();
+    for n in 0..3 {
+        sqlx::query("INSERT INTO leave.leave_request_day (org_id, leave_request_id, leave_date, fraction) VALUES ($1, $2, $3, 1.0)")
+            .bind(s.org_id).bind(leave).bind(from + Duration::days(n)).execute(&pool).await.unwrap();
+    }
+    let (_, list) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/periods/{last}/checklist"), None, &[]).await;
+    assert_eq!((list["counts"]["flagged_day"].as_i64(), list["counts"]["pending_request"].as_i64()), (Some(2), Some(1)), "{list}");
+    let (st, b) = common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await;
+    assert_eq!((st, b["errors"].as_array().map(Vec::len)), (StatusCode::CONFLICT, Some(3)), "{b}");
+    assert_eq!(patch_settings(&app, &s, json!({ "pending_at_lock": "allow_as_absent", "reason": "close" })).await.0, StatusCode::OK);
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await.0, StatusCode::OK);
+    let (_, t) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/periods/{last}/totals"), None, &[]).await;
+    assert_eq!(t["items"][0]["deduction_days"], "5.00", "two waiting absences and three leave days: {t}");
+}
+
+/// PL-05 allow-as-present: a pending day carries no deduction. Period settings cannot change under a later version.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn pending_days_counted_as_present(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s).await;
+    org_settings(&pool, s.org_id).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let (last, _) = periods(&app, &s).await;
+    let first = month_start(1);
+    let body = json!({ "from": first, "to": first + Duration::days(2), "employee_ids": [w.employee_id], "reason": "check" });
+    common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/recalculations", Some(body), &key()).await;
+    sqlx::query(
+        "INSERT INTO attendance.regularisation_request (org_id, employee_id, attendance_date, request_type, proposed_in_at, proposed_out_at, reason, requested_by_user_id)
+         VALUES ($1, $2, $3, 'whole_day', $4, $5, 'x', $6)",
+    )
+    .bind(s.org_id).bind(w.employee_id).bind(first)
+    .bind(first.and_hms_opt(3, 30, 0).unwrap().and_utc()).bind(first.and_hms_opt(12, 30, 0).unwrap().and_utc()).bind(w.user_id)
+    .execute(&pool).await.unwrap();
+    assert_eq!(patch_settings(&app, &s, json!({ "pending_at_lock": "allow_as_present", "reason": "close" })).await.0, StatusCode::OK);
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await.0, StatusCode::OK);
+    let (_, t) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/periods/{last}/totals"), None, &[]).await;
+    assert_eq!(t["items"][0]["deduction_days"], "2.00", "the pending day is counted present: {t}");
+
+    let other = common::seed_org(&pool).await;
+    org_settings(&pool, other.org_id).await;
+    sqlx::query("INSERT INTO org.organisation_settings_version (org_id, effective_from, settings, schema_version) SELECT org_id, current_date + 30, settings, 1 FROM org.organisation_settings_version WHERE org_id = $1")
+        .bind(other.org_id).execute(&pool).await.unwrap();
+    let (_, _, etag) = common::call(&app, &other, "GET", "/v1/period/settings", None, None).await;
+    let (st, b, _) = common::call(&app, &other, "PATCH", "/v1/period/settings", Some(json!({ "unlock": "with_org_admin_approval", "reason": "x" })), etag.as_deref()).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("ILLEGAL_TRANSITION")), "a scheduled version would undo it: {b}");
 }
 
 /// Review focus 3: PL-06 never refuses; the requester never approves; approval unlocks and re-evaluates the days.
@@ -212,6 +299,13 @@ async fn unlock_needs_someone_else_and_reopens_the_days(pool: PgPool) {
     assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await.0, StatusCode::OK, "P8: lock again");
     let frozen: i64 = sqlx::query_scalar("SELECT count(*) FROM period.period_totals").fetch_one(&pool).await.unwrap();
     assert_eq!(frozen, 2, "each lock freezes its own totals; the first stay as history");
+
+    let (_, again) = common::as_user(&app, &s.hr_token, "POST", &uri, Some(json!({ "reason": "second look" })), &key()).await;
+    let reject = format!("/v1/period/unlock-requests/{}/reject", again["id"].as_str().unwrap());
+    let (st, r) = common::as_user(&app, &oa, "POST", &reject, Some(json!({ "reason": "not needed" })), &key()).await;
+    assert_eq!((st, r["state"].as_str()), (StatusCode::OK, Some("rejected")), "{r}");
+    let (_, p) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/periods/{last}"), None, &[]).await;
+    assert_eq!(p["state"], "locked", "a rejection leaves the period locked");
 }
 
 /// Review focus 4: a branch-scoped reader sees only their branch's employees in the checklist and totals.

@@ -112,6 +112,15 @@ pub async fn create_employee(tx: &mut OrgTx<'_>, actor: Uuid, input: EmployeeCre
         (_, None) => next_code(tx, input.master_branch_id).await?,
     };
 
+    // BR-06: a joining date inside (or before) a locked period would put new days into frozen attendance.
+    let locked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM period.attendance_period WHERE state = 'locked' AND period_end >= $1)")
+        .bind(input.joining_date)
+        .fetch_one(&mut ***tx)
+        .await?;
+    if locked {
+        return Err(WorkforceError::PeriodLocked);
+    }
+
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO workforce.employee (org_id, id, employee_code, full_name, date_of_birth, mobile, email, address,

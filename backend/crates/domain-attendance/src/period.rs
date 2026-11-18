@@ -299,6 +299,14 @@ pub async fn change_settings(tx: &mut OrgTx<'_>, actor: Uuid, changes: Map<Strin
     if from == today {
         return Err(DomainError::VersionFrozen); // versions are append-only: one change per day
     }
+    // A later version already exists and would silently bring the old period settings back on its date.
+    let later: Option<NaiveDate> = sqlx::query_scalar("SELECT min(effective_from) FROM org.organisation_settings_version WHERE effective_from > $1")
+        .bind(today)
+        .fetch_one(&mut ***tx)
+        .await?;
+    if let Some(d) = later {
+        return Err(DomainError::IllegalTransition(format!("an organisation-settings version from {d} is already scheduled; change the period settings after it takes effect")));
+    }
     let mut period = doc.get("period").and_then(Value::as_object).cloned().unwrap_or_default();
     period.extend(changes);
     let merged: Map<String, Value> = defaults().into_iter().map(|(k, v)| (k.clone(), period.get(&k).cloned().unwrap_or(v))).collect();
@@ -370,12 +378,19 @@ async fn live_items(tx: &mut OrgTx<'_>, from: NaiveDate, to: NaiveDate, emps: &[
            SELECT 'pending_request', q.employee_id, q.attendance_date, 'regularisation', q.id FROM attendance.regularisation_request q
             WHERE q.state IN ('pending_l1','pending_l2') AND q.attendance_date BETWEEN $1 AND $2
            UNION
+           -- An absence still inside its DS-10 waiting days is unsettled too (SM-DAY A7).
            SELECT 'flagged_day', d.employee_id, d.attendance_date, NULL, NULL FROM attendance.attendance_day d
-            WHERE d.processing_state = 'exception' AND d.attendance_date BETWEEN $1 AND $2
+            WHERE d.processing_state IN ('exception','absence_pending') AND d.attendance_date BETWEEN $1 AND $2
            UNION
-           SELECT 'flagged_day', p.employee_id, (p.event_at AT TIME ZONE 'Asia/Kolkata')::date, 'punch_flag', f.id
-             FROM timecap.punch_flag f JOIN timecap.raw_punch p ON p.id = f.punch_id
-            WHERE f.state = 'raised' AND (p.event_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $1 AND $2
+           -- A raised punch flag belongs to the attendance day whose result uses the punch (a night shift's morning
+           -- punch is the previous day's); a punch no result uses yet falls back to its India date.
+           SELECT 'flagged_day', x.employee_id, x.date, 'punch_flag', x.id FROM (
+             SELECT p.employee_id, f.id, coalesce(
+                      (SELECT ad.attendance_date FROM attendance.day_result_punch rp
+                         JOIN attendance.attendance_day ad ON ad.current_result_id = rp.result_id WHERE rp.raw_punch_id = p.id LIMIT 1),
+                      (p.event_at AT TIME ZONE 'Asia/Kolkata')::date) AS date
+               FROM timecap.punch_flag f JOIN timecap.raw_punch p ON p.id = f.punch_id WHERE f.state = 'raised') x
+            WHERE x.date BETWEEN $1 AND $2
            UNION
            SELECT 'unresolved_missed_punch', d.employee_id, d.attendance_date, NULL, NULL
              FROM attendance.attendance_day d JOIN attendance.day_result r ON r.id = d.current_result_id
@@ -432,7 +447,31 @@ enum Pending {
     Present,
 }
 
+/// Every (employee, date) a checklist item stands for: each day of a pending leave, the date of every other item.
+async fn pending_dates(tx: &mut OrgTx<'_>, from: NaiveDate, to: NaiveDate, items: &[Value]) -> Result<Vec<(String, String)>, DomainError> {
+    let mut out: Vec<(String, String)> = items
+        .iter()
+        .filter(|i| i["request_type"] != "leave")
+        .map(|i| (i["employee_id"].as_str().unwrap_or("").to_string(), i["date"].as_str().unwrap_or("").to_string()))
+        .collect();
+    let leaves: Vec<Uuid> = items.iter().filter(|i| i["request_type"] == "leave").filter_map(|i| i["request_id"].as_str()?.parse().ok()).collect();
+    let days: Vec<(Uuid, NaiveDate)> = sqlx::query_as(
+        "SELECT q.employee_id, d.leave_date FROM leave.leave_request q JOIN leave.leave_request_day d ON d.leave_request_id = q.id
+         WHERE q.id = ANY($1) AND d.leave_date BETWEEN $2 AND $3",
+    )
+    .bind(&leaves)
+    .bind(from)
+    .bind(to)
+    .fetch_all(&mut ***tx)
+    .await?;
+    out.extend(days.into_iter().map(|(e, d)| (e.to_string(), d.to_string())));
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// Totals per employee from the current day results and their effects (BR-08: lines carry the result ids).
+// shortcut: effects measured only in minutes (DS-05 "deduct actual minutes") are not totalled; add a minutes line when PayrollInput v1 carries one.
 async fn compute(tx: &mut OrgTx<'_>, period: Uuid, from: NaiveDate, to: NaiveDate, scope: &ScopeFilter, pending: Pending, items: &[Value]) -> Result<Vec<Value>, DomainError> {
     let emps = employees(tx, from, to, scope).await?;
     let ids: Vec<Uuid> = emps.iter().map(|e| e.0).collect();
@@ -450,7 +489,7 @@ async fn compute(tx: &mut OrgTx<'_>, period: Uuid, from: NaiveDate, to: NaiveDat
     .bind(&ids)
     .fetch_all(&mut ***tx)
     .await?;
-    let pending_days: Vec<(String, String)> = items.iter().map(|i| (i["employee_id"].as_str().unwrap_or("").to_string(), i["date"].as_str().unwrap_or("").to_string())).collect();
+    let pending_days = pending_dates(tx, from, to, items).await?;
     let is_pending = |e: Uuid, d: NaiveDate| pending != Pending::Leave && pending_days.contains(&(e.to_string(), d.to_string()));
 
     let mut out = Vec::with_capacity(emps.len());
