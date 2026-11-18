@@ -28,8 +28,9 @@ pub struct LocationIn {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileRef {
-    path: String,
+    pub(crate) path: String,
 }
 
 /// PunchCapture. There is no inside/outside or distance field: unknown fields are refused (AC-C04-11.1).

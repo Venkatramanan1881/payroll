@@ -21,6 +21,8 @@ pub enum ApiError {
     /// E18: (rule_ref, attempt_id, message shown to the employee).
     PunchRefused(String, uuid::Uuid, String),
     SelfApprovalForbidden,
+    /// 409 with a catalogue code from ERROR_CATALOG.md and a detail.
+    Refused(&'static str, String),
     /// Phone verified for several organisations: (choice token, [(candidate_ref, display_name)]).
     OrganisationChoiceRequired(String, Vec<(String, String)>),
     Internal(anyhow::Error),
@@ -41,6 +43,7 @@ impl ApiError {
             ApiError::IdempotencyConflict => (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT", "Idempotency-Key reused with a different body"),
             ApiError::EmployeeLimitReached => (StatusCode::CONFLICT, "EMPLOYEE_LIMIT_REACHED", "Employee limit reached"),
             ApiError::PunchRefused(..) => (StatusCode::UNPROCESSABLE_ENTITY, "PUNCH_REFUSED", "Punch refused"),
+            ApiError::Refused(code, _) => (StatusCode::CONFLICT, *code, "Not allowed by the organisation's rules"),
             ApiError::SelfApprovalForbidden => (StatusCode::FORBIDDEN, "SELF_APPROVAL_FORBIDDEN", "You cannot decide your own request"),
             ApiError::ValidationFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Request is not valid"),
             ApiError::OrganisationChoiceRequired(..) => (StatusCode::CONFLICT, "ORGANISATION_CHOICE_REQUIRED", "Choose an organisation"),
@@ -63,7 +66,7 @@ impl IntoResponse for ApiError {
             "correlation_id": uuid::Uuid::new_v4(),
         });
         match self {
-            ApiError::ValidationFailed(detail) | ApiError::IllegalTransition(detail) => body["detail"] = json!(detail),
+            ApiError::ValidationFailed(detail) | ApiError::IllegalTransition(detail) | ApiError::Refused(_, detail) => body["detail"] = json!(detail),
             ApiError::PunchRefused(rule_ref, attempt_id, message) => {
                 body["rule_ref"] = json!(rule_ref);
                 body["attempt_id"] = json!(attempt_id);
@@ -116,6 +119,9 @@ impl From<db::DomainError> for ApiError {
             D::VersionFrozen => ApiError::VersionFrozen,
             D::PeriodLocked => ApiError::PeriodLocked,
             D::IdempotencyConflict => ApiError::IdempotencyConflict,
+            D::Refused(code, detail) => ApiError::Refused(code, detail),
+            D::SelfApproval => ApiError::SelfApprovalForbidden,
+            D::Forbidden => ApiError::Forbidden,
             D::Db(e) => e.into(),
         }
     }

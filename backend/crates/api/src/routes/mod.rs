@@ -4,3 +4,4 @@ pub mod employees;
 pub mod policy;
 pub mod sched;
 pub mod punches;
+pub mod regularisation;

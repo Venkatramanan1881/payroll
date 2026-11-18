@@ -89,7 +89,7 @@ pub async fn seed_org(pool: &PgPool) -> SeedOrg {
         .bind(org_id).bind(hr_user_id).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name, system_code) VALUES ($1, $2, 'HR Manager', 'hr_manager')")
         .bind(org_id).bind(role_id).execute(pool).await.unwrap();
-    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07", "TCP-11", "CMP-01", "TCP-04", "TCP-06", "TCP-07", "TCP-08", "TCP-09", "ATT-01", "ATT-06"] {
+    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07", "TCP-11", "CMP-01", "TCP-04", "TCP-06", "TCP-07", "TCP-08", "TCP-09", "ATT-01", "ATT-06", "ATT-03", "ATT-04", "ATT-05"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')")
             .bind(org_id).bind(role_id).bind(op).execute(pool).await.unwrap();
     }
@@ -141,7 +141,7 @@ pub async fn seed_worker(pool: &PgPool, app: &axum::Router, s: &SeedOrg, name: &
         .bind(s.org_id).bind(user_id).bind(employee_id).bind(format!("+91{}", 6_000_000_000u64 + (user_id.as_u128() % 1_000_000_000) as u64))
         .execute(pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name) VALUES ($1, $2, $3)").bind(s.org_id).bind(role_id).bind(format!("Employee {role_id}")).execute(pool).await.unwrap();
-    for op in ["TCP-03", "TCP-07", "TCP-09", "ATT-01"] {
+    for op in ["TCP-03", "TCP-07", "TCP-09", "ATT-01", "ATT-02"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'self')")
             .bind(s.org_id).bind(role_id).bind(op).execute(pool).await.unwrap();
     }
