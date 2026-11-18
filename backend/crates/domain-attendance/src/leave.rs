@@ -37,7 +37,7 @@ fn check_version(v: &Map<String, Value>) -> Result<(), DomainError> {
     if let Some(k) = v.keys().find(|k| !VERSION_FIELDS.contains(&k.as_str())) {
         return Err(invalid(format!("unknown field {k}")));
     }
-    if let Some(k) = REQUIRED.iter().find(|k| !v.contains_key(**k)) {
+    if let Some(k) = REQUIRED.iter().find(|k| v.get(**k).is_none_or(Value::is_null)) {
         return Err(invalid(format!("{k} is required")));
     }
     if v["reason"].as_str().is_none_or(|r| r.trim().is_empty()) {
@@ -164,12 +164,13 @@ pub struct Version {
 
 type VersionRow = (bool, Value, i64, bool, i32, Option<i64>, Option<i32>, Option<i64>, String, bool);
 
+/// Includes retired types: requests already raised can still be decided; submission refuses retired types itself.
 pub async fn version_on(tx: &mut OrgTx<'_>, leave_type: Uuid, date: NaiveDate) -> Result<Option<Version>, DomainError> {
     let row: Option<VersionRow> = sqlx::query_as(
         "SELECT v.paid, v.eligibility, (v.negative_allowed_days * 100)::int8, v.half_day_allowed, v.min_notice_days, (v.max_consecutive_days * 100)::int8,
                 v.after_event_days, (v.document_after_days * 100)::int8, v.approval_levels, v.combine_allowed
          FROM leave.leave_type_version v JOIN leave.leave_type t ON t.id = v.leave_type_id
-         WHERE v.leave_type_id = $1 AND v.effective_from <= $2 AND t.retired_at IS NULL ORDER BY v.effective_from DESC LIMIT 1",
+         WHERE v.leave_type_id = $1 AND v.effective_from <= $2 ORDER BY v.effective_from DESC LIMIT 1",
     )
     .bind(leave_type)
     .bind(date)
@@ -240,11 +241,21 @@ pub async fn balance_pct(tx: &mut OrgTx<'_>, account: Uuid) -> Result<i64, Domai
     Ok(sqlx::query_scalar("SELECT coalesce((sum(quantity) * 100)::int8, 0) FROM leave.leave_ledger_entry WHERE account_id = $1").bind(account).fetch_one(&mut ***tx).await?)
 }
 
+/// Balances per active type. Missing accounts are opened (the caller commits), so every row carries its account.
 pub async fn balances(tx: &mut OrgTx<'_>, employee: Uuid, on: Option<NaiveDate>) -> Result<Vec<Value>, DomainError> {
+    sqlx::query(
+        "INSERT INTO leave.leave_account (org_id, employee_id, leave_type_id)
+         SELECT app.current_org(), $1, t.id FROM leave.leave_type t WHERE t.retired_at IS NULL ON CONFLICT DO NOTHING",
+    )
+    .bind(employee)
+    .execute(&mut ***tx)
+    .await?;
     Ok(sqlx::query_scalar(
         "SELECT jsonb_build_object('leave_type_id', t.id, 'leave_type_name', t.name, 'account_id', a.id,
-           'balance', to_char(coalesce((SELECT sum(e.quantity) FROM leave.leave_ledger_entry e WHERE e.account_id = a.id AND ($2::date IS NULL OR e.entry_date <= $2)), 0), 'FM990.00'))
-         FROM leave.leave_type t LEFT JOIN leave.leave_account a ON a.leave_type_id = t.id AND a.employee_id = $1
+           'balance', to_char(coalesce((SELECT sum(e.quantity) FROM leave.leave_ledger_entry e WHERE e.account_id = a.id AND ($2::date IS NULL OR e.entry_date <= $2)), 0), 'FM990.00'),
+           'pending_days', to_char(coalesce((SELECT sum(d.fraction) FROM leave.leave_request q JOIN leave.leave_request_day d ON d.leave_request_id = q.id
+                                             WHERE q.employee_id = $1 AND q.leave_type_id = t.id AND q.state IN ('pending_l1','pending_l2')), 0), 'FM990.00'))
+         FROM leave.leave_type t JOIN leave.leave_account a ON a.leave_type_id = t.id AND a.employee_id = $1
          WHERE t.retired_at IS NULL ORDER BY t.name",
     )
     .bind(employee)
@@ -362,6 +373,12 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewLeave)
         }
     }
     let master = master_branch_on(tx, employee, r.from).await?.ok_or_else(|| invalid("not employed on from_date"))?;
+    let retired: Option<bool> = sqlx::query_scalar("SELECT retired_at IS NOT NULL FROM leave.leave_type WHERE id = $1").bind(r.leave_type).fetch_optional(&mut ***tx).await?;
+    if retired != Some(false) {
+        return Err(invalid("leave_type_id is not an active leave type"));
+    }
+    // One submission at a time per employee, so two overlapping requests can never both pass the overlap check.
+    sqlx::query("SELECT 1 FROM workforce.employee WHERE id = $1 FOR UPDATE").bind(employee).execute(&mut ***tx).await?;
     let v = version_on(tx, r.leave_type, r.from).await?.ok_or_else(|| invalid("leave_type_id has no version in force on from_date"))?;
     if !eligible(tx, employee, &v, r.from).await? {
         return Err(refused("NOT_ELIGIBLE", "the employee is not eligible for this leave type (LM-01)"));
@@ -550,8 +567,8 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
         return Err(invalid("reason is required to reject"));
     }
     let v = version_on(tx, r.leave_type, r.from).await?.ok_or_else(|| invalid("leave type has no version in force"))?;
-    approval::step(tx, Step { kind: KIND, request_id: id, level, action: done, requester: r.requester, actor: Some(p.user_id), on_behalf_of, comment: note }).await?;
     if approve && level == 1 && v.two_levels {
+        approval::step(tx, Step { kind: KIND, request_id: id, level, action: done, requester: r.requester, actor: Some(p.user_id), on_behalf_of, comment: note }).await?;
         let today = Utc::now().date_naive();
         let next = approval::route(tx, KIND, r.employee, 2, today).await?.filter(|a| *a != r.requester);
         sqlx::query("UPDATE leave.leave_request SET state = 'pending_l2', current_approver_user_id = $2, updated_at = now(), updated_by = $3 WHERE id = $1")
@@ -561,6 +578,27 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
             .execute(&mut ***tx)
             .await?;
         return Ok(());
+    }
+    if approve {
+        // BR-06: until period adjustments exist, a locked day is never moved by leave (no debit without a recalculation).
+        for d in request_dates(tx, id).await? {
+            if db::employee_locked(tx, r.employee, d, d.succ_opt()).await? {
+                return Err(DomainError::PeriodLocked);
+            }
+        }
+        let overlap: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM leave.leave_request_day x JOIN leave.leave_request_day o ON o.leave_date = x.leave_date
+                            JOIN leave.leave_request q ON q.id = o.leave_request_id
+                            WHERE x.leave_request_id = $1 AND q.id <> $1 AND q.employee_id = $2 AND q.state = 'approved'
+                              AND (x.half IS NULL OR o.half IS NULL OR x.half = o.half))",
+        )
+        .bind(id)
+        .bind(r.employee)
+        .fetch_one(&mut ***tx)
+        .await?;
+        if overlap {
+            return Err(refused("OVERLAPPING_REQUEST", "another approved leave already covers these days"));
+        }
     }
     if approve && v.paid {
         // LM-07 at decision: the balance may have moved since submission.
@@ -581,6 +619,7 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
         .execute(&mut ***tx)
         .await?;
     }
+    approval::step(tx, Step { kind: KIND, request_id: id, level, action: done, requester: r.requester, actor: Some(p.user_id), on_behalf_of, comment: note }).await?;
     sqlx::query("UPDATE leave.leave_request SET state = $2, decided_basis = 'approver', current_approver_user_id = NULL, updated_at = now(), updated_by = $3 WHERE id = $1")
         .bind(id)
         .bind(done)
@@ -609,6 +648,14 @@ pub async fn cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, reason: &str) -
     }
     if reason.trim().is_empty() {
         return Err(invalid("reason is required"));
+    }
+    if r.state == "approved" {
+        // BR-06: cancelling approved leave in a locked period would refund days payroll already used.
+        for d in request_dates(tx, id).await? {
+            if db::employee_locked(tx, r.employee, d, d.succ_opt()).await? {
+                return Err(DomainError::PeriodLocked);
+            }
+        }
     }
     let level = if r.state == "pending_l2" { 2 } else { 1 };
     // The approver it was waiting on is kept, so they may still ask about it (ILLEGAL_TRANSITION, not NOT_FOUND).
@@ -677,6 +724,8 @@ pub async fn can_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<b
 
 pub struct Filter {
     pub employees: Option<Vec<Uuid>>,
+    /// A single employee asked for (applies to routed requests too).
+    pub employee: Option<Uuid>,
     pub state: Option<String>,
     pub leave_type: Option<Uuid>,
 }
@@ -687,12 +736,14 @@ pub async fn list(tx: &mut OrgTx<'_>, p: &Principal, f: &Filter) -> Result<Vec<V
     let sql = format!(
         "SELECT {} FROM leave.leave_request q
          WHERE (($1::uuid[] IS NULL OR q.employee_id = ANY($1)) OR q.current_approver_user_id = $4
-                OR q.current_approver_user_id IN (SELECT approver_user_id FROM iam.delegation WHERE delegate_user_id = $4 AND valid @> now()))
-           AND ($2::text IS NULL OR q.state = $2) AND ($3::uuid IS NULL OR q.leave_type_id = $3)
+                OR (q.current_approver_user_id IN (SELECT approver_user_id FROM iam.delegation WHERE delegate_user_id = $4 AND valid @> now())
+                    AND coalesce((SELECT (settings->>'AC-03')::boolean FROM org.organisation_settings_version WHERE effective_from <= current_date
+                                  ORDER BY effective_from DESC LIMIT 1), true)))
+           AND ($2::text IS NULL OR q.state = $2) AND ($3::uuid IS NULL OR q.leave_type_id = $3) AND ($5::uuid IS NULL OR q.employee_id = $5)
          ORDER BY q.submitted_at DESC, q.id LIMIT 500",
         request_json()
     );
-    Ok(sqlx::query_scalar(&sql).bind(&f.employees).bind(&f.state).bind(f.leave_type).bind(p.user_id).fetch_all(&mut ***tx).await?)
+    Ok(sqlx::query_scalar(&sql).bind(&f.employees).bind(&f.state).bind(f.leave_type).bind(p.user_id).bind(f.employee).fetch_all(&mut ***tx).await?)
 }
 
 /// Approved leave on a date for the day calculation: (full day?, half, split time if the shift fixes one).

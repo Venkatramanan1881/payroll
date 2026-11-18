@@ -162,6 +162,9 @@ pub fn compute_day(input: &DayInput) -> DayOutput {
     for e in out.effects.iter_mut().filter(|e| e.kind == "absence_lop") {
         e.days_pct = Some(50);
     }
+    for f in out.flags.iter_mut().filter(|f| *f == "absence_charge_due") {
+        *f = "absence_charge_due_half".into(); // the other half only: half a day is debited
+    }
     if worked_half == 0 {
         out.flags.push("absent_other_half".into());
     }
@@ -593,6 +596,8 @@ mod tests {
         h.leave = Some(LeaveCover { half: Some("second_half".into()), split_at: None });
         let o = compute_day(&h);
         assert_eq!((o.status, o.effects[0].days_pct), ("half_day_leave", Some(50)), "half leave: half a day charged");
+        h.settings.absence_mode = AbsenceMode::AutoDebit;
+        assert!(compute_day(&h).flags.contains(&"absence_charge_due_half".to_string()));
     }
 
     #[test]

@@ -239,3 +239,46 @@ async fn bulk_decisions_report_each_item(pool: PgPool) {
     assert_eq!((res["items"][0]["outcome"].as_str(), res["items"][0]["state"].as_str()), (Some("done"), Some("approved")), "{res}");
     assert_eq!((res["items"][1]["outcome"].as_str(), res["items"][1]["error"]["code"].as_str()), (Some("refused"), Some("NOT_FOUND")), "not routed to this manager");
 }
+
+/// Review fix 1: half-day leave with the other half absent is charged half a day, not a whole one.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn half_day_leave_with_absent_other_half_debits_half(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    let cl = leave_type(&app, &s, "CL", json!({})).await;
+    org_policy(&app, &s, &[("DS", json!({ "DS-10": { "action": "auto_debit" } })), ("LV", json!({ "LV-04": [cl] }))]).await;
+    let (w, boss) = people(&pool, &app, &s).await;
+    credit(&app, &s, &w, &cl, "3.00").await;
+    let d = days_ago(1);
+    let (_, r) = post(&app, &w.token, "/v1/leave/requests", Some(json!({ "leave_type_id": cl, "from_date": d, "to_date": d, "from_part": "first_half", "to_part": "first_half" }))).await;
+    let id = r["id"].as_str().unwrap();
+    let (st, b) = post(&app, &boss.token, "/v1/leave/requests/bulk-decisions", Some(json!({ "decision": "approve", "request_ids": [id], "comment": "ok" }))).await;
+    assert_eq!((st, b["items"][0]["outcome"].as_str()), (StatusCode::OK, Some("done")), "{b}");
+    let result = day(&app, &s, &w, d).await;
+    assert_eq!(result["day_status"], "half_day_leave", "{result}");
+    assert_eq!(balance(&app, &w, &cl).await, "2.00", "3 - 0.50 leave - 0.50 for the absent half");
+}
+
+/// Review fix 2: leave on a locked date is neither approved nor, once approved, cancelled.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn locked_dates_refuse_approval(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, &[]).await;
+    let (w, boss) = people(&pool, &app, &s).await;
+    let cl = leave_type(&app, &s, "CL", json!({})).await;
+    credit(&app, &s, &w, &cl, "3.00").await;
+    let d = days_ago(1);
+    let (_, r) = post(&app, &w.token, "/v1/leave/requests", Some(json!({ "leave_type_id": cl, "from_date": d, "to_date": d }))).await;
+    let id = r["id"].as_str().unwrap();
+    let (cycle, period) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query("INSERT INTO period.attendance_cycle (org_id, id, owner_kind, owner_id, valid) VALUES ($1, $2, 'organisation', $1, daterange('2026-01-01', NULL))")
+        .bind(s.org_id).bind(cycle).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO period.attendance_period (org_id, id, cycle_id, period_start, period_end) VALUES ($1, $2, $3, $4, $4)")
+        .bind(s.org_id).bind(period).bind(cycle).bind(d).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO period.lock_coverage (org_id, period_id, employee_id, dates) VALUES ($1, $2, $3, daterange($4, $4 + 1))")
+        .bind(s.org_id).bind(period).bind(w.employee_id).bind(d).execute(&pool).await.unwrap();
+    let (st, b) = post(&app, &boss.token, &format!("/v1/leave/requests/{id}/approve"), None).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("PERIOD_LOCKED")), "{b}");
+    assert_eq!(balance(&app, &w, &cl).await, "3.00", "nothing debited");
+}

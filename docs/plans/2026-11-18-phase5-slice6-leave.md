@@ -45,5 +45,12 @@
 4. An auto-debit is undone when a punch or leave later covers the day.
 5. BR-07: whoever submitted on behalf cannot approve it.
 
+## After review
+- Leave on a locked date cannot be approved, nor approved leave on it cancelled (409 PERIOD_LOCKED) until period adjustments exist (BR-06).
+- A half-day leave with the other half absent is charged half a day under DS-10. One automatic debit per day, ever.
+- Submissions are serialised per employee; final approval re-checks overlap with other approved leave.
+- The employee's own user is never the routed approver, and a delegate never acts for them.
+- DS-10 is applied when a day is recalculated after its waiting days. The nightly pass that recalculates open absences comes with the jobs slice (J1); until then an HR recalculation applies it.
+
 ## Not in this slice
 Accruals, year end and proration jobs (LM-02..06 run with the jobs slice); sandwich LM-16..20; uninformed absence and excess absence LM-21..27; absconding LM-29..32; LM-15 notice period (needs the exit flow); the generic approvals inbox; LV-03 work from home; penalties recovered from leave (LA-12/EC-11).

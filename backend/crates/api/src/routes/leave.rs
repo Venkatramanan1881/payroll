@@ -97,7 +97,9 @@ pub struct OnDate {
 /// GET /v1/leave/employees/{employee_id}/balances (LVE-08).
 pub async fn balances(Auth(p, mut tx): Auth, Path(employee): Path<Uuid>, Query(q): Query<OnDate>) -> Result<Json<Value>, ApiError> {
     may_view(&mut tx, &p, employee).await?;
-    Ok(Json(json!({ "employee_id": employee, "balances": leave::balances(&mut tx, employee, q.on_date).await? })))
+    let balances = leave::balances(&mut tx, employee, q.on_date).await?;
+    tx.commit().await?; // keeps the accounts opened for the reply
+    Ok(Json(json!({ "employee_id": employee, "balances": balances })))
 }
 
 #[derive(Deserialize)]
@@ -224,7 +226,7 @@ pub async fn list(Auth(p, mut tx): Auth, Query(q): Query<ListQuery>) -> Result<J
             Some(v) => v.into_iter().filter(|x| *x == e).collect(),
         });
     }
-    let f = leave::Filter { employees, state: q.state, leave_type: q.leave_type_id };
+    let f = leave::Filter { employees, employee: q.employee_id, state: q.state, leave_type: q.leave_type_id };
     Ok(Json(json!({ "items": leave::list(&mut tx, &p, &f).await?, "next_cursor": null })))
 }
 
@@ -280,6 +282,7 @@ pub struct BulkIn {
     decision: String,
     request_ids: Vec<Uuid>,
     reason: Option<String>,
+    comment: Option<String>,
 }
 
 /// POST /v1/leave/requests/bulk-decisions: one decision per request, each on its own (not atomic).
@@ -300,7 +303,8 @@ pub async fn bulk(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Resu
     let mut items = Vec::new();
     for id in r.request_ids {
         sqlx::query("SAVEPOINT bulk_item").execute(&mut **tx).await?;
-        let outcome = leave::decide(&mut tx, &p, id, approve, r.reason.as_deref()).await;
+        let note = if approve { r.comment.as_deref() } else { r.reason.as_deref() };
+        let outcome = leave::decide(&mut tx, &p, id, approve, note).await;
         let sp = if outcome.is_err() { "ROLLBACK TO SAVEPOINT bulk_item" } else { "RELEASE SAVEPOINT bulk_item" };
         sqlx::query(sp).execute(&mut **tx).await?;
         items.push(match outcome {

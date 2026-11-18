@@ -83,7 +83,7 @@ impl From<sqlx::Error> for DomainError {
     fn from(e: sqlx::Error) -> Self {
         if let Some(db) = e.as_database_error() {
             match db.code().as_deref() {
-                Some("23503" | "23505" | "23514" | "23P01" | "22007" | "22008" | "22P02") => {
+                Some("23502" | "23503" | "23505" | "23514" | "23P01" | "22007" | "22008" | "22P02") => {
                     return DomainError::Validation(db.constraint().unwrap_or(db.message()).to_string())
                 }
                 // RLS violations share 42501, so only the trigger's own "(G5)" message counts as frozen.

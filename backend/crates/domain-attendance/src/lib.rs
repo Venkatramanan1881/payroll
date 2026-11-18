@@ -368,8 +368,16 @@ async fn settle_absence_debit(
     .bind(day_id)
     .fetch_optional(&mut ***tx)
     .await?;
-    let due = out.flags.iter().any(|f| f == "absence_charge_due");
-    out.flags.retain(|f| f != "absence_charge_due");
+    // Hundredths of a day due: a whole absent day, or the other half of a half-day leave.
+    let due_pct: i64 = if out.flags.iter().any(|f| f == "absence_charge_due") {
+        100
+    } else if out.flags.iter().any(|f| f == "absence_charge_due_half") {
+        50
+    } else {
+        0
+    };
+    out.flags.retain(|f| f != "absence_charge_due" && f != "absence_charge_due_half");
+    let due = due_pct > 0;
     if !due {
         if let Some(debit) = open_debit {
             sqlx::query(
@@ -388,23 +396,29 @@ async fn settle_absence_debit(
         out.flags.push("absence_auto_debited".into());
         return Ok(());
     }
-    for leave_type in order {
+    // One debit per day ever: after a reversal the day is loss of pay, never a debit from the next type.
+    let debited_before: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM leave.leave_ledger_entry WHERE cause_kind = 'attendance_day' AND cause_id = $1 AND entry_kind = 'absence_auto_debit')")
+        .bind(day_id)
+        .fetch_one(&mut ***tx)
+        .await?;
+    for leave_type in order.iter().filter(|_| !debited_before) {
         let Some(v) = leave::version_on(tx, *leave_type, date).await? else { continue };
         if !v.paid {
             continue;
         }
         let account = leave::lock_account(tx, employee, *leave_type).await?;
-        if leave::balance_pct(tx, account).await? < 100 {
+        if leave::balance_pct(tx, account).await? < due_pct {
             continue;
         }
         let posted = sqlx::query(
             "INSERT INTO leave.leave_ledger_entry (org_id, account_id, entry_date, entry_kind, quantity, cause_kind, cause_id, reason)
-             VALUES (app.current_org(), $1, $2, 'absence_auto_debit', -1, 'attendance_day', $3, 'absent with no leave (DS-10, LV-04)')
+             VALUES (app.current_org(), $1, $2, 'absence_auto_debit', -($4::numeric / 100), 'attendance_day', $3, 'absent with no leave (DS-10, LV-04)')
              ON CONFLICT DO NOTHING",
         )
         .bind(account)
         .bind(date)
         .bind(day_id)
+        .bind(due_pct as i32)
         .execute(&mut ***tx)
         .await?
         .rows_affected();
@@ -413,7 +427,7 @@ async fn settle_absence_debit(
             return Ok(());
         }
     }
-    out.effects.push(Effect { kind: "absence_lop", days_pct: Some(100), minutes: None, reason_code: "absent_no_leave_balance".into(), rule_ref: "DS-10" });
+    out.effects.push(Effect { kind: "absence_lop", days_pct: Some(due_pct), minutes: None, reason_code: "absent_no_leave_balance".into(), rule_ref: "DS-10" });
     Ok(())
 }
 

@@ -16,7 +16,7 @@ pub async fn route(tx: &mut OrgTx<'_>, kind: &str, employee: Uuid, level: i16, t
         .fetch_optional(&mut ***tx)
         .await?;
     let source = rule.as_ref().map_or(if level == 1 { "reporting_manager" } else { "hr" }, |r| r.0.as_str());
-    Ok(match source {
+    let routed = match source {
         "named_user" => rule.and_then(|r| r.1),
         "reporting_manager" => sqlx::query_scalar(
             "SELECT u.id FROM workforce.employee_assignment a JOIN iam.user_account u ON u.employee_id = a.manager_employee_id AND u.active
@@ -27,6 +27,14 @@ pub async fn route(tx: &mut OrgTx<'_>, kind: &str, employee: Uuid, level: i16, t
         .fetch_optional(&mut ***tx)
         .await?,
         _ => None,
+    };
+    // BR-07: the employee's own user never approves their request; it goes to the HR pool instead.
+    Ok(match routed {
+        Some(u) => {
+            let own: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM iam.user_account WHERE id = $1 AND employee_id = $2)").bind(u).bind(employee).fetch_one(&mut ***tx).await?;
+            if own { None } else { Some(u) }
+        }
+        None => None,
     })
 }
 
@@ -51,7 +59,9 @@ pub async fn may_decide(tx: &mut OrgTx<'_>, p: &Principal, employee: Uuid, op: &
             .bind(p.user_id)
             .fetch_one(&mut ***tx)
             .await?;
-            if delegated { Ok(Some(a)) } else { Err(DomainError::NotFound) }
+            // A delegate never acts for the employee's own user (BR-07 through delegation).
+            let for_employee: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM iam.user_account WHERE id = $1 AND employee_id = $2)").bind(a).bind(employee).fetch_one(&mut ***tx).await?;
+            if delegated && !for_employee { Ok(Some(a)) } else { Err(DomainError::NotFound) }
         }
         None => {
             let today = Utc::now().date_naive();
