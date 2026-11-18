@@ -45,7 +45,8 @@ pub struct PunchInput {
     pub has_selfie: bool,
     pub event_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
-    /// Phone clock minus the server's estimate of the true time; None when it cannot be measured (phone rebooted).
+    /// Phone clock minus the server's estimate of the true time; None when it cannot be measured (phone rebooted),
+    /// which is flagged too so a changed clock cannot hide behind a reported restart.
     pub clock_skew_ms: Option<i64>,
 }
 
@@ -116,18 +117,16 @@ pub fn locate(loc: Option<Loc>, ctx: &PunchContext) -> Located {
         .filter(|f| applicable.contains(&f.branch_id))
         .map(|f| (f, dist(f)))
         .min_by(|a, b| a.1.total_cmp(&b.1));
+    // Inside the fence of a branch the employee may not punch at (EM-07).
+    let foreign = || ctx.fences.iter().find(|f| !applicable.contains(&f.branch_id) && !allowed(ctx, f.branch_id) && dist(f) <= f.radius_m as f64);
     let Some((_, d)) = nearest else {
-        // No applicable fence configured: nothing to compare against.
-        let foreign = ctx.fences.iter().find(|f| !applicable.contains(&f.branch_id) && dist(f) <= f.radius_m as f64);
-        return Located { not_allowed_branch: foreign.filter(|f| !allowed(ctx, f.branch_id)).map(|f| f.branch_id), ..Located::default() };
+        // No applicable fence configured: only the EM-07 check is possible.
+        let b = foreign().map(|f| f.branch_id);
+        return Located { branch_id: b, not_allowed_branch: b, ..Located::default() };
     };
     // Inside any applicable fence wins, even if a nearer centre has a smaller radius.
     let inside = ctx.fences.iter().filter(|f| applicable.contains(&f.branch_id)).find(|f| dist(f) <= f.radius_m as f64);
-    let foreign = if inside.is_none() {
-        ctx.fences.iter().find(|f| !applicable.contains(&f.branch_id) && !allowed(ctx, f.branch_id) && dist(f) <= f.radius_m as f64)
-    } else {
-        None
-    };
+    let foreign = if inside.is_none() { foreign() } else { None };
     Located {
         branch_id: inside.map(|f| f.branch_id).or(foreign.map(|f| f.branch_id)),
         fence_distance_m: Some(d.round() as i32),
@@ -149,11 +148,20 @@ fn flag(reason: &'static str, evidence: Value) -> FlagSpec {
 pub fn evaluate(input: &PunchInput, ctx: &PunchContext) -> Decision {
     let located = locate(input.location, ctx);
     let mut d = Decision { located: located.clone(), ..Decision::default() };
-    let Some(s) = &ctx.settings else { return d };
     let refuse = |mut d: Decision, rule: &'static str, msg: &str| {
         d.refused = Some((rule, msg.to_string()));
         d.flags.clear();
         d
+    };
+    let Some(s) = &ctx.settings else {
+        // EM-07 is an organisation setting: it applies even with the PC group switched off.
+        if let Some(branch) = located.not_allowed_branch {
+            if ctx.branch_not_allowed_blocks {
+                return refuse(d, "EM-07", "You are not allowed to punch at this branch.");
+            }
+            d.flags.push(flag("branch_not_allowed", json!({ "branch_id": branch })));
+        }
+        return d;
     };
     let web = input.source == "web";
 
@@ -224,10 +232,12 @@ pub fn evaluate(input: &PunchInput, ctx: &PunchContext) -> Decision {
         d.flags.push(flag("late_sync", json!({ "delay_hours": delay.num_hours(), "limit_days": s.late_sync_days })));
     }
 
-    if let Some(skew) = input.clock_skew_ms {
-        if skew.abs() > s.clock_tolerance_min * 60_000 {
-            d.flags.push(flag("clock_mismatch", json!({ "skew_seconds": skew / 1000, "tolerance_minutes": s.clock_tolerance_min })));
+    match input.clock_skew_ms {
+        Some(skew) if skew.unsigned_abs() > (s.clock_tolerance_min as u64) * 60_000 => {
+            d.flags.push(flag("clock_mismatch", json!({ "skew_seconds": skew / 1000, "tolerance_minutes": s.clock_tolerance_min })))
         }
+        None => d.flags.push(flag("clock_mismatch", json!({ "unverifiable": true }))),
+        _ => {}
     }
     d
 }
@@ -268,7 +278,7 @@ mod tests {
             has_selfie: false,
             event_at: now,
             received_at: now,
-            clock_skew_ms: None,
+            clock_skew_ms: Some(0),
         }
     }
 
@@ -412,6 +422,24 @@ mod tests {
         let mut c = ctx();
         c.settings.as_mut().unwrap().app_selfie = true;
         assert_eq!(evaluate(&input("app", Some(10.0)), &c).refused.map(|r| r.0), Some("PC-02"));
+    }
+
+    #[test]
+    fn unverifiable_clock_is_flagged() {
+        let mut i = input("app", Some(10.0));
+        i.clock_skew_ms = None;
+        assert_eq!(reasons(&evaluate(&i, &ctx())), ["clock_mismatch"]);
+    }
+
+    #[test]
+    fn e17_without_any_applicable_fence_still_attributes_the_branch() {
+        let mut c = ctx();
+        c.fences.retain(|f| f.branch_id == branch(3));
+        let d = evaluate(&input("app", Some(0.2 * 111_195.0)), &c);
+        assert_eq!(reasons(&d), ["branch_not_allowed"]);
+        assert_eq!(d.located.branch_id, Some(branch(3)));
+        c.settings = None;
+        assert_eq!(reasons(&evaluate(&input("app", Some(0.2 * 111_195.0)), &c)), ["branch_not_allowed"], "EM-07 applies with PC off");
     }
 
     #[test]

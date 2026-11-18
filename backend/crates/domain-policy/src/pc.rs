@@ -77,8 +77,8 @@ fn choice(v: &Value, key: &str, allowed: &[&str]) -> Result<String, String> {
     v.as_str().filter(|s| allowed.contains(s)).map(str::to_string).ok_or(format!("{key} must be one of {}", allowed.join(", ")))
 }
 
-fn whole(v: &Value, key: &str, min: i64) -> Result<i64, String> {
-    v.as_i64().filter(|n| *n >= min).ok_or(format!("{key} must be a whole number of at least {min}"))
+fn whole(v: &Value, key: &str, min: i64, max: i64) -> Result<i64, String> {
+    v.as_i64().filter(|n| (min..=max).contains(n)).ok_or(format!("{key} must be a whole number from {min} to {max}"))
 }
 
 impl PcSettings {
@@ -106,8 +106,8 @@ impl PcSettings {
                 "PC-04" => s.outside_fence = choice(v, key, &["block", "flag", "allow"])?,
                 "PC-05" => s.web_ip_restricted = v.as_bool().ok_or("PC-05 must be true or false")?,
                 "PC-06" => s.off_day = choice(v, key, &["allow", "flag", "block"])?,
-                "PC-07" => s.late_sync_days = whole(v, key, 0)?,
-                "PC-08" => s.clock_tolerance_min = whole(v, key, 0)?,
+                "PC-07" => s.late_sync_days = whole(v, key, 0, 365)?,
+                "PC-08" => s.clock_tolerance_min = whole(v, key, 0, 1440)?,
                 "PC-12" => {
                     let f = flags(v, key, &["location", "inside_fence"])?;
                     s.web_location = f[0].unwrap_or(s.web_location);
@@ -120,7 +120,7 @@ impl PcSettings {
                         return Err(format!("PC-14.{k} is not a known field"));
                     }
                     if let Some(t) = o.get("threshold_m") {
-                        s.accuracy_threshold_m = whole(t, "PC-14.threshold_m", 1)?;
+                        s.accuracy_threshold_m = whole(t, "PC-14.threshold_m", 1, 100_000)?;
                     }
                     if let Some(a) = o.get("action") {
                         s.accuracy_action = choice(a, "PC-14.action", &["accept", "flag", "block"])?;
@@ -128,7 +128,8 @@ impl PcSettings {
                 }
                 "PC-15" => s.ip_and_location = choice(v, key, &["both", "either"])?,
                 "PC-16" => s.fences = choice(v, key, &["master", "master_and_allowed"])?,
-                other => return Err(format!("{other} is not a PC setting handled in this version")),
+                // PC-03 lives in org.geo_fence; PC-09/10/11/17 wait for their flows. Stored, not evaluated (check_document vets the key).
+                _ => {}
             }
         }
         Ok(s)
@@ -171,16 +172,22 @@ mod tests {
     }
 
     #[test]
+    fn known_unbuilt_keys_are_stored_not_refused() {
+        assert_eq!(PcSettings::parse(&json!({ "PC-03": 200, "PC-09": "always", "PC-17": "applied" })).unwrap(), PcSettings::default());
+    }
+
+    #[test]
     fn wrong_values_are_refused() {
         for bad in [
             json!({ "PC-04": "maybe" }),
             json!({ "PC-05": "yes" }),
             json!({ "PC-07": -1 }),
             json!({ "PC-07": 1.5 }),
+            json!({ "PC-07": 366 }),
+            json!({ "PC-08": 100_000 }),
             json!({ "PC-14": { "threshold_m": 0 } }),
             json!({ "PC-02": { "gps": true } }),
             json!({ "PC-12": { "location": 1 } }),
-            json!({ "PC-09": "always" }),
             json!([]),
         ] {
             assert!(PcSettings::parse(&bad).is_err(), "{bad} should be refused");

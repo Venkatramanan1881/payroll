@@ -15,6 +15,8 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     let phone_verifier = std::sync::Arc::new(domain_iam::firebase::GoogleVerifier::new(&firebase_project));
-    axum::serve(listener, api::router(api::AppState { pool, jwt_secret, phone_verifier })).await?;
+    let app = api::router(api::AppState { pool, jwt_secret, phone_verifier });
+    // The peer address backs PC-05 when no trusted proxy header is present.
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
 }

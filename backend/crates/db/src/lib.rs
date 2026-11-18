@@ -68,6 +68,8 @@ pub enum DomainError {
     IllegalTransition(String),
     VersionFrozen,
     PeriodLocked,
+    /// A client key already used for something else (409).
+    IdempotencyConflict,
     Db(sqlx::Error),
 }
 

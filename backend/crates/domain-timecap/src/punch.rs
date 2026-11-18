@@ -38,7 +38,7 @@ async fn existing(tx: &mut OrgTx<'_>, employee: Uuid, key: Uuid) -> Result<Optio
         .await?;
     let Some((id, owner)) = row else { return Ok(None) };
     if owner != Some(employee) {
-        return Err(invalid("idempotency_key is already used"));
+        return Err(DomainError::IdempotencyConflict);
     }
     let flags: Vec<String> = sqlx::query_scalar("SELECT reason FROM timecap.punch_flag WHERE punch_id = $1 ORDER BY created_at, reason")
         .bind(id)
@@ -65,6 +65,18 @@ pub async fn local_date(tx: &mut OrgTx<'_>, at: DateTime<Utc>, tz: &str) -> Resu
     Ok(sqlx::query_scalar("SELECT ($1::timestamptz AT TIME ZONE $2)::date").bind(at).bind(tz).fetch_one(&mut ***tx).await?)
 }
 
+/// The branch's time zone on the date of `at` (BR-11).
+// shortcut: a branch with no dated time zone is read as India time (V1 market); require one when branches abroad appear.
+pub async fn branch_tz(tx: &mut OrgTx<'_>, branch: Uuid, at: DateTime<Utc>) -> Result<String, DomainError> {
+    Ok(sqlx::query_scalar(
+        "SELECT coalesce((SELECT tz FROM org.branch_timezone WHERE branch_id = $1 AND valid @> ($2::timestamptz AT TIME ZONE 'UTC')::date), 'Asia/Kolkata')",
+    )
+    .bind(branch)
+    .bind(at)
+    .fetch_one(&mut ***tx)
+    .await?)
+}
+
 pub async fn master_branch_on(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) -> Result<Option<Uuid>, DomainError> {
     Ok(sqlx::query_scalar("SELECT branch_id FROM workforce.employee_assignment WHERE employee_id = $1 AND kind = 'master_branch' AND valid @> $2::date")
         .bind(employee)
@@ -84,12 +96,28 @@ pub async fn record(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, c: &Capture
         return Ok(o);
     }
     if let Some(path) = &c.selfie_path {
+        if path.split(['/', '\\']).any(|seg| seg == ".." || seg == ".") || path.contains('\\') {
+            return Err(invalid("selfie.path must be a plain storage path"));
+        }
         let ours: bool = sqlx::query_scalar("SELECT starts_with($1, app.current_org()::text || '/')").bind(path).fetch_one(&mut ***tx).await?;
         if !ours {
             return Err(invalid("selfie.path must be a file of this organisation")); // TB-02
         }
     }
-    let date = local_date(tx, c.event_at, &c.captured_tz).await?;
+    local_date(tx, c.event_at, &c.captured_tz).await?; // captured_tz must be a real zone; it is kept as evidence only
+    // The rule date comes from the master branch's zone, never from the client's zone (BR-11): a client cannot move a punch
+    // onto another day. The UTC date and its neighbours find the branch for an employee who joins or moves that day.
+    let utc = c.event_at.date_naive();
+    let mut probe = None;
+    for d in [Some(utc), utc.succ_opt(), utc.pred_opt()].into_iter().flatten() {
+        if let Some(b) = master_branch_on(tx, employee, d).await? {
+            probe = Some(b);
+            break;
+        }
+    }
+    let probe = probe.ok_or_else(|| invalid("not employed on the punch date"))?;
+    let tz = branch_tz(tx, probe, c.event_at).await?;
+    let date = local_date(tx, c.event_at, &tz).await?;
     let master = master_branch_on(tx, employee, date).await?.ok_or_else(|| invalid("not employed on the punch date"))?;
 
     // Settings in force on the punch date (BR-05); the policy is chosen by the master branch (EM-R9).
@@ -110,6 +138,10 @@ pub async fn record(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, c: &Capture
     let branch_not_allowed_blocks = org_setting(tx, "EM-07", date).await?.as_deref() == Some("block");
     let fences: Vec<(Uuid, f64, f64, i32)> =
         sqlx::query_as("SELECT branch_id, latitude::float8, longitude::float8, radius_m FROM org.geo_fence WHERE enabled").fetch_all(&mut ***tx).await?;
+    let tolerance = settings.as_ref().map_or(5, |s| s.clock_tolerance_min);
+    if c.event_at > c.received_at + chrono::Duration::minutes(tolerance) {
+        return Err(invalid("punch time is in the future"));
+    }
     let mut ctx = PunchContext {
         settings,
         master_branch: master,
@@ -147,13 +179,23 @@ pub async fn record(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, c: &Capture
     let (lat, lon, acc) = c.location.map(|l| (Some(l.lat), Some(l.lon), Some(l.accuracy_m as i32))).unwrap_or_default();
 
     if let Some((rule_ref, message)) = d.refused {
+        // A retried offline batch refuses the same item again: report the attempt already recorded.
+        let earlier: Option<Uuid> = sqlx::query_scalar("SELECT id FROM timecap.punch_attempt_refused WHERE employee_id = $1 AND attempted_at = $2 AND rule_ref = $3 LIMIT 1")
+            .bind(employee)
+            .bind(c.event_at)
+            .bind(rule_ref)
+            .fetch_optional(&mut ***tx)
+            .await?;
+        if let Some(attempt_id) = earlier {
+            return Ok(Outcome::Refused { attempt_id, rule_ref, message });
+        }
         let attempt_id: Uuid = sqlx::query_scalar(
             "INSERT INTO timecap.punch_attempt_refused (org_id, employee_id, source, attempted_at, rule_ref, message, latitude, longitude, accuracy_m, client_ip, created_by)
              VALUES (app.current_org(), $1, $2, $3, $4, $5, $6, $7, $8, $9::inet, $10) RETURNING id",
         )
         .bind(employee)
         .bind(&c.source)
-        .bind(c.received_at)
+        .bind(c.event_at) // when the employee tried, not when an offline batch arrived
         .bind(rule_ref)
         .bind(&message)
         .bind(lat)
@@ -193,7 +235,7 @@ pub async fn record(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, c: &Capture
     .fetch_optional(&mut ***tx)
     .await?;
     let Some(id) = id else {
-        return existing(tx, employee, c.idempotency_key).await?.ok_or_else(|| invalid("idempotency_key is already used"));
+        return existing(tx, employee, c.idempotency_key).await?.ok_or(DomainError::IdempotencyConflict);
     };
     for f in &d.flags {
         let mut evidence = f.evidence.clone();
@@ -294,14 +336,7 @@ pub async fn record_manual(
     }
     let mut ids = Vec::with_capacity(entries.len());
     for (i, (employee, at)) in entries.iter().enumerate() {
-        // shortcut: a branch with no dated time zone is read as India time (V1 market); require one when branches abroad appear.
-        let tz: String = sqlx::query_scalar(
-            "SELECT coalesce((SELECT tz FROM org.branch_timezone WHERE branch_id = $1 AND valid @> ($2::timestamptz AT TIME ZONE 'UTC')::date), 'Asia/Kolkata')",
-        )
-        .bind(branch)
-        .bind(at)
-        .fetch_one(&mut ***tx)
-        .await?;
+        let tz = branch_tz(tx, branch, *at).await?;
         let date = local_date(tx, *at, &tz).await?;
         if master_branch_on(tx, *employee, date).await?.is_none() {
             return Err(invalid(format!("entries[{i}].employee_id is not employed on that date")));
@@ -334,7 +369,7 @@ pub struct AttemptFilter {
     pub rule_ref: Option<String>,
 }
 
-// shortcut: no cursor paging, newest 500 only.
+// shortcut: no cursor paging, newest 500 only; from/to compare the UTC date (attempts keep no zone).
 pub async fn list_attempts(tx: &mut OrgTx<'_>, f: &AttemptFilter, with_location: bool) -> Result<Vec<Value>, DomainError> {
     Ok(sqlx::query_scalar(
         "SELECT jsonb_build_object('id', a.id, 'employee_id', a.employee_id, 'source', a.source, 'device_id', a.device_id, 'attempted_at', a.attempted_at,
