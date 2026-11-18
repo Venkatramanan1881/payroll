@@ -54,7 +54,7 @@ async fn create_code_rules_follow_em01(pool: PgPool) {
     let (st, _) = create(&app, &s, &with_code).await;
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "code is refused when EM-01 = automatic");
 
-    sqlx::query("INSERT INTO org.organisation_settings_version (org_id, effective_from, settings, schema_version) VALUES ($1, '2000-01-01', '{\"EM-01\":\"manual\"}', 1)")
+    sqlx::query("INSERT INTO org.organisation_settings_version (org_id, effective_from, settings, schema_version) VALUES ($1, '2000-01-01', '{\"employee_code_mode\":\"manual\"}', 1)")
         .bind(s.org_id).execute(&pool).await.unwrap();
     let (st, _) = create(&app, &s, &new_employee(s.branch_id, "Bala")).await;
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "code is required when EM-01 = manual");

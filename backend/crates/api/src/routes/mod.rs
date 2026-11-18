@@ -6,3 +6,5 @@ pub mod sched;
 pub mod punches;
 pub mod regularisation;
 pub mod leave;
+pub mod org;
+pub mod jobs;

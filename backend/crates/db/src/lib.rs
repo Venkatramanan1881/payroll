@@ -60,6 +60,21 @@ pub async fn audit(
     Ok(())
 }
 
+/// An audit entry written by a timed job (no user acts).
+pub async fn audit_system(tx: &mut OrgTx<'_>, action: &str, target_type: &str, target_id: Option<Uuid>, after: Option<serde_json::Value>) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO audit.audit_entry (org_id, actor_kind, action, target_type, target_id, after_value)
+         VALUES (app.current_org(), 'system_job', $1, $2, $3, $4)",
+    )
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(after)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(())
+}
+
 /// Error shared by the domain crates added from slice 2 on.
 #[derive(Debug)]
 pub enum DomainError {

@@ -228,7 +228,7 @@ pub async fn hr_correct(tx: &mut OrgTx<'_>, p: &Principal, r: NewRequest) -> Res
 
 /// The effect of an approved request: manual punches referencing it (BR-01), the corrected punch chosen, the day
 /// recalculated (BR-03). Keys derive from the request, so the effect can never be applied twice.
-async fn apply(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid) -> Result<(), DomainError> {
+pub(crate) async fn apply(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid) -> Result<(), DomainError> {
     let (employee, date, kind, pin, pout, target, reason): RequestRow =
         sqlx::query_as(
             "SELECT employee_id, attendance_date, request_type, proposed_in_at, proposed_out_at, target_raw_punch_id, reason

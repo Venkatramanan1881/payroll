@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub mod approval;
+pub mod jobs;
 pub mod leave;
 pub mod regularisation;
 

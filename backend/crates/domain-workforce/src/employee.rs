@@ -99,7 +99,7 @@ pub async fn create_employee(tx: &mut OrgTx<'_>, actor: Uuid, input: EmployeeCre
     }
 
     let code_mode: Option<String> = sqlx::query_scalar(
-        "SELECT settings->>'EM-01' FROM org.organisation_settings_version WHERE effective_from <= $1 ORDER BY effective_from DESC LIMIT 1",
+        "SELECT settings->>'employee_code_mode' FROM org.organisation_settings_version WHERE effective_from <= $1 ORDER BY effective_from DESC LIMIT 1",
     )
     .bind(today)
     .fetch_optional(&mut ***tx)
@@ -298,7 +298,7 @@ pub async fn update_employee(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, fields: 
     }
     if let Some(v) = fields.get("employee_code") {
         let mode: Option<String> = sqlx::query_scalar(
-            "SELECT settings->>'EM-01' FROM org.organisation_settings_version WHERE effective_from <= $1 ORDER BY effective_from DESC LIMIT 1",
+            "SELECT settings->>'employee_code_mode' FROM org.organisation_settings_version WHERE effective_from <= $1 ORDER BY effective_from DESC LIMIT 1",
         )
         .bind(today)
         .fetch_optional(&mut ***tx)
