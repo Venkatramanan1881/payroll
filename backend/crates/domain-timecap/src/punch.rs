@@ -123,7 +123,7 @@ pub async fn record(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, c: &Capture
     // Settings in force on the punch date (BR-05); the policy is chosen by the master branch (EM-R9).
     let resolved = domain_policy::assignment::resolve_policy(tx, employee, date, master).await?;
     let settings = pc::load(tx, resolved.and_then(|r| r.version_id)).await?;
-    let allowed_branches: Vec<Uuid> = match org_setting(tx, "EM-06", date).await?.as_deref() {
+    let allowed_branches: Vec<Uuid> = match org_setting(tx, "allowed_branches_mode", date).await?.as_deref() {
         Some("all_branches") => sqlx::query_scalar("SELECT id FROM org.branch WHERE id <> $1").bind(master).fetch_all(&mut ***tx).await?,
         Some("chosen_branches") => {
             sqlx::query_scalar("SELECT branch_id FROM workforce.employee_allowed_branch WHERE employee_id = $1 AND valid @> $2::date AND branch_id <> $3")
@@ -135,7 +135,7 @@ pub async fn record(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, c: &Capture
         }
         _ => vec![], // EM-06 default: master branch only
     };
-    let branch_not_allowed_blocks = org_setting(tx, "EM-07", date).await?.as_deref() == Some("block");
+    let branch_not_allowed_blocks = org_setting(tx, "non_allowed_branch_punch", date).await?.as_deref() == Some("block");
     let fences: Vec<(Uuid, f64, f64, i32)> =
         sqlx::query_as("SELECT branch_id, latitude::float8, longitude::float8, radius_m FROM org.geo_fence WHERE enabled").fetch_all(&mut ***tx).await?;
     let tolerance = settings.as_ref().map_or(5, |s| s.clock_tolerance_min);

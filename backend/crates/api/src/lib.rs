@@ -15,6 +15,8 @@ pub struct AppState {
     pub pool: PgPool,
     pub jwt_secret: Vec<u8>,
     pub phone_verifier: Arc<dyn domain_iam::firebase::PhoneTokenVerifier>,
+    /// Bearer secret for /internal/jobs; None disables the job endpoints.
+    pub job_secret: Option<Vec<u8>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -68,6 +70,25 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/attendance/regularisation-requests/{id}/cancel", post(routes::regularisation::cancel))
         .route("/v1/attendance/hr-corrections", post(routes::regularisation::hr_correction))
         .route("/v1/attendance/bulk-regularisations", post(routes::regularisation::bulk))
+        .route("/internal/jobs/{name}", post(routes::jobs::run))
+        .route("/v1/organisation", get(routes::org::organisation))
+        .route("/v1/branches", get(routes::org::list_branches).post(routes::org::create_branch))
+        .route("/v1/branches/{id}", get(routes::org::get_branch).patch(routes::org::update_branch))
+        .route("/v1/branches/{id}/geo-fences", get(routes::org::list_fences).post(routes::org::create_fence))
+        .route("/v1/branches/{id}/ip-allow-list", get(routes::org::ip_list))
+        .route("/v1/branches/{id}/ip-allow-list/change", post(routes::org::change_ip_list))
+        .route("/v1/geo-fences/{id}", axum::routing::patch(routes::org::update_fence))
+        .route("/v1/geo-fences/{id}/test", post(routes::org::test_fence))
+        .route("/v1/geo-fences/{id}/switch-on", post(routes::org::switch_on))
+        .route("/v1/geo-fences/{id}/switch-off", post(routes::org::switch_off))
+        .route("/v1/lists/{kind}", get(routes::org::list_entries).post(routes::org::create_entry))
+        .route("/v1/lists/{kind}/{id}", axum::routing::patch(routes::org::update_entry))
+        .route("/v1/lists/{kind}/{id}/retire", post(routes::org::retire_entry))
+        .route("/v1/contractors", get(routes::org::list_contractors).post(routes::org::create_contractor))
+        .route("/v1/contractors/{id}", get(routes::org::get_contractor).patch(routes::org::update_contractor))
+        .route("/v1/contractors/{id}/retire", post(routes::org::retire_contractor))
+        .route("/v1/organisation-settings", get(routes::org::settings))
+        .route("/v1/organisation-settings/versions", get(routes::org::settings_versions).post(routes::org::create_settings_version))
         .route("/v1/leave/types", get(routes::leave::list_types).post(routes::leave::create_type))
         .route("/v1/leave/types/{id}", get(routes::leave::get_type))
         .route("/v1/leave/types/{id}/versions", post(routes::leave::publish_version))

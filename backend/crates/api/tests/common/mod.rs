@@ -8,6 +8,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 pub const JWT_SECRET: &[u8] = b"test-secret-not-for-production";
+pub const JOB_SECRET: &[u8] = b"test-job-secret-not-for-production-0123456789";
 
 /// A request with a bearer token and optional JSON body / extra headers.
 pub fn req(method: &str, uri: &str, token: &str, body: Option<serde_json::Value>, headers: &[(&str, String)]) -> Request<Body> {
@@ -40,7 +41,7 @@ impl domain_iam::firebase::PhoneTokenVerifier for FakeVerifier {
 }
 
 pub fn state(pool: PgPool) -> api::AppState {
-    api::AppState { pool, jwt_secret: JWT_SECRET.to_vec(), phone_verifier: std::sync::Arc::new(FakeVerifier) }
+    api::AppState { pool, jwt_secret: JWT_SECRET.to_vec(), phone_verifier: std::sync::Arc::new(FakeVerifier), job_secret: Some(JOB_SECRET.to_vec()) }
 }
 
 pub fn app(pool: PgPool) -> axum::Router {
@@ -89,7 +90,7 @@ pub async fn seed_org(pool: &PgPool) -> SeedOrg {
         .bind(org_id).bind(hr_user_id).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name, system_code) VALUES ($1, $2, 'HR Manager', 'hr_manager')")
         .bind(org_id).bind(role_id).execute(pool).await.unwrap();
-    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07", "TCP-11", "CMP-01", "TCP-04", "TCP-06", "TCP-07", "TCP-08", "TCP-09", "ATT-01", "ATT-06", "ATT-03", "ATT-04", "ATT-05", "LVE-01", "LVE-03", "LVE-04", "LVE-05", "LVE-06", "LVE-07", "LVE-08"] {
+    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07", "TCP-11", "CMP-01", "TCP-04", "TCP-06", "TCP-07", "TCP-08", "TCP-09", "ATT-01", "ATT-06", "ATT-03", "ATT-04", "ATT-05", "LVE-01", "LVE-03", "LVE-04", "LVE-05", "LVE-06", "LVE-07", "LVE-08", "ORG-01", "ORG-02", "ORG-03", "ORG-04", "ORG-05", "ORG-06", "ORG-07"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')")
             .bind(org_id).bind(role_id).bind(op).execute(pool).await.unwrap();
     }

@@ -16,6 +16,8 @@ pub struct RgSettings {
     pub window_days: i64,                // RG-04
     pub two_levels: bool,                // RG-05
     pub auto_types: Vec<String>,         // RG-06
+    pub timeout_days: i64,               // RG-07
+    pub timeout_action: String,          // RG-07 escalate | auto_approve | auto_reject
     pub over_limit_blocks: bool,         // RG-08
     pub attachment_types: Vec<String>,   // RG-09
     pub hr_direct: bool,                 // RG-10
@@ -32,6 +34,8 @@ impl Default for RgSettings {
             window_days: 7,
             two_levels: false,
             auto_types: vec![],
+            timeout_days: 2, // RG-07 default: escalate after 2 days
+            timeout_action: "escalate".into(),
             over_limit_blocks: false,
             attachment_types: vec![],
             hr_direct: true,
@@ -94,13 +98,14 @@ impl RgSettings {
                 "RG-05" => s.two_levels = v.as_str().filter(|x| ["one", "two"].contains(x)).ok_or("RG-05 must be one or two")? == "two",
                 "RG-06" => s.auto_types = type_list(v, key)?,
                 "RG-07" => {
-                    // Stored for the timeout job (J3), which arrives with deployment; shape checked now.
                     let o = v.as_object().ok_or("RG-07 must be an object")?;
-                    count(o.get("days").unwrap_or(&Value::Null), "RG-07.days")?;
-                    o.get("action")
+                    s.timeout_days = count(o.get("days").unwrap_or(&Value::Null), "RG-07.days")?.max(1);
+                    s.timeout_action = o
+                        .get("action")
                         .and_then(Value::as_str)
                         .filter(|a| ["escalate", "auto_approve", "auto_reject"].contains(a))
-                        .ok_or("RG-07.action must be escalate, auto_approve or auto_reject")?;
+                        .ok_or("RG-07.action must be escalate, auto_approve or auto_reject")?
+                        .to_string();
                 }
                 "RG-08" => s.over_limit_blocks = v.as_str().filter(|x| ["block", "hr_approval"].contains(x)).ok_or("RG-08 must be block or hr_approval")? == "block",
                 "RG-09" => s.attachment_types = type_list(v, key)?,

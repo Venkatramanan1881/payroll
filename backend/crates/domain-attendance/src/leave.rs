@@ -152,7 +152,7 @@ pub async fn list_types(tx: &mut OrgTx<'_>, on: NaiveDate, include_retired: bool
 pub struct Version {
     pub paid: bool,
     eligibility: Value,
-    negative_allowed: i64,
+    pub(crate) negative_allowed: i64,
     half_day_allowed: bool,
     min_notice_days: i32,
     max_consecutive: Option<i64>,
@@ -514,11 +514,11 @@ async fn request_dates(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Vec<NaiveDate>, D
     Ok(sqlx::query_scalar("SELECT leave_date FROM leave.leave_request_day WHERE leave_request_id = $1 ORDER BY leave_date").bind(id).fetch_all(&mut ***tx).await?)
 }
 
-async fn total_pct(tx: &mut OrgTx<'_>, id: Uuid) -> Result<i64, DomainError> {
+pub(crate) async fn total_pct(tx: &mut OrgTx<'_>, id: Uuid) -> Result<i64, DomainError> {
     Ok(sqlx::query_scalar("SELECT coalesce((sum(fraction) * 100)::int8, 0) FROM leave.leave_request_day WHERE leave_request_id = $1").bind(id).fetch_one(&mut ***tx).await?)
 }
 
-async fn recalc_days(tx: &mut OrgTx<'_>, employee: Uuid, id: Uuid, trigger: &str) -> Result<(), DomainError> {
+pub(crate) async fn recalc_days(tx: &mut OrgTx<'_>, employee: Uuid, id: Uuid, trigger: &str) -> Result<(), DomainError> {
     for d in request_dates(tx, id).await? {
         crate::recalculate(tx, employee, d, trigger, Some(id)).await?;
     }
@@ -737,7 +737,7 @@ pub async fn list(tx: &mut OrgTx<'_>, p: &Principal, f: &Filter) -> Result<Vec<V
         "SELECT {} FROM leave.leave_request q
          WHERE (($1::uuid[] IS NULL OR q.employee_id = ANY($1)) OR q.current_approver_user_id = $4
                 OR (q.current_approver_user_id IN (SELECT approver_user_id FROM iam.delegation WHERE delegate_user_id = $4 AND valid @> now())
-                    AND coalesce((SELECT (settings->>'AC-03')::boolean FROM org.organisation_settings_version WHERE effective_from <= current_date
+                    AND coalesce((SELECT (settings->>'delegation_enabled')::boolean FROM org.organisation_settings_version WHERE effective_from <= current_date
                                   ORDER BY effective_from DESC LIMIT 1), true)))
            AND ($2::text IS NULL OR q.state = $2) AND ($3::uuid IS NULL OR q.leave_type_id = $3) AND ($5::uuid IS NULL OR q.employee_id = $5)
          ORDER BY q.submitted_at DESC, q.id LIMIT 500",

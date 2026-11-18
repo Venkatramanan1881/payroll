@@ -34,6 +34,7 @@ dependencies = [
  "db",
  "domain-attendance",
  "domain-iam",
+ "domain-org",
  "domain-policy",
  "domain-sched",
  "domain-timecap",
@@ -385,6 +386,18 @@ dependencies = [
  "sha2",
  "sqlx",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "domain-org"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "db",
+ "domain-timecap",
+ "serde_json",
+ "sqlx",
  "uuid",
 ]
 

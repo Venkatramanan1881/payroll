@@ -51,7 +51,7 @@ pub async fn may_decide(tx: &mut OrgTx<'_>, p: &Principal, employee: Uuid, op: &
         Some(a) => {
             // AC-03 off (organisation setting) means delegations are not honoured; the BRD gives no default, so on.
             let delegated: bool = sqlx::query_scalar(
-                "SELECT coalesce((SELECT (settings->>'AC-03')::boolean FROM org.organisation_settings_version WHERE effective_from <= current_date
+                "SELECT coalesce((SELECT (settings->>'delegation_enabled')::boolean FROM org.organisation_settings_version WHERE effective_from <= current_date
                                   ORDER BY effective_from DESC LIMIT 1), true)
                     AND EXISTS (SELECT 1 FROM iam.delegation WHERE approver_user_id = $1 AND delegate_user_id = $2 AND valid @> now())",
             )
