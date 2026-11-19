@@ -353,7 +353,7 @@ pub fn span_minutes(start: NaiveTime, end: NaiveTime) -> i64 {
 }
 
 /// The permission's instants in the employee's zone (master branch on the date).
-async fn instants(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, start: NaiveTime, end: NaiveTime) -> Result<(DateTime<Utc>, DateTime<Utc>), DomainError> {
+pub(crate) async fn instants(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, start: NaiveTime, end: NaiveTime) -> Result<(DateTime<Utc>, DateTime<Utc>), DomainError> {
     let tz = crate::employee_tz(tx, employee, date).await?;
     let mut from: DateTime<Utc> = sqlx::query_scalar("SELECT ($1::date + $2::time) AT TIME ZONE $3").bind(date).bind(start).bind(&tz).fetch_one(&mut ***tx).await?;
     // A night shift (e.g. 22:00-06:00 on D): a time before the shift's start is the after-midnight part, on D+1.

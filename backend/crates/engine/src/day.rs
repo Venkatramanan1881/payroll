@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Bump when a rule's meaning changes, so unchanged inputs are still recalculated (BR-02, AT5).
-pub const ENGINE_VERSION: &str = "3";
+pub const ENGINE_VERSION: &str = "4";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Expected {
@@ -45,6 +45,8 @@ pub struct DayInput {
     /// counted session is credited. The caller has already moved the shift's start or end past a permission at
     /// either edge, so no late or early mark falls inside it.
     pub credited: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    /// An approved full-day (or several-day) on-duty covers the day: it counts as worked (PM-R6).
+    pub on_duty_day: bool,
     pub settings: AttendanceSettings,
 }
 
@@ -136,6 +138,24 @@ fn status_of(pct: i64, quarter_days: bool) -> &'static str {
 /// The day with approved leave applied: a full leave day is `leave`; a half day is calculated on the other half
 /// (start or end moved to the split point, E12, LA-20) and shown as `half_day_leave`.
 pub fn compute_day(input: &DayInput) -> DayOutput {
+    let working = matches!(input.expected, Expected::Working { .. } | Expected::HoursOnly { .. });
+    if input.on_duty_day && !working {
+        // An off day, holiday or unscheduled day keeps its own status; the on-duty is shown on it (OD-10 reads it).
+        let mut rest = input.clone();
+        rest.on_duty_day = false;
+        let mut out = compute_day(&rest);
+        out.flags.push("on_duty".into());
+        step(&mut out.explanation, "PM-R6", json!({}), "approved on-duty on a day with no working shift".into());
+        return out;
+    }
+    if input.on_duty_day {
+        let mut out = DayOutput { status: "on_duty", state: "provisional", fraction_pct: 100, ..DayOutput::default() };
+        for p in &input.punches {
+            out.punches_used.push(PunchUse { id: p.id, direction: None, session_no: None, excluded: Some("on_duty".into()) });
+        }
+        step(&mut out.explanation, "PM-R6", json!({}), "approved on-duty for the whole day counts as worked".into());
+        return out;
+    }
     let Some(leave) = &input.leave else { return compute_core(input) };
     let mut rest = input.clone();
     rest.leave = None;
@@ -295,8 +315,17 @@ fn compute_core(input: &DayInput) -> DayOutput {
     if out.break_min > 0 {
         step(&mut out.explanation, "BK-03", json!({ "gross": out.gross_min, "break": out.break_min, "paid": s.break_paid }), format!("net {} minutes", out.net_min));
     }
-    let credit: i64 = input
-        .credited
+    // Overlapping approvals (a permission and an on-duty) credit their union once.
+    let mut spans = input.credited.clone();
+    spans.sort();
+    let mut union: Vec<(DateTime<Utc>, DateTime<Utc>)> = vec![];
+    for (f, t) in spans {
+        match union.last_mut() {
+            Some(last) if f <= last.1 => last.1 = last.1.max(t),
+            _ => union.push((f, t)),
+        }
+    }
+    let credit: i64 = union
         .iter()
         .map(|(f, t)| {
             let worked: i64 = out.sessions.iter().filter_map(|x| x.out_at.map(|o| minutes((*f).max(x.in_at), (*t).min(o)))).sum();
@@ -305,7 +334,7 @@ fn compute_core(input: &DayInput) -> DayOutput {
         .sum();
     if credit > 0 {
         out.net_min += credit;
-        step(&mut out.explanation, "PM-12", json!({ "credited": credit }), format!("{credit} approved permission minutes count as worked"));
+        step(&mut out.explanation, "PM-12", json!({ "credited": credit }), format!("{credit} approved permission or on-duty minutes count as worked"));
     }
 
     let first_in = merged.first().map(|p| p.in_at);
@@ -331,7 +360,7 @@ fn compute_core(input: &DayInput) -> DayOutput {
         }
         Expected::Working { .. } | Expected::HoursOnly { .. } => {}
     }
-    if kept.is_empty() {
+    if kept.is_empty() && credit == 0 {
         out.status = "absent";
         if !input.absence_due {
             out.state = "absence_pending";
@@ -346,13 +375,15 @@ fn compute_core(input: &DayInput) -> DayOutput {
         }
         return out;
     }
-    let has_pair = out.sessions.iter().any(|x| x.out_at.is_some());
+    let real_pair = out.sessions.iter().any(|x| x.out_at.is_some());
+    // Approved time away with no punches is judged on hours alone: it has no in or out to mark late or early.
+    let has_pair = real_pair || credit > 0;
     if let (Some((start_at, _)), Some(fi)) = (times, first_in) {
         if fi < start_at {
             out.early_arrival_min = if s.ea_from_punch { minutes(fi, start_at).min(s.ea_cap_min) } else { 0 };
         }
     }
-    let basis = if times.is_none() { Basis::Hours } else { s.basis.unwrap_or(if flexible { Basis::Hours } else { Basis::Shift }) };
+    let basis = if times.is_none() || !real_pair { Basis::Hours } else { s.basis.unwrap_or(if flexible { Basis::Hours } else { Basis::Shift }) };
     // Slabs need a real in and out: a day with no pair is already not present (BR-04, no second penalty).
     let slabs_apply = basis != Basis::Hours && has_pair;
 
@@ -480,6 +511,7 @@ mod tests {
             leave: None,
             absence_due: false,
             credited: vec![],
+            on_duty_day: false,
             settings: AttendanceSettings::default(),
         }
     }
@@ -663,5 +695,51 @@ mod tests {
         let mut b = a.clone();
         b.cutoff_passed = true;
         assert_ne!(fingerprint(&a), fingerprint(&b));
+    }
+
+    /// Approved time away with no punches counts on hours; it is never a full absence (review finding).
+    #[test]
+    fn credit_without_punches() {
+        let edge = |s: &str, e: &str| Expected::Working { start_at: t(s), end_at: t(e), required_min: 480, flexible: false };
+        // Hours on-duty for the whole shift: both edges moved, nine hours credited.
+        let mut i = day(edge("18:00", "18:00"), &[]);
+        i.credited = vec![(t("09:00"), t("18:00"))];
+        let o = compute_day(&i);
+        assert_eq!((o.status, o.fraction_pct, o.net_min), ("present", 100, 540), "{:?}", o.explanation);
+        // Half-day on-duty, no return to office: half a day, not absent.
+        let mut i = day(edge("09:00", "13:30"), &[]);
+        i.credited = vec![(t("13:30"), t("18:00"))];
+        let o = compute_day(&i);
+        assert!(o.status != "absent" && o.fraction_pct >= 50 && o.fraction_pct < 100, "{} {}", o.status, o.fraction_pct);
+        // First-half leave and second-half on-duty: the other half is fully covered.
+        let mut i = day(edge("09:00", "13:30"), &[]);
+        i.leave = Some(LeaveCover { half: Some("first_half".into()), split_at: Some(t("13:30")) });
+        i.credited = vec![(t("13:30"), t("18:00"))];
+        let o = compute_day(&i);
+        assert_eq!((o.status, o.fraction_pct), ("half_day_leave", 50), "{:?}", o.explanation);
+        assert!(!o.flags.iter().any(|f| f == "absent_other_half"));
+    }
+
+    /// Overlapping approvals are credited once.
+    #[test]
+    fn overlapping_credit_counts_once() {
+        let mut i = day(Expected::Working { start_at: t("10:00"), end_at: t("18:00"), required_min: 480, flexible: false }, &["10:00", "18:00"]);
+        i.credited = vec![(t("09:00"), t("10:00"))];
+        let once = compute_day(&i).net_min;
+        i.credited.push((t("09:30"), t("10:00")));
+        assert_eq!(compute_day(&i).net_min, once);
+    }
+
+    /// A full-day on-duty on a weekly off keeps the off day and shows the on-duty.
+    #[test]
+    fn on_duty_on_off_day_keeps_status() {
+        let mut i = day(Expected::WeeklyOff, &[]);
+        i.on_duty_day = true;
+        let o = compute_day(&i);
+        assert_eq!(o.status, "weekly_off");
+        assert!(o.flags.iter().any(|f| f == "on_duty"));
+        let mut i = day(shift(), &[]);
+        i.on_duty_day = true;
+        assert_eq!((compute_day(&i).status, compute_day(&i).fraction_pct), ("on_duty", 100));
     }
 }

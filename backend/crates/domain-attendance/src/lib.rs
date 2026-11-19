@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub mod approval;
 pub mod jobs;
 pub mod leave;
+pub mod onduty;
 pub mod openbal;
 pub mod period;
 pub mod permission;
@@ -255,43 +256,71 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
     if cur.expected == Expected::Unscheduled && rows.is_empty() && existing.is_none() {
         return Ok(None); // nothing expected, nothing punched
     }
-    // Approved leave on the day (full, or a half with the shift's SH-11 split point).
+    // The shift's half-day split (SH-11 fixed time, else mid-shift), from the shift before any edge moves.
+    let shift_window = match &cur.expected {
+        Expected::Working { start_at, end_at, .. } => Some((*start_at, *end_at)),
+        _ => None,
+    };
+    let fixed_split: Option<DateTime<Utc>> = match cur.shift_version {
+        Some(v) => sqlx::query_scalar(
+            "SELECT CASE WHEN half_day_split = 'fixed_time' AND half_day_split_time IS NOT NULL
+                         THEN (($2::date + half_day_split_time) AT TIME ZONE $3) END FROM sched.shift_version WHERE id = $1",
+        )
+        .bind(v)
+        .bind(date)
+        .bind(&tz)
+        .fetch_one(&mut ***tx)
+        .await?,
+        None => None,
+    };
+    let mid = shift_window.map(|(s, e)| fixed_split.unwrap_or(s + (e - s) / 2));
+    // Approved leave on the day (full, or a half split at `mid`, so later edge moves never shift the split).
     let leave = match leave::leave_on(tx, employee, date).await? {
         None => None,
         Some(None) => Some(LeaveCover { half: None, split_at: None }),
-        Some(Some(half)) => {
-            let split_at: Option<DateTime<Utc>> = match cur.shift_version {
-                Some(v) => sqlx::query_scalar(
-                    "SELECT CASE WHEN half_day_split = 'fixed_time' AND half_day_split_time IS NOT NULL
-                                 THEN (($2::date + half_day_split_time) AT TIME ZONE $3) END FROM sched.shift_version WHERE id = $1",
-                )
-                .bind(v)
-                .bind(date)
-                .bind(&tz)
-                .fetch_one(&mut ***tx)
-                .await?,
-                None => None,
-            };
-            Some(LeaveCover { half: Some(half), split_at })
-        }
+        Some(Some(half)) => Some(LeaveCover { half: Some(half), split_at: mid.or(fixed_split) }),
     };
-    // PM-R6 / PM-12: approved permissions. One at either edge of the shift moves that edge (no late or early mark
-    // inside it); permission minutes that count as worked are credited towards the day's hours.
-    let mut expected = cur.expected;
-    let mut credited = vec![];
-    for (from, to, worked) in permission::approved_on(tx, employee, date).await? {
-        if let Expected::Working { start_at, end_at, .. } = &mut expected {
-            if from <= *start_at && to > *start_at {
-                *start_at = to.min(*end_at);
+    // PM-R6 / PM-12 / OD: approved permissions and on-duty hours. One at either edge of the shift moves that edge
+    // (no late or early mark inside it); time that counts as worked is credited towards the day's hours.
+    let mut covers: Vec<(DateTime<Utc>, DateTime<Utc>, bool)> = permission::approved_on(tx, employee, date).await?;
+    let mut on_duty_day = false;
+    for cover in onduty::approved_on(tx, employee, date).await? {
+        let Some((start_at, end_at)) = shift_window else {
+            on_duty_day |= matches!(cover, onduty::Cover::Day);
+            continue; // hours and half days need a shift with set times (refused at submit)
+        };
+        let mid = mid.expect("set with the window");
+        match cover {
+            onduty::Cover::Day => on_duty_day = true,
+            // Only the part inside the shift counts.
+            onduty::Cover::Hours(a, b) if a.max(start_at) < b.min(end_at) => covers.push((a.max(start_at), b.min(end_at), true)),
+            onduty::Cover::Hours(..) => {}
+            // The half not on leave; else the half without kept punches (OQ-C09-12).
+            onduty::Cover::Half => {
+                let second = match leave.as_ref().and_then(|l| l.half.as_deref()) {
+                    Some(h) => h == "first_half",
+                    None => rows.iter().find(|r| r.2.is_none()).is_some_and(|r| r.1 < mid),
+                };
+                covers.push(if second { (mid, end_at, true) } else { (start_at, mid, true) });
             }
-            if from < *end_at && to >= *end_at {
-                *end_at = from.max(*start_at);
-            }
-        }
-        if worked {
-            credited.push((from, to));
         }
     }
+    // Back-to-back covers chain: the start moves forward in start order, the end back in reverse order.
+    covers.sort_by_key(|c| c.0);
+    let mut expected = cur.expected.clone();
+    if let Expected::Working { start_at, end_at, .. } = &mut expected {
+        for (from, to, _) in &covers {
+            if *from <= *start_at && *to > *start_at {
+                *start_at = (*to).min(*end_at);
+            }
+        }
+        for (from, to, _) in covers.iter().rev() {
+            if *from < *end_at && *to >= *end_at {
+                *end_at = (*from).max(*start_at);
+            }
+        }
+    }
+    let credited: Vec<_> = covers.into_iter().filter(|c| c.2).map(|c| (c.0, c.1)).collect();
     // DS-10: an absence is charged once its waiting days have passed, never on the day itself (D-07b).
     let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE $1)::date").bind(&tz).fetch_one(&mut ***tx).await?;
     let absence_due = (today - date).num_days() >= settings.absence_wait_days().max(1);
@@ -302,6 +331,7 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
         leave,
         absence_due,
         credited,
+        on_duty_day,
         settings,
     };
     let print = fingerprint(&input);
