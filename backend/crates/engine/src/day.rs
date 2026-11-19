@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Bump when a rule's meaning changes, so unchanged inputs are still recalculated (BR-02, AT5).
-pub const ENGINE_VERSION: &str = "2";
+pub const ENGINE_VERSION: &str = "3";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Expected {
@@ -41,6 +41,9 @@ pub struct DayInput {
     pub leave: Option<LeaveCover>,
     /// An absence with no leave is due to be charged (DS-10 waiting days passed).
     pub absence_due: bool,
+    /// Minutes counted as worked without punches: approved permissions with PM-12 = yes. The caller has already
+    /// moved the shift's start or end past a permission at either edge, so no late or early mark falls inside it.
+    pub credit_min: i64,
     pub settings: AttendanceSettings,
 }
 
@@ -288,6 +291,10 @@ fn compute_core(input: &DayInput) -> DayOutput {
         out.break_min = s.break_min;
     }
     out.net_min = out.gross_min - if s.break_paid { 0 } else { out.break_min };
+    if input.credit_min > 0 {
+        out.net_min += input.credit_min;
+        step(&mut out.explanation, "PM-12", json!({ "credited": input.credit_min }), format!("{} approved permission minutes count as worked", input.credit_min));
+    }
     if out.break_min > 0 {
         step(&mut out.explanation, "BK-03", json!({ "gross": out.gross_min, "break": out.break_min, "paid": s.break_paid }), format!("net {} minutes", out.net_min));
     }
@@ -463,6 +470,7 @@ mod tests {
             cutoff_passed: false,
             leave: None,
             absence_due: false,
+            credit_min: 0,
             settings: AttendanceSettings::default(),
         }
     }
