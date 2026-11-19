@@ -55,7 +55,8 @@ async fn users_are_created_changed_and_cut_off(pool: PgPool) {
     let body = json!({ "login_kind": "mobile_otp", "mobile": "+919876500001", "role_ids": [hr], "scopes": [{ "scope_kind": "branch", "branch_id": s.branch_id }] });
     let (st, u) = common::as_user(&app, &oa, "POST", "/v1/users", Some(body.clone()), &key()).await;
     assert_eq!((st, u["roles"][0]["id"].as_str(), u["scopes"][0]["scope_kind"].as_str()), (StatusCode::CREATED, Some(&*hr.to_string()), Some("branch")), "{u}");
-    assert_eq!(common::as_user(&app, &oa, "POST", "/v1/users", Some(body), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY, "mobile is unique");
+    let (st, b) = common::as_user(&app, &oa, "POST", "/v1/users", Some(body), &key()).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("ALREADY_EXISTS")), "mobile is unique: {b}");
     let mixed = json!({ "login_kind": "mobile_otp", "mobile": "+919876500002", "role_ids": [hr],
                         "scopes": [{ "scope_kind": "branch", "branch_id": s.branch_id }, { "scope_kind": "all" }] });
     assert_eq!(common::as_user(&app, &oa, "POST", "/v1/users", Some(mixed), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY, "OQ-C03-04");
@@ -86,7 +87,10 @@ async fn users_are_created_changed_and_cut_off(pool: PgPool) {
         .fetch_one(&pool).await.unwrap();
     assert_eq!(audited, 1, "old and new values audited");
 
-    sqlx::query("INSERT INTO iam.session (org_id, user_id, refresh_token_hash, expires_at) VALUES ($1, $2, 'h', now() + interval '1 day')").bind(s.org_id).bind(user).execute(&pool).await.unwrap();
+    let sid: Uuid = sqlx::query_scalar("INSERT INTO iam.session (org_id, user_id, refresh_token_hash, expires_at) VALUES ($1, $2, 'h', now() + interval '1 day') RETURNING id")
+        .bind(s.org_id).bind(user).fetch_one(&pool).await.unwrap();
+    let session_token = domain_iam::tokens::issue_access(common::JWT_SECRET, user, s.org_id, Some(sid), common::now());
+    assert_eq!(common::as_user(&app, &session_token, "GET", "/v1/me", None, &[]).await.0, StatusCode::OK);
     let off = format!("/v1/users/{id}/deactivate");
     assert_eq!(common::as_user(&app, &oa, "POST", &off, Some(json!({ "reason": " " })), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     let (st, d) = common::as_user(&app, &oa, "POST", &off, Some(json!({ "reason": "left" })), &key()).await;
@@ -97,7 +101,18 @@ async fn users_are_created_changed_and_cut_off(pool: PgPool) {
     assert_eq!(common::as_user(&app, &oa, "POST", &off, Some(json!({ "reason": "again" })), &key()).await.0, StatusCode::OK, "idempotent");
     let (_, back) = common::as_user(&app, &oa, "POST", &format!("/v1/users/{id}/reactivate"), Some(json!({ "reason": "rejoined" })), &key()).await;
     assert_eq!(back["active"], true);
+    assert_eq!(common::as_user(&app, &session_token, "GET", "/v1/me", None, &[]).await.0, StatusCode::UNAUTHORIZED, "a revoked session stays revoked after reactivation");
     assert_eq!(common::as_user(&app, &oa, "POST", &format!("/v1/users/{oa_id}/deactivate"), Some(json!({ "reason": "oops" })), &key()).await.0, StatusCode::FORBIDDEN, "no self-lockout");
+
+    // IAM-01 without IAM-02 cannot create a user (that would assign roles and scope).
+    let (half, half_role) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query("INSERT INTO iam.user_account (org_id, id, login_kind, email, password_hash) VALUES ($1, $2, 'password', 'half@test.invalid', 'x')").bind(s.org_id).bind(half).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO iam.role (org_id, id, name) VALUES ($1, $2, 'Half')").bind(s.org_id).bind(half_role).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, 'IAM-01', 'all')").bind(s.org_id).bind(half_role).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(s.org_id).bind(half).bind(half_role).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO iam.user_scope (org_id, user_id, scope_kind) VALUES ($1, $2, 'all')").bind(s.org_id).bind(half).execute(&pool).await.unwrap();
+    let grab = json!({ "login_kind": "password", "email": "mine@test.invalid", "initial_password": "long enough pw", "role_ids": [hr], "scopes": [{ "scope_kind": "all" }] });
+    assert_eq!(common::as_user(&app, &common::token(half, s.org_id), "POST", "/v1/users", Some(grab), &key()).await.0, StatusCode::FORBIDDEN, "IAM-02 needed");
 
     let other = common::seed_org(&pool).await;
     let (_, other_oa) = org_admin(&pool, other.org_id).await;
@@ -112,7 +127,7 @@ async fn roles_and_grants(pool: PgPool) {
     let (_, oa) = org_admin(&pool, s.org_id).await;
     let (st, r) = common::as_user(&app, &oa, "POST", "/v1/roles", Some(json!({ "name": "Store Manager" })), &key()).await;
     assert_eq!((st, &r["grants"], &r["system_code"]), (StatusCode::CREATED, &json!([]), &Value::Null), "{r}");
-    assert_eq!(common::as_user(&app, &oa, "POST", "/v1/roles", Some(json!({ "name": "Store Manager" })), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY, "unique names");
+    assert_eq!(common::as_user(&app, &oa, "POST", "/v1/roles", Some(json!({ "name": "Store Manager" })), &key()).await.0, StatusCode::CONFLICT, "unique names");
     let id = r["id"].as_str().unwrap();
     let uri = format!("/v1/roles/{id}/change-grants");
     for bad in ["ADT-03", "PLT-01", "XYZ-01"] {
@@ -141,6 +156,10 @@ async fn roles_and_grants(pool: PgPool) {
     sqlx::query("UPDATE iam.role SET system_code = 'auditor' WHERE id = $1").bind(hr).execute(&pool).await.unwrap();
     let h = vec![("if-match", etag(&app, &oa, &format!("/v1/roles/{hr}")).await)];
     assert_eq!(common::as_user(&app, &oa, "PATCH", &format!("/v1/roles/{hr}"), Some(json!({ "name": "X" })), &h).await.0, StatusCode::CONFLICT, "system roles keep their names");
+    let mut h = key();
+    h.push(("if-match", etag(&app, &oa, &format!("/v1/roles/{hr}")).await));
+    let writes = json!({ "grants": [{ "operation_code": "WRK-01", "grant_kind": "all" }], "reason": "auditor writes" });
+    assert_eq!(common::as_user(&app, &oa, "POST", &format!("/v1/roles/{hr}/change-grants"), Some(writes), &h).await.0, StatusCode::CONFLICT, "system roles keep their grants (G-09)");
     let (_, modules) = common::as_user(&app, &oa, "GET", "/v1/me/modules", None, &[]).await;
     assert_eq!((modules["items"].as_array().map(Vec::len), modules["mobile_app"].as_bool()), (Some(20), Some(false)), "{modules}");
 }
@@ -164,6 +183,12 @@ async fn access_settings_switches_and_delegations(pool: PgPool) {
     assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("CONFLICTING_SETTINGS")));
     let (st, ended) = common::as_user(&app, &oa, "POST", &format!("/v1/delegations/{}/end", del["id"].as_str().unwrap()), None, &key()).await;
     assert!(st == StatusCode::OK && ended["valid_to"].as_str().unwrap() < del["valid_to"].as_str().unwrap(), "{ended}");
+    let later = json!({ "approver_user_id": oa_id, "delegate_user_id": s.hr_user_id, "valid_from": now + chrono::Duration::days(5), "valid_to": now + chrono::Duration::days(6) });
+    let (_, future) = common::as_user(&app, &oa, "POST", "/v1/delegations", Some(later), &key()).await;
+    let (st, gone) = common::as_user(&app, &oa, "POST", &format!("/v1/delegations/{}/end", future["id"].as_str().unwrap()), None, &key()).await;
+    assert_eq!((st, &gone["valid_to"]), (StatusCode::OK, &gone["valid_from"]), "{gone}");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM iam.delegation WHERE lower(valid) > now()").fetch_one(&pool).await.unwrap();
+    assert_eq!(left, 0, "a delegation that never started is removed");
 
     let today = (chrono::Utc::now() + chrono::Duration::minutes(330)).date_naive();
     let change = |body: Value| {

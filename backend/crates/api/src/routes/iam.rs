@@ -104,7 +104,14 @@ pub struct UserIn {
 /// POST /v1/users (IAM-01).
 pub async fn create_user(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     require_org_wide(&mut tx, &p, "IAM-01").await?;
-    let (key, replay) = start(&mut tx, &headers, "POST /v1/users", &raw).await?;
+    require_org_wide(&mut tx, &p, "IAM-02").await?; // the new user gets roles and scope
+    // The idempotency record keeps a hash of the request; the password is left out so it cannot be guessed from it.
+    let mut hashed: Value = parse(&raw)?;
+    if let Some(o) = hashed.as_object_mut() {
+        o.remove("initial_password");
+    }
+    let hashed = serde_json::to_vec(&hashed).map_err(|e| ApiError::Internal(e.into()))?;
+    let (key, replay) = start(&mut tx, &headers, "POST /v1/users", &hashed).await?;
     if let Some(r) = replay {
         return Ok(r);
     }
@@ -169,6 +176,7 @@ pub async fn change_access(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers:
     }
     let a: AccessIn = parse(&raw)?;
     reason_ok(&a.reason)?;
+    admin::lock_user(&mut tx, id).await?;
     if_match(&headers, &admin::get_user(&mut tx, id).await?)?;
     let body = admin::change_access(&mut tx, p.user_id, id, &a.role_ids, &scopes(a.scopes), &a.reason).await?;
     done(tx, key, StatusCode::OK, body).await
@@ -211,6 +219,7 @@ pub async fn create_role(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) 
 pub async fn rename_role(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     require_org_wide(&mut tx, &p, "IAM-04").await?;
     let n: NameIn = parse(&raw)?;
+    admin::lock_role(&mut tx, id).await?;
     if_match(&headers, &admin::get_role(&mut tx, id).await?)?;
     let out = admin::rename_role(&mut tx, p.user_id, id, &n.name).await?;
     tx.commit().await?;
@@ -244,6 +253,7 @@ pub async fn change_grants(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers:
     if g.grants.len() > 500 {
         return Err(ApiError::ValidationFailed("at most 500 grants".into()));
     }
+    admin::lock_role(&mut tx, id).await?;
     if_match(&headers, &admin::get_role(&mut tx, id).await?)?;
     let grants: Vec<GrantIn> = g.grants.into_iter().map(|g| GrantIn { operation_code: g.operation_code, grant_kind: g.grant_kind, setting_ref: g.setting_ref }).collect();
     let body = admin::change_grants(&mut tx, p.user_id, id, &grants, &g.reason).await?;
@@ -287,6 +297,7 @@ pub async fn change_approver_rules(Auth(p, mut tx): Auth, headers: HeaderMap, ra
     if r.levels.is_empty() || r.levels.len() > 2 {
         return Err(ApiError::ValidationFailed("one or two levels".into()));
     }
+    admin::lock_settings(&mut tx).await?;
     if_match(&headers, &admin::approver_rules(&mut tx).await?)?;
     let levels: Vec<LevelIn> = r.levels.into_iter().map(|l| LevelIn { level: l.level, source: l.source, named_user_id: l.named_user_id }).collect();
     let body = admin::change_approver_rules(&mut tx, p.user_id, &r.request_type, &levels, &r.reason).await?;
@@ -369,6 +380,7 @@ async fn change_settings(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes, 
     if body.is_empty() || body.keys().any(|k| !allowed.contains(&k.as_str())) {
         return Err(ApiError::ValidationFailed(format!("give at least one of {}", allowed.join(", "))));
     }
+    admin::lock_settings(&mut tx).await?;
     if_match(&headers, &admin::access_settings(&mut tx).await?)?;
     let out = admin::change_access_settings(&mut tx, p.user_id, body, from, &reason).await?;
     done(tx, key, StatusCode::OK, out).await

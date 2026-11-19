@@ -10,7 +10,7 @@ use axum::response::Response;
 use axum::Json;
 use chrono::NaiveDate;
 use db::OrgTx;
-use domain_iam::authz::{require, Principal, Scope};
+use domain_iam::authz::{require, GrantKind, Principal, Scope};
 use domain_org as org;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,9 +35,10 @@ async fn branch_in_scope(tx: &mut OrgTx<'_>, p: &Principal, op: &str, branch: Uu
 
 /// Organisation-wide writes (x-scope: org): only a caller whose scope is the whole organisation.
 pub(crate) async fn require_org_wide(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<(), ApiError> {
-    match require(tx, p, op).await?.scope {
-        Scope::All => Ok(()),
-        _ => Err(ApiError::Forbidden),
+    let g = require(tx, p, op).await?;
+    match (g.kind, g.scope) {
+        (GrantKind::All | GrantKind::Scoped, Scope::All) => Ok(()),
+        _ => Err(ApiError::Forbidden), // a self-only or approve-only grant is not organisation-wide
     }
 }
 

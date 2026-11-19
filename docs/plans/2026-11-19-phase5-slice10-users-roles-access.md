@@ -59,6 +59,21 @@ Each request reads grants and scope afresh, so every change takes effect on the 
   - `PATCH /v1/me/language`: If-Match; only an offered language.
   - `GET /v1/me/modules`: today's entitlements (common modules always on) and the plan's `mobile_app`.
 
+## Review fixes
+- **Creating a user assigns roles and scope:** it needs IAM-02 as well as IAM-01.
+- **Grant changes:**
+  - refused on system roles until G-09 / OQ-C03-01 is decided (409);
+  - refused on any role the caller holds (403).
+- **Lockout guard:** a grant change, an access change or a deactivation that would leave no active user with IAM-01, IAM-02 and IAM-03 over the whole organisation is refused (409).
+- **"Organisation-wide" means a full grant:** a self-only or approve-only grant no longer passes the admin routes.
+- **Duplicates:** a duplicate mobile, email, employee link or role name → 409 ALREADY_EXISTS (added to the error catalogue).
+- **A named approver who has been deactivated** routes to the HR pool instead of a dead account.
+- **Concurrent writes:** row locks (user, role) and an organisation lock (settings, approver rules) are taken before every If-Match comparison.
+- **Passwords and idempotency:** the idempotency record hashes the user-creation request without the password.
+- **Sessions:** a token tied to a revoked or expired session is refused, so reactivation does not revive old sessions.
+- **Delegations:** a delegation that has not started yet is removed when ended (the table forbids an empty window).
+- **Smaller validation fixes:** a real email shape is required; a mobile is checked for every login kind; a past `effective_from` → 422 before any version conflict; LIKE wildcards in `q` are literal.
+
 ## Not in this slice
 - Password sign-in and the AC-08 second step (UM-R3; OQ-C03-06 decides who signs in with a password).
 - Vendor support access (VC-03).

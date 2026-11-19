@@ -98,6 +98,11 @@ pub async fn change_access_settings(tx: &mut OrgTx<'_>, actor: Uuid, changes: Ma
     if changes.get("settings_change_mode").is_some_and(|v| v == "hr_with_org_admin_approval") {
         return Err(invalid("AC-04 with Organisation Admin approval needs the settings-change approval workflow, which is not built yet"));
     }
+    // shortcut: India's date for every organisation; read the organisation's zone when one outside India signs up.
+    let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE 'Asia/Kolkata')::date").fetch_one(&mut ***tx).await?;
+    if from < today {
+        return Err(invalid("effective_from cannot be in the past"));
+    }
     let prev: Option<(NaiveDate, Value, i32)> = sqlx::query_as(
         "SELECT effective_from, settings, schema_version FROM org.organisation_settings_version WHERE effective_from <= $1 ORDER BY effective_from DESC LIMIT 1",
     )
@@ -116,10 +121,6 @@ pub async fn change_access_settings(tx: &mut OrgTx<'_>, actor: Uuid, changes: Ma
         .await?;
     if let Some(d) = later {
         return Err(DomainError::IllegalTransition(format!("an organisation-settings version from {d} already exists and would undo this change")));
-    }
-    let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE 'Asia/Kolkata')::date").fetch_one(&mut ***tx).await?;
-    if from < today {
-        return Err(invalid("effective_from cannot be in the past"));
     }
     let before = access_settings(tx).await?;
     let obj = doc.as_object_mut().ok_or_else(|| invalid("stored settings are not an object"))?;
@@ -142,6 +143,51 @@ pub async fn change_access_settings(tx: &mut OrgTx<'_>, actor: Uuid, changes: Ma
 
 async fn setting_on(tx: &mut OrgTx<'_>, key: &str) -> Result<bool, DomainError> {
     Ok(access_settings(tx).await?[key].as_bool().unwrap_or(true))
+}
+
+/// Somebody active must keep full access administration (IAM-01, IAM-02 and IAM-03 over the whole organisation);
+/// a change that would leave nobody able to manage users, roles and grants is refused.
+async fn admin_remains(tx: &mut OrgTx<'_>) -> Result<(), DomainError> {
+    let ok: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM iam.user_account u WHERE u.active
+           AND EXISTS (SELECT 1 FROM iam.user_scope s WHERE s.user_id = u.id AND s.scope_kind = 'all')
+           AND (SELECT count(DISTINCT g.operation_code) FROM iam.role_grant g JOIN iam.user_role ur ON ur.role_id = g.role_id
+                 WHERE ur.user_id = u.id AND g.operation_code IN ('IAM-01','IAM-02','IAM-03') AND g.grant_kind IN ('all','scoped')) = 3)",
+    )
+    .fetch_one(&mut ***tx)
+    .await?;
+    if !ok {
+        return Err(DomainError::IllegalTransition("this would leave nobody able to manage users, roles and grants".into()));
+    }
+    Ok(())
+}
+
+/// Serialises writers of one row (or of the organisation's settings) before their If-Match comparison.
+pub async fn lock_user(tx: &mut OrgTx<'_>, id: Uuid) -> Result<(), DomainError> {
+    sqlx::query("SELECT 1 FROM iam.user_account WHERE id = $1 FOR UPDATE").bind(id).execute(&mut ***tx).await?;
+    Ok(())
+}
+
+pub async fn lock_role(tx: &mut OrgTx<'_>, id: Uuid) -> Result<(), DomainError> {
+    sqlx::query("SELECT 1 FROM iam.role WHERE id = $1 FOR UPDATE").bind(id).execute(&mut ***tx).await?;
+    Ok(())
+}
+
+/// Settings versions and approver rules are append-only or replaced as a set: one writer per organisation at a time.
+pub async fn lock_settings(tx: &mut OrgTx<'_>) -> Result<(), DomainError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('iam-settings:' || app.current_org()::text))").execute(&mut ***tx).await?;
+    Ok(())
+}
+
+/// A unique index hit (email, mobile, employee link, role name) is a conflict with an existing row (409).
+fn duplicate(what: &'static str) -> impl FnOnce(sqlx::Error) -> DomainError {
+    move |e| {
+        if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
+            DomainError::Refused("ALREADY_EXISTS", format!("{what} is already in use in the organisation"))
+        } else {
+            e.into()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -169,11 +215,12 @@ pub async fn list_users(tx: &mut OrgTx<'_>, role: Option<Uuid>, active: Option<b
          WHERE ($1::uuid IS NULL OR EXISTS (SELECT 1 FROM iam.user_role ur WHERE ur.user_id = u.id AND ur.role_id = $1))
            AND ($2::boolean IS NULL OR u.active = $2)
            AND ($3::text IS NULL OR u.email ILIKE '%' || $3 || '%' OR u.mobile LIKE '%' || $3 || '%' OR e.full_name ILIKE '%' || $3 || '%')
+         -- $3 arrives with LIKE wildcards escaped
          ORDER BY coalesce(u.email, u.mobile), u.id"
     ))
     .bind(role)
     .bind(active)
-    .bind(q)
+    .bind(q.map(|q| q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
     .fetch_all(&mut ***tx)
     .await?)
 }
@@ -252,8 +299,8 @@ pub async fn create_user(tx: &mut OrgTx<'_>, actor: Uuid, u: NewUser) -> Result<
     let hash = match (u.login_kind.as_str(), &u.mobile, &u.email, &u.initial_password) {
         ("mobile_otp", Some(m), _, None) if is_mobile(m) => None,
         ("mobile_otp", ..) => return Err(invalid("mobile_otp needs mobile in E.164 form (+91...) and no password")),
-        ("password", _, Some(e), Some(p)) if e.contains('@') && e.len() <= 254 && (8..=200).contains(&p.chars().count()) => Some(hash_password(p)?),
-        ("password", ..) => return Err(invalid("password needs email and an initial_password of 8-200 characters")),
+        ("password", m, Some(e), Some(p)) if is_email(e) && m.as_deref().is_none_or(is_mobile) && (8..=200).contains(&p.chars().count()) => Some(hash_password(p)?),
+        ("password", ..) => return Err(invalid("password needs a valid email, an initial_password of 8-200 characters and, if given, a mobile in E.164 form")),
         _ => return Err(invalid("login_kind must be mobile_otp or password")),
     };
     if u.language.as_deref().is_some_and(|l| !["en", "ta", "hi"].contains(&l)) {
@@ -277,11 +324,17 @@ pub async fn create_user(tx: &mut OrgTx<'_>, actor: Uuid, u: NewUser) -> Result<
     .bind(&u.language)
     .bind(actor)
     .fetch_one(&mut ***tx)
-    .await?;
+    .await
+    .map_err(duplicate("the mobile, email or employee link"))?;
     set_access(tx, actor, id, &u.roles, &u.scopes).await?;
     let created = get_user(tx, id).await?;
     db::audit(tx, actor, "iam.user_created", "user_account", Some(id), Some(created.clone())).await?;
     Ok(created)
+}
+
+fn is_email(e: &str) -> bool {
+    let Some((local, domain)) = e.split_once('@') else { return false };
+    e.len() <= 254 && !local.is_empty() && !domain.contains('@') && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.') && !e.contains(char::is_whitespace)
 }
 
 fn is_mobile(m: &str) -> bool {
@@ -300,6 +353,7 @@ pub async fn change_access(tx: &mut OrgTx<'_>, actor: Uuid, user: Uuid, roles: &
     not_self(actor, user)?;
     let before = get_user(tx, user).await?;
     set_access(tx, actor, user, roles, scopes).await?;
+    admin_remains(tx).await?;
     let after = get_user(tx, user).await?;
     let change = json!({ "before": { "roles": before["roles"], "scopes": before["scopes"] }, "after": { "roles": after["roles"], "scopes": after["scopes"] }, "reason": reason });
     db::audit(tx, actor, "iam.user_access_changed", "user_account", Some(user), Some(change)).await?;
@@ -320,6 +374,7 @@ pub async fn set_active(tx: &mut OrgTx<'_>, actor: Uuid, user: Uuid, active: boo
     if changed == 1 {
         if !active {
             sqlx::query("UPDATE iam.session SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL").bind(user).execute(&mut ***tx).await?;
+            admin_remains(tx).await?;
         }
         let action = if active { "iam.user_reactivated" } else { "iam.user_deactivated" };
         db::audit(tx, actor, action, "user_account", Some(user), Some(json!({ "reason": reason }))).await?;
@@ -431,7 +486,8 @@ pub async fn create_role(tx: &mut OrgTx<'_>, actor: Uuid, name: &str) -> Result<
         .bind(check_name(name)?)
         .bind(actor)
         .fetch_one(&mut ***tx)
-        .await?;
+        .await
+        .map_err(duplicate("the role name"))?;
     db::audit(tx, actor, "iam.role_created", "role", Some(id), Some(json!({ "name": name }))).await?;
     role_json(tx, id).await
 }
@@ -442,7 +498,13 @@ pub async fn rename_role(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, name: &str) 
     if system.ok_or(DomainError::NotFound)?.is_some() {
         return Err(DomainError::IllegalTransition("system roles keep their names (OQ-C03-01)".into()));
     }
-    sqlx::query("UPDATE iam.role SET name = $2, updated_by = $3 WHERE id = $1").bind(id).bind(check_name(name)?).bind(actor).execute(&mut ***tx).await?;
+    sqlx::query("UPDATE iam.role SET name = $2, updated_by = $3 WHERE id = $1")
+        .bind(id)
+        .bind(check_name(name)?)
+        .bind(actor)
+        .execute(&mut ***tx)
+        .await
+        .map_err(duplicate("the role name"))?;
     db::audit(tx, actor, "iam.role_renamed", "role", Some(id), Some(json!({ "name": name }))).await?;
     role_json(tx, id).await
 }
@@ -474,7 +536,13 @@ pub async fn change_grants(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, grants: &[
         }
     }
     let before = role_json(tx, id).await?;
-    sqlx::query("SELECT 1 FROM iam.role WHERE id = $1 FOR UPDATE").bind(id).execute(&mut ***tx).await?;
+    if !before["system_code"].is_null() {
+        return Err(DomainError::IllegalTransition("system roles keep the matrix's grants until G-09 / OQ-C03-01 is decided".into()));
+    }
+    let holds: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM iam.user_role WHERE user_id = $1 AND role_id = $2)").bind(actor).bind(id).fetch_one(&mut ***tx).await?;
+    if holds {
+        return Err(DomainError::Forbidden); // nobody changes the grants of a role they hold (no self-promotion)
+    }
     sqlx::query("DELETE FROM iam.role_grant WHERE role_id = $1").bind(id).execute(&mut ***tx).await?;
     for g in grants {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind, setting_ref, created_by) VALUES (app.current_org(), $1, $2, $3, $4, $5)")
@@ -487,6 +555,7 @@ pub async fn change_grants(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, grants: &[
             .await?;
     }
     sqlx::query("UPDATE iam.role SET updated_by = $2 WHERE id = $1").bind(id).bind(actor).execute(&mut ***tx).await?;
+    admin_remains(tx).await?;
     let after = role_json(tx, id).await?;
     db::audit(tx, actor, "iam.role_grants_changed", "role", Some(id), Some(json!({ "before": before["grants"], "after": after["grants"], "reason": reason }))).await?;
     Ok(after)
@@ -617,7 +686,7 @@ async fn get_delegation(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainErr
         .ok_or(DomainError::NotFound)
 }
 
-/// Shortens the window to now; a delegation not yet started is cut to an instant window. Ended already -> unchanged.
+/// Shortens the window to now; a delegation not yet started is removed. Ended already -> unchanged.
 pub async fn end_delegation(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid) -> Result<Value, DomainError> {
     let changed = sqlx::query(
         "UPDATE iam.delegation SET valid = tstzrange(least(lower(valid), now()), now()) WHERE id = $1 AND upper(valid) > now() AND lower(valid) < now()",
@@ -626,13 +695,14 @@ pub async fn end_delegation(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid) -> Result
     .execute(&mut ***tx)
     .await?
     .rows_affected();
-    // Not started yet: nothing to keep, so the window shrinks to its first microsecond (a range cannot be empty).
-    let future = sqlx::query("UPDATE iam.delegation SET valid = tstzrange(lower(valid), lower(valid) + interval '1 microsecond') WHERE id = $1 AND lower(valid) >= now()")
-        .bind(id)
-        .execute(&mut ***tx)
-        .await?
-        .rows_affected();
-    let d = get_delegation(tx, id).await?;
+    // Not started yet: nothing happened under it, so it is removed (the table forbids an empty window) and audited.
+    let mut d = get_delegation(tx, id).await?;
+    let future = sqlx::query("DELETE FROM iam.delegation WHERE id = $1 AND lower(valid) >= now()").bind(id).execute(&mut ***tx).await?.rows_affected();
+    if future > 0 {
+        d["valid_to"] = d["valid_from"].clone();
+    } else {
+        d = get_delegation(tx, id).await?;
+    }
     if changed + future > 0 {
         db::audit(tx, actor, "iam.delegation_ended", "delegation", Some(id), None).await?;
     }
@@ -664,5 +734,6 @@ mod tests {
         assert!(!GRANTABLE.iter().any(|c| c.starts_with("PLT-")));
         assert!(module_on("LVE-01", &[]) && !module_on("CMP-01", &[]) && module_on("CMP-01", &["M02".into()]));
         assert!(is_mobile("+919876543210") && !is_mobile("9876543210") && !is_mobile("+0123456789"));
+        assert!(is_email("hr@example.in") && !is_email("hr@") && !is_email("@x.in") && !is_email("a@b") && !is_email("a b@x.in"));
     }
 }
