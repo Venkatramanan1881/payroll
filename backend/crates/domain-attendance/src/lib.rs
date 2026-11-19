@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub mod approval;
 pub mod jobs;
 pub mod leave;
+pub mod openbal;
 pub mod period;
 pub mod regularisation;
 
