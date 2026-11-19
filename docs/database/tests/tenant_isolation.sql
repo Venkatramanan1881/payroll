@@ -2,7 +2,10 @@
 -- Run against a disposable database after all migrations: psql -v ON_ERROR_STOP=1 -f tenant_isolation.sql
 -- Any failure raises an exception. Runs inside one transaction and rolls back.
 
+\set ON_ERROR_STOP 1
 BEGIN;
+-- PostgreSQL 16+ (Supabase): SET ROLE needs membership. Granted inside the transaction, so the ROLLBACK removes it.
+GRANT app_api TO CURRENT_USER WITH INHERIT FALSE, SET TRUE;
 
 -- 1. Build check: no unprotected tables (NFR-01.4).
 DO $$ BEGIN

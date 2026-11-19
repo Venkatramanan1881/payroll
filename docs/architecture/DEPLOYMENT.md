@@ -49,10 +49,10 @@ DATABASE_URL=<owner connection> api migrate
 
 ### The current test project
 
-- `izxqgkbiulmbgrbpvfzq` received migrations 0001–0009 through the Supabase console tooling, not through `api migrate`. It therefore has no `_sqlx_migrations` record, and `api migrate` would try to apply everything again.
-- Because it holds no data, the simplest fix is to reset the project's application schemas and then run `api migrate`.
-- Alternatively, record 0001–0009 as applied (the checksums must match the files in git).
-- Either way, it needs explicit approval before it is done.
+- `izxqgkbiulmbgrbpvfzq` (region ap-northeast-1, test only) was reset and rebuilt with `api migrate` on 2026-11-19; `_sqlx_migrations` records 0001–0009.
+- `docs/database/tests/tenant_isolation.sql` passed against it the same day.
+- `supabase_roles.sql` has not been run there yet: until it is, no login role can switch to `app_api`, so the API cannot serve.
+- Supabase's own migration list still shows the earlier console-applied 0001–0009; our history is `_sqlx_migrations`.
 
 ## 4. Cloud Run service
 
@@ -98,6 +98,7 @@ Until the OIDC upgrade (§5), the job secret is the only gate: Cloud Run IAM wou
 ## 6. Release checklist
 
 1. All tests pass (`cargo test --workspace` against a throwaway PostgreSQL) and clippy is clean.
+   Production: the Supabase project is in **Mumbai (ap-south-1)** (D-21); a project's region cannot be changed later.
 2. Migrations reviewed; any new one approved (Gate 3 amendment).
 3. `api migrate` run against the target database as the owner.
 4. Deploy the image; check `/health`.

@@ -27,6 +27,10 @@ Answers given by the project owner in session. Each decision closes the listed q
 | D-12b | 2026-11-17 | Email provider (D3) | **Zoho ZeptoMail** (transactional email; India data centre to be selected at sign-up, TB-07). | D3 | TSD to record it in its next version; current prices and data-location terms to be checked at sign-up |
 | D-H3 | 2026-11-16 | Update the TSD for BRD v0.8? | **Yes**: TSD v0.2 written, v0.1 kept. | H3 | — |
 | D-H4 | 2026-11-16 | Delete BRD v0.7? | **No. Never delete any version** of a source document. | H4 | Standing rule |
+| D-18 | 2026-11-19 | Changing a branch's time zone needs a migration (branch_timezone is append-only) | **Deferred.** India-only customers do not move zones; the endpoint stays unbuilt. | — | organisation.yaml change-time-zone not implemented until asked |
+| D-19 | 2026-11-19 | Where is the payroll input export (MD-06) stored? | **Google Cloud Storage**: a private bucket, short-lived signed download links (TB-02). | OQ-C12-11 (storage part) | Slice 9 |
+| D-20 | 2026-11-19 | How are payable days computed? | **Calendar days employed in the period minus deduction days** (LOP absences, hours shortfall, missed-punch and late/early penalties counted in days). | Slice 8 assumption | — |
+| D-21 | 2026-11-19 | Region | **Test project outside Mumbai (ap-northeast-1); production in Mumbai (ap-south-1).** A project's region cannot change later. | D4 (production) | DEPLOYMENT.md release checklist |
 
 ## Answered but not yet closed (need a follow-up answer)
 
