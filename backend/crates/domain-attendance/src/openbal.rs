@@ -124,6 +124,9 @@ async fn check_entry(tx: &mut OrgTx<'_>, e: &EntryIn) -> Result<Option<String>, 
             if !known {
                 return Ok(Some("leave_type_id is not a leave type of the organisation".into()));
             }
+            if crate::comp_off::is_comp_off_type(tx, t).await? {
+                return Ok(Some("comp-off is not a leave balance (D-25); comp-off opening balances are not available yet".into()));
+            }
         }
         // shortcut: counters wait for the period-counter rebuild that reads them (LA-18 / EC-17); accepting them now would silently drop them.
         ("comp_off" | "permission_used" | "late_counter" | "early_counter", ..) => {

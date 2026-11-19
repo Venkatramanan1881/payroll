@@ -13,7 +13,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// POST /internal/jobs/{name}: nightly-recalculation (J1), approval-timeouts (J3) or period-housekeeping (J7), for every active organisation.
+/// POST /internal/jobs/{name}: nightly-recalculation (J1), approval-timeouts (J3), comp-off-expiry (J6) or period-housekeeping (J7), for every active organisation.
 /// One organisation's failure is reported and the others still run.
 // shortcut: a shared secret from Secret Manager; switch to Cloud Scheduler OIDC tokens (audience check) when the deployment adds it.
 pub async fn run(State(state): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
@@ -22,7 +22,7 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>, header
     if !same(sent.as_bytes(), secret) {
         return Err(ApiError::Unauthenticated);
     }
-    if !["nightly-recalculation", "approval-timeouts", "period-housekeeping"].contains(&name.as_str()) {
+    if !["nightly-recalculation", "approval-timeouts", "comp-off-expiry", "period-housekeeping"].contains(&name.as_str()) {
         return Err(ApiError::NotFound);
     }
     let orgs = jobs::active_organisations(&state.pool).await?;
@@ -32,7 +32,11 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>, header
             "nightly-recalculation" => jobs::nightly_recalculation(&state.pool, *org).await,
             _ => {
                 let mut tx = db::begin_org(&state.pool, *org).await?;
-                let r = if name == "period-housekeeping" { domain_attendance::period::housekeeping(&mut tx).await } else { jobs::approval_timeouts(&mut tx).await };
+                let r = match name.as_str() {
+                    "period-housekeeping" => domain_attendance::period::housekeeping(&mut tx).await,
+                    "comp-off-expiry" => domain_attendance::comp_off::expire_due(&mut tx).await,
+                    _ => jobs::approval_timeouts(&mut tx).await,
+                };
                 match r {
                     Ok(s) => tx.commit().await.map(|_| s).map_err(Into::into),
                     Err(e) => Err(e),
