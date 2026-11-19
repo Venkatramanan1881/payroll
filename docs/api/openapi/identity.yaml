@@ -1277,6 +1277,7 @@ components:
               - type: object
                 properties:
                   challenge_token: { type: string, description: Present only with SECOND_FACTOR_REQUIRED. }
+                  otpauth_uri: { type: string, description: 'D-23: first sign-in only. The authenticator secret to enrol (otpauth:// URI for a QR code); stored once its first code is verified.' }
   schemas:
     TokenPair:
       type: object

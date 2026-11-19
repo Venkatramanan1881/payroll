@@ -55,12 +55,32 @@ impl api::storage::ObjectStore for MemoryStore {
     }
 }
 
+pub const MFA_KEY: [u8; 32] = [9u8; 32];
+
+/// Test vendor verifier: "vendor:<email>" verifies to that email.
+pub struct FakeVendorVerifier;
+
+#[async_trait::async_trait]
+impl domain_iam::firebase::VendorTokenVerifier for FakeVendorVerifier {
+    async fn verify(&self, id_token: &str) -> Result<String, domain_iam::tokens::TokenError> {
+        id_token.strip_prefix("vendor:").map(str::to_lowercase).ok_or(domain_iam::tokens::TokenError)
+    }
+}
+
 pub fn state(pool: PgPool) -> api::AppState {
     state_with_store(pool, std::sync::Arc::new(MemoryStore::default()))
 }
 
 pub fn state_with_store(pool: PgPool, store: std::sync::Arc<MemoryStore>) -> api::AppState {
-    api::AppState { pool, jwt_secret: JWT_SECRET.to_vec(), phone_verifier: std::sync::Arc::new(FakeVerifier), job_secret: Some(JOB_SECRET.to_vec()), store: Some(store) }
+    api::AppState {
+        pool,
+        jwt_secret: JWT_SECRET.to_vec(),
+        phone_verifier: std::sync::Arc::new(FakeVerifier),
+        job_secret: Some(JOB_SECRET.to_vec()),
+        store: Some(store),
+        vendor_verifier: Some(std::sync::Arc::new(FakeVendorVerifier)),
+        mfa_key: Some(MFA_KEY),
+    }
 }
 
 pub fn app(pool: PgPool) -> axum::Router {

@@ -1,6 +1,6 @@
 mod error;
 mod extract;
-mod idempotency;
+pub(crate) mod idempotency;
 mod routes;
 pub mod storage;
 
@@ -20,6 +20,10 @@ pub struct AppState {
     pub job_secret: Option<Vec<u8>>,
     /// Payroll input export files (D-19); None when EXPORT_BUCKET is not set.
     pub store: Option<Arc<dyn storage::ObjectStore>>,
+    /// Vendor console sign-in (D-22); None keeps every /v1/vendor route at 404.
+    pub vendor_verifier: Option<Arc<dyn domain_iam::firebase::VendorTokenVerifier>>,
+    /// AES-256 key for authenticator secrets (D-23); None makes AC-08 sign-ins fail closed.
+    pub mfa_key: Option<[u8; 32]>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -27,6 +31,25 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(|| async { Json(serde_json::json!({ "status": "ok" })) }))
         .route("/v1/auth/firebase/sign-in", post(routes::auth::firebase_sign_in))
         .route("/v1/auth/organisation-choice", post(routes::auth::choose_organisation))
+        .route("/v1/auth/password/sign-in", post(routes::auth::password_sign_in))
+        .route("/v1/auth/second-factor/verify", post(routes::auth::verify_second_factor))
+        .route("/v1/vendor/auth/google/sign-in", post(routes::vendor::google_sign_in))
+        .route("/v1/vendor/organisations", get(routes::vendor::list_orgs).post(routes::vendor::create_org))
+        .route("/v1/vendor/organisations/{id}", get(routes::vendor::get_org))
+        .route("/v1/vendor/organisations/{id}/change-plan", post(routes::vendor::change_plan))
+        .route("/v1/vendor/organisations/{id}/change-employee-limit", post(routes::vendor::change_limit))
+        .route("/v1/vendor/organisations/{id}/change-vendor-settings", post(routes::vendor::change_vendor_settings))
+        .route("/v1/vendor/organisations/{id}/change-subscription", post(routes::vendor::change_subscription))
+        .route("/v1/vendor/organisations/{id}/modules/{module_code}/switch-on", post(routes::vendor::module_on))
+        .route("/v1/vendor/organisations/{id}/modules/{module_code}/switch-off", post(routes::vendor::module_off))
+        .route("/v1/vendor/organisations/{id}/suspend", post(routes::vendor::suspend))
+        .route("/v1/vendor/organisations/{id}/reactivate", post(routes::vendor::reactivate))
+        .route("/v1/vendor/organisations/{id}/history", get(routes::vendor::history))
+        .route("/v1/vendor/plans", get(routes::vendor::list_plans).post(routes::vendor::create_plan))
+        .route("/v1/vendor/plans/{id}", axum::routing::patch(routes::vendor::update_plan))
+        .route("/v1/vendor/vendor-users", get(routes::vendor::list_vendor_users).post(routes::vendor::create_vendor_user))
+        .route("/v1/vendor/vendor-users/{id}/change-role", post(routes::vendor::change_vendor_role))
+        .route("/v1/vendor/vendor-users/{id}/deactivate", post(routes::vendor::deactivate_vendor_user))
         .route("/v1/auth/refresh", post(routes::auth::refresh))
         .route("/v1/auth/sign-out", post(routes::auth::sign_out))
         .route("/v1/shifts", post(routes::sched::create_shift).get(routes::sched::list_shifts))

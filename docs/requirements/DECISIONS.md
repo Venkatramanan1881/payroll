@@ -31,6 +31,9 @@ Answers given by the project owner in session. Each decision closes the listed q
 | D-19 | 2026-11-19 | Where is the payroll input export (MD-06) stored? | **Google Cloud Storage**: a private bucket, short-lived signed download links (TB-02). | OQ-C12-11 (storage part) | Slice 9 |
 | D-20 | 2026-11-19 | How are payable days computed? | **Calendar days employed in the period minus deduction days** (LOP absences, hours shortfall, missed-punch and late/early penalties counted in days). | Slice 8 assumption | — |
 | D-21 | 2026-11-19 | Region | **Test project outside Mumbai (ap-northeast-1); production in Mumbai (ap-south-1).** A project's region cannot change later. | D4 (production) | DEPLOYMENT.md release checklist |
+| D-22 | 2026-11-19 | How do vendor staff sign in to the vendor console? (OQ-V01-17) | **Google accounts restricted to the vendor's domain** (Google ID token; no vendor passwords stored). | OQ-V01-17 | Contract amendment: POST /v1/vendor/auth/google/sign-in |
+| D-23 | 2026-11-19 | What is the admins' second sign-in step (AC-08)? (OQ-C03-06, method) | **Authenticator-app code (TOTP)**, enrolled at the first password sign-in. | OQ-C03-06 (method only; who is an admin user stays open) | — |
+| D-24 | 2026-11-19 | Slice 11 scope | **Split:** slice 11 = vendor console core and admin sign-in; slice 12 = opening balances, support access, usage/health, templates, announcements. | — | — |
 
 ## Answered but not yet closed (need a follow-up answer)
 

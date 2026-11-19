@@ -21,6 +21,7 @@ struct Keys {
 
 pub struct GoogleVerifier {
     project_id: String,
+    jwk_url: &'static str,
     keys: RwLock<Keys>,
 }
 
@@ -53,7 +54,7 @@ impl GoogleVerifier {
     /// Fixed keys (tests); they never refresh.
     pub fn with_keys(project_id: &str, map: HashMap<String, DecodingKey>) -> Self {
         let far = Instant::now() + Duration::from_secs(100 * 365 * 24 * 3600);
-        Self { project_id: project_id.to_string(), keys: RwLock::new(Keys { map, valid_until: far }) }
+        Self { project_id: project_id.to_string(), jwk_url: JWK_URL, keys: RwLock::new(Keys { map, valid_until: far }) }
     }
 
     fn expired(self) -> Self {
@@ -68,7 +69,7 @@ impl GoogleVerifier {
                 return k.map.get(kid).cloned().ok_or(TokenError);
             }
         }
-        let res = reqwest::get(JWK_URL).await.map_err(|_| TokenError)?;
+        let res = reqwest::get(self.jwk_url).await.map_err(|_| TokenError)?;
         let max_age = res
             .headers()
             .get("cache-control")
@@ -103,6 +104,69 @@ impl PhoneTokenVerifier for GoogleVerifier {
             return Err(TokenError);
         }
         Ok(c.phone_number)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Vendor console sign-in (D-22): Google ID tokens from the vendor's own domain.
+
+const GOOGLE_CERTS: &str = "https://www.googleapis.com/oauth2/v3/certs";
+
+/// Verifies a vendor's Google ID token and returns the verified email (lower case).
+#[async_trait::async_trait]
+pub trait VendorTokenVerifier: Send + Sync {
+    async fn verify(&self, id_token: &str) -> Result<String, TokenError>;
+}
+
+pub struct GoogleIdVerifier {
+    keys: GoogleVerifier,
+    domain: String,
+}
+
+#[derive(Deserialize)]
+struct GoogleIdClaims {
+    email: String,
+    #[serde(default)]
+    email_verified: bool,
+    #[serde(default)]
+    hd: Option<String>,
+    iat: i64,
+}
+
+impl GoogleIdVerifier {
+    /// `client_id`: the OAuth client the console signs in with (the token audience); `domain`: the vendor's Workspace domain.
+    pub fn new(client_id: &str, domain: &str) -> Self {
+        let mut keys = GoogleVerifier::new(client_id);
+        keys.jwk_url = GOOGLE_CERTS;
+        Self { keys, domain: domain.trim().to_lowercase() }
+    }
+
+    /// Fixed keys (tests).
+    pub fn with_keys(client_id: &str, domain: &str, map: HashMap<String, DecodingKey>) -> Self {
+        Self { keys: GoogleVerifier::with_keys(client_id, map), domain: domain.to_lowercase() }
+    }
+}
+
+#[async_trait::async_trait]
+impl VendorTokenVerifier for GoogleIdVerifier {
+    async fn verify(&self, id_token: &str) -> Result<String, TokenError> {
+        let header = decode_header(id_token).map_err(|_| TokenError)?;
+        if header.alg != Algorithm::RS256 {
+            return Err(TokenError);
+        }
+        let key = self.keys.key(header.kid.as_deref().ok_or(TokenError)?).await?;
+        let mut v = Validation::new(Algorithm::RS256);
+        v.set_audience(&[&self.keys.project_id]);
+        v.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
+        let c = decode::<GoogleIdClaims>(id_token, &key, &v).map_err(|_| TokenError)?.claims;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| TokenError)?.as_secs() as i64;
+        let email = c.email.to_lowercase();
+        // `hd` is set only for Workspace accounts; a personal Gmail account with a look-alike address never passes.
+        let in_domain = c.hd.as_deref().map(str::to_lowercase).as_deref() == Some(self.domain.as_str()) && email.ends_with(&format!("@{}", self.domain));
+        if !c.email_verified || !in_domain || c.iat > now + 60 {
+            return Err(TokenError);
+        }
+        Ok(email)
     }
 }
 
@@ -161,6 +225,28 @@ mod tests {
     #[tokio::test]
     async fn unknown_kid_rejected() {
         assert!(verifier().verify(&mint("k9", PROJECT, &iss(), now() + 3600, "+91")).await.is_err());
+    }
+
+    fn google(aud: &str, iss: &str, email: &str, verified: bool, hd: Option<&str>) -> String {
+        let mut h = Header::new(Algorithm::RS256);
+        h.kid = Some("k1".into());
+        let claims = serde_json::json!({ "aud": aud, "iss": iss, "exp": now() + 3600, "iat": now() - 10, "sub": "g1", "email": email,
+                                          "email_verified": verified, "hd": hd });
+        encode(&h, &claims, &EncodingKey::from_rsa_pem(PRIVATE.as_bytes()).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn vendor_google_tokens_need_the_domain() {
+        let mut keys = HashMap::new();
+        keys.insert("k1".to_string(), jsonwebtoken::DecodingKey::from_rsa_pem(PUBLIC.as_bytes()).unwrap());
+        let v = GoogleIdVerifier::with_keys("client-1", "probeyond.in", keys);
+        let iss = "https://accounts.google.com";
+        assert_eq!(v.verify(&google("client-1", iss, "Ops@ProBeyond.in", true, Some("probeyond.in"))).await.unwrap(), "ops@probeyond.in");
+        assert!(v.verify(&google("client-1", iss, "ops@probeyond.in", true, None)).await.is_err(), "personal account without hd");
+        assert!(v.verify(&google("client-1", iss, "ops@gmail.com", true, Some("probeyond.in"))).await.is_err());
+        assert!(v.verify(&google("client-1", iss, "ops@probeyond.in", false, Some("probeyond.in"))).await.is_err(), "unverified email");
+        assert!(v.verify(&google("other", iss, "ops@probeyond.in", true, Some("probeyond.in"))).await.is_err(), "wrong audience");
+        assert!(v.verify(&google("client-1", "https://evil", "ops@probeyond.in", true, Some("probeyond.in"))).await.is_err());
     }
 
     #[tokio::test]

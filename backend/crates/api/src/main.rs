@@ -35,7 +35,22 @@ async fn main() -> anyhow::Result<()> {
     if store.is_none() {
         eprintln!("EXPORT_BUCKET is not set: payroll input exports are disabled");
     }
-    let app = api::router(api::AppState { pool, jwt_secret, phone_verifier, job_secret, store });
+    // The vendor console (D-22) is served only where both are set: the vendor service, never the public API.
+    let vendor_verifier = match (std::env::var("VENDOR_GOOGLE_CLIENT_ID"), std::env::var("VENDOR_GOOGLE_DOMAIN")) {
+        (Ok(c), Ok(d)) if !c.trim().is_empty() && !d.trim().is_empty() => {
+            Some(std::sync::Arc::new(domain_iam::firebase::GoogleIdVerifier::new(c.trim(), d.trim())) as std::sync::Arc<dyn domain_iam::firebase::VendorTokenVerifier>)
+        }
+        _ => None,
+    };
+    // MFA_ENCRYPTION_KEY: 32 random bytes, base64. Without it AC-08 sign-ins fail closed.
+    let mfa_key = std::env::var("MFA_ENCRYPTION_KEY").ok().and_then(|k| {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(k.trim()).ok().and_then(|b| <[u8; 32]>::try_from(b).ok())
+    });
+    if mfa_key.is_none() {
+        eprintln!("MFA_ENCRYPTION_KEY is missing or not 32 bytes (base64): admin sign-in with the second step will fail");
+    }
+    let app = api::router(api::AppState { pool, jwt_secret, phone_verifier, job_secret, store, vendor_verifier, mfa_key });
     // The peer address backs PC-05 when no trusted proxy header is present.
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
