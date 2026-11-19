@@ -31,6 +31,17 @@
   - Hours: like a permission that counts as worked — an edge of the shift moves, and the uncovered part is credited.
   - Half day: covers the half without kept punches (first kept punch before mid-shift → second half, else first half); the split point is the shift's fixed half-day split if set, else mid-shift. Which half is not a stored column (OQ-C09-12).
 
+## Review fixes
+- **No false absence:** approved time away (permission or on-duty) with no punches is judged on hours; it is never a full absence or full loss of pay (half-day on-duty with no return, half-day leave plus half-day on-duty, a whole shift of on-duty hours).
+- **Off days keep their status:** a full or several-day on-duty over a weekly off, holiday or unscheduled day keeps that status and adds an `on_duty` flag (OD-10 comp-off reads it in slice 15).
+- **Hours inside the shift:** hours and half days need a shift with set times; hours outside it are refused (422), and only the part inside the shift is credited.
+- **Credit counted once:** overlapping permission and on-duty intervals are credited as their union; back-to-back covers chain at both edges whatever their order.
+- **The half-day split:** comes from the shift (fixed SH-11 time, else mid-shift) before any edge moves, for leave as well as on-duty; a half-day on-duty next to a half-day leave covers the other half.
+- **Visibility:** list and get read the PRM-09, PRM-10 and PRM-11 scopes (managers see their team without PRM-11).
+- **Leave re-checked at final approval:** leave approved after the on-duty was submitted refuses the approval (OVERLAPPING_REQUEST).
+- **Leavers:** settings are read only for a level-1 approval, so a request of someone no longer employed on its date can still be rejected.
+- **OD-04 "after" window:** counts from the first day of the on-duty.
+
 ## Not in this slice
 - Proof files, OD-07 punch evidence, OD-03 limits, OD-09 daily allowance (V3), OD-10 comp-off (slice 15), OD-11 eligibility, the on-duty timer (J3), the change route (G-27).
 - Leave submission does not yet refuse a day already covered by approved on-duty (the day shows on-duty; leave balance still charged).

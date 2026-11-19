@@ -16,14 +16,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// Own requests plus the PRM-11 scope; approvers also see what is routed to or was decided by them.
+/// Own requests plus the approver and HR scopes (PRM-09/10/11); approvers also see what is routed to or was decided by them.
 async fn readable(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Option<Vec<Uuid>>, ApiError> {
     let mut out: Vec<Uuid> = p.employee_id.into_iter().collect();
-    match visible_employees(tx, p, "PRM-11").await {
-        Ok(None) => return Ok(None),
-        Ok(Some(more)) => out.extend(more),
-        Err(ApiError::Forbidden) => {}
-        Err(e) => return Err(e),
+    for op in ["PRM-09", "PRM-10", "PRM-11"] {
+        match visible_employees(tx, p, op).await {
+            Ok(None) => return Ok(None),
+            Ok(Some(more)) => out.extend(more),
+            Err(ApiError::Forbidden) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(Some(out))
 }

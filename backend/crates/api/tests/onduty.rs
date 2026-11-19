@@ -146,3 +146,45 @@ async fn switched_off(pool: PgPool) {
     let (st, b) = common::as_user(&app, &w.token, "POST", "/v1/on-duty/requests", Some(ask("full_day", &d, &d)), &key()).await;
     assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("RULE_GROUP_DISABLED")), "{b}");
 }
+
+async fn grant(pool: &PgPool, org: Uuid, user: Uuid, op: &str, kind: &str) {
+    let role = Uuid::new_v4();
+    sqlx::query("INSERT INTO iam.role (org_id, id, name) VALUES ($1, $2, $3)").bind(org).bind(role).bind(format!("r-{role}")).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, $4)").bind(org).bind(role).bind(op).bind(kind).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(org).bind(user).bind(role).execute(pool).await.unwrap();
+}
+
+/// A half day away with no punches is not an absence; hours stay inside the shift; a manager with PRM-09 (and no
+/// PRM-11) sees the team's on-duty even when someone else decided it.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn half_day_hours_and_visibility(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, None).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let boss = common::seed_worker(&pool, &app, &s, "Meena").await;
+    grant(&pool, s.org_id, boss.user_id, "PRM-09", "approve").await;
+    let ds = ((Utc::now() + Duration::minutes(330)).date_naive() - Duration::days(1)).to_string();
+
+    let mut early = ask("hours", &ds, &ds);
+    early["from_time"] = json!("07:00");
+    early["to_time"] = json!("10:00");
+    assert_eq!(common::as_user(&app, &w.token, "POST", "/v1/on-duty/requests", Some(early), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY, "hours inside the shift");
+
+    let (st, r) = common::as_user(&app, &w.token, "POST", "/v1/on-duty/requests", Some(ask("half_day", &ds, &ds)), &key()).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    let id = r["id"].as_str().unwrap();
+    let (st, ok) = common::as_user(&app, &s.hr_token, "POST", &format!("/v1/on-duty/requests/{id}/approve"), None, &key()).await;
+    assert_eq!((st, ok["state"].as_str()), (StatusCode::OK, Some("approved")), "{ok}");
+    let r = day(&app, &s, &w, &ds).await;
+    assert_ne!(r["day_status"], "absent", "{r}");
+    assert_ne!(r["day_fraction_present"], "0.00", "{r}");
+
+    // The manager becomes the reporting line only now: neither routed nor a decider, seen through PRM-09.
+    sqlx::query("INSERT INTO workforce.employee_assignment (org_id, employee_id, kind, manager_employee_id, valid) VALUES ($1, $2, 'reporting_manager', $3, daterange('2026-01-01', NULL))")
+        .bind(s.org_id).bind(w.employee_id).bind(boss.employee_id).execute(&pool).await.unwrap();
+    let (_, list) = common::as_user(&app, &boss.token, "GET", "/v1/on-duty/requests", None, &[]).await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "{list}");
+    assert_eq!(common::as_user(&app, &boss.token, "GET", &format!("/v1/on-duty/requests/{id}"), None, &[]).await.0, StatusCode::OK);
+}

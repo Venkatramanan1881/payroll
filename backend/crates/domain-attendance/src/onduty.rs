@@ -76,10 +76,22 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewOnDuty
     if hours && r.from_time == r.to_time {
         return Err(invalid("from_time and to_time differ"));
     }
+    // Hours and half days are parts of a shift: the day needs one with set times, and hours fall inside it.
+    if matches!(r.kind.as_str(), "hours" | "half_day") {
+        let Some((start, end)) = crate::shift_times(tx, employee, r.from).await? else {
+            return Err(invalid("hours and half days need a shift with set times on that date"));
+        };
+        if let (Some(f), Some(t)) = (r.from_time, r.to_time) {
+            let (a, b) = crate::permission::instants(tx, employee, r.from, f, t).await?;
+            if a < start || b > end {
+                return Err(invalid("on-duty hours fall inside the shift"));
+            }
+        }
+    }
     // OD-04: before the event only, or before / after within N days (the employee's own date).
     let tz = crate::employee_tz(tx, employee, r.from).await?;
     let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE $1)::date").bind(&tz).fetch_one(&mut ***tx).await?;
-    let window_ok = if s.before_only { today < r.from } else { today <= r.to + Duration::days(s.after_days) };
+    let window_ok = if s.before_only { today < r.from } else { today <= r.from + Duration::days(s.after_days) };
     if !window_ok {
         return Err(refused("OUTSIDE_REQUEST_WINDOW", "the on-duty is outside its application window (OD-04)"));
     }
@@ -88,13 +100,9 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewOnDuty
         if db::employee_locked(tx, employee, d, d.succ_opt()).await? {
             return Err(DomainError::PeriodLocked);
         }
-        // A full-day leave leaves nothing to be on duty for; a half-day leave still allows hours or the other half.
-        let leave = crate::leave::leave_on(tx, employee, d).await?;
-        if matches!(leave, Some(None)) || (leave.is_some() && matches!(r.kind.as_str(), "full_day" | "several_days")) {
-            return Err(refused("OVERLAPPING_REQUEST", format!("leave is taken on {d}")));
-        }
         d = d.succ_opt().expect("valid");
     }
+    leave_clash(tx, employee, &r.kind, r.from, r.to).await?;
     let overlapping: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM perm.on_duty_request WHERE employee_id = $1 AND state IN ('pending_l1','pending_l2','approved')
                         AND daterange(from_date, to_date, '[]') && daterange($2, $3, '[]'))",
@@ -131,8 +139,23 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewOnDuty
     Ok(id)
 }
 
+/// Approved leave on a covered day: a full-day leave leaves nothing to be on duty for; a half-day leave still
+/// allows hours or the other half.
+async fn leave_clash(tx: &mut OrgTx<'_>, employee: Uuid, kind: &str, from: NaiveDate, to: NaiveDate) -> Result<(), DomainError> {
+    let mut d = from;
+    while d <= to {
+        let leave = crate::leave::leave_on(tx, employee, d).await?;
+        if matches!(leave, Some(None)) || (leave.is_some() && matches!(kind, "full_day" | "several_days")) {
+            return Err(refused("OVERLAPPING_REQUEST", format!("leave is taken on {d}")));
+        }
+        d = d.succ_opt().expect("valid");
+    }
+    Ok(())
+}
+
 struct Row {
     employee: Uuid,
+    kind: String,
     state: String,
     requester: Uuid,
     approver: Option<Uuid>,
@@ -140,15 +163,17 @@ struct Row {
     to: NaiveDate,
 }
 
+type RowTuple = (Uuid, String, String, Uuid, Option<Uuid>, NaiveDate, NaiveDate);
+
 async fn lock(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Row, DomainError> {
-    let r: Option<(Uuid, String, Uuid, Option<Uuid>, NaiveDate, NaiveDate)> = sqlx::query_as(
-        "SELECT employee_id, state, requested_by, current_approver_user_id, from_date, to_date FROM perm.on_duty_request WHERE id = $1 FOR UPDATE",
+    let r: Option<RowTuple> = sqlx::query_as(
+        "SELECT employee_id, duration_kind, state, requested_by, current_approver_user_id, from_date, to_date FROM perm.on_duty_request WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut ***tx)
     .await?;
-    let (employee, state, requester, approver, from, to) = r.ok_or(DomainError::NotFound)?;
-    Ok(Row { employee, state, requester, approver, from, to })
+    let (employee, kind, state, requester, approver, from, to) = r.ok_or(DomainError::NotFound)?;
+    Ok(Row { employee, kind, state, requester, approver, from, to })
 }
 
 async fn recalc(tx: &mut OrgTx<'_>, employee: Uuid, from: NaiveDate, to: NaiveDate, trigger: &str, id: Uuid) -> Result<(), DomainError> {
@@ -206,8 +231,8 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
     if !approve && note.is_none() {
         return Err(invalid("reason is required to reject"));
     }
-    let s = settings_on(tx, r.employee, r.from).await?;
-    if approve && level == 1 && s.two_levels {
+    // Settings only matter for a level-1 approval (so a request of someone who has since left can still be decided).
+    if approve && level == 1 && settings_on(tx, r.employee, r.from).await?.two_levels {
         approval::step(tx, Step { kind: KIND, request_id: id, level, action: done, requester: r.requester, actor: Some(p.user_id), on_behalf_of, comment: note }).await?;
         let next = approval::route(tx, KIND, r.employee, 2, Utc::now().date_naive()).await?.filter(|a| *a != r.requester);
         sqlx::query("UPDATE perm.on_duty_request SET state = 'pending_l2', current_approver_user_id = $2, updated_at = now(), updated_by = $3 WHERE id = $1")
@@ -222,6 +247,9 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
     }
     if approve && any_locked(tx, r.employee, r.from, r.to).await? {
         return Err(DomainError::PeriodLocked);
+    }
+    if approve {
+        leave_clash(tx, r.employee, &r.kind, r.from, r.to).await?; // leave approved since the submission
     }
     approval::step(tx, Step { kind: KIND, request_id: id, level, action: done, requester: r.requester, actor: Some(p.user_id), on_behalf_of, comment: note }).await?;
     sqlx::query("UPDATE perm.on_duty_request SET state = $2, decided_basis = 'approver', current_approver_user_id = NULL, updated_at = now(), updated_by = $3 WHERE id = $1")
