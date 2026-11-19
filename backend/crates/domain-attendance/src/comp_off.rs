@@ -19,6 +19,13 @@ fn invalid(m: impl Into<String>) -> DomainError {
     DomainError::Validation(m.into())
 }
 
+/// One employee's comp-off writes (earning, decisions, debits, reversals, expiry) run one at a time, so every ledger
+/// sum read after this lock is current.
+async fn lock_employee(tx: &mut OrgTx<'_>, employee: Uuid) -> Result<(), DomainError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('comp_off:' || $1::text))").bind(employee).execute(&mut ***tx).await?;
+    Ok(())
+}
+
 async fn employee_user(tx: &mut OrgTx<'_>, employee: Uuid) -> Result<Option<Uuid>, DomainError> {
     Ok(sqlx::query_scalar("SELECT id FROM iam.user_account WHERE employee_id = $1 ORDER BY created_at LIMIT 1").bind(employee).fetch_optional(&mut ***tx).await?)
 }
@@ -56,6 +63,16 @@ pub async fn on_day(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, policy_
         (true, true) => 100,
         (true, false) => hw.earned_pct(out.net_min),
     };
+    lock_employee(tx, employee).await?;
+    // SM-COMPOFF: a claim an approver rejected is final; only the system's own withdrawal lets the day earn again.
+    let rejected: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM leave.comp_off_credit WHERE employee_id = $1 AND worked_date = $2 AND state = 'not_credited' AND decided_by IS NOT NULL)")
+        .bind(employee)
+        .bind(date)
+        .fetch_one(&mut ***tx)
+        .await?;
+    if rejected {
+        return Ok(());
+    }
     let existing: Option<(Uuid, String, i64)> = sqlx::query_as(
         "SELECT id, state, (fraction * 100)::int8 FROM leave.comp_off_credit WHERE employee_id = $1 AND worked_date = $2 AND state <> 'not_credited' FOR UPDATE",
     )
@@ -63,10 +80,10 @@ pub async fn on_day(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, policy_
     .bind(date)
     .fetch_optional(&mut ***tx)
     .await?;
-    let requester = employee_user(tx, employee).await?;
     match existing {
         None if pct == 0 => Ok(()),
         None => {
+            let requester = employee_user(tx, employee).await?;
             let (state, approver) = if hw.approval {
                 ("pending_approval", approval::route(tx, KIND, employee, 1, Utc::now().date_naive()).await?)
             } else {
@@ -97,6 +114,7 @@ pub async fn on_day(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, policy_
             event(tx, if hw.approval { "RequestSubmitted" } else { "CompOffCredited" }, id, employee).await
         }
         Some((id, state, was)) if state == "pending_approval" && pct != was => {
+            let requester = employee_user(tx, employee).await?;
             if pct == 0 {
                 sqlx::query("UPDATE leave.comp_off_credit SET state = 'not_credited', current_approver_user_id = NULL, decided_at = now(), updated_at = now() WHERE id = $1")
                     .bind(id)
@@ -125,20 +143,28 @@ async fn event(tx: &mut OrgTx<'_>, kind: &str, id: Uuid, employee: Uuid) -> Resu
     Ok(())
 }
 
+/// employee, worked date, state, fraction (hundredths), approver, decider.
+type CreditRow = (Uuid, NaiveDate, String, i64, Option<Uuid>, Option<Uuid>);
+
 /// SM-COMPOFF C2 / C4 (CMP-05, one level). Credited answers approve with 200 and no second entry; not_credited
 /// answers reject with 200; the opposite decision is ILLEGAL_TRANSITION.
 pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, note: Option<&str>) -> Result<(), DomainError> {
-    let row: Option<(Uuid, NaiveDate, String, i64, Option<Uuid>)> = sqlx::query_as(
-        "SELECT employee_id, worked_date, state, (fraction * 100)::int8, current_approver_user_id FROM leave.comp_off_credit WHERE id = $1 FOR UPDATE",
+    let employee: Uuid = sqlx::query_scalar("SELECT employee_id FROM leave.comp_off_credit WHERE id = $1").bind(id).fetch_optional(&mut ***tx).await?.ok_or(DomainError::NotFound)?;
+    lock_employee(tx, employee).await?;
+    let row: Option<CreditRow> = sqlx::query_as(
+        "SELECT employee_id, worked_date, state, (fraction * 100)::int8, current_approver_user_id, decided_by FROM leave.comp_off_credit WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut ***tx)
     .await?;
-    let (employee, worked, state, pct, approver) = row.ok_or(DomainError::NotFound)?;
+    let (employee, worked, state, pct, approver, decided_by) = row.ok_or(DomainError::NotFound)?;
     if p.employee_id == Some(employee) {
         return Err(DomainError::SelfApproval); // BR-07
     }
     let on_behalf_of = approval::may_decide(tx, p, employee, "CMP-05", approver).await?;
+    if state != "pending_approval" && decided_by.is_some_and(|d| d != p.user_id) {
+        return Err(DomainError::NotFound); // a closed credit answers only to whoever decided it
+    }
     match (state.as_str(), approve) {
         ("pending_approval", _) => {}
         ("not_credited", false) => return Ok(()),
@@ -161,7 +187,8 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
         .bind(p.user_id)
         .execute(&mut ***tx)
         .await?;
-        post_credit(tx, id, Utc::now().date_naive(), pct, Some(p.user_id)).await?;
+        let today = crate::period::org_today(tx).await?;
+        post_credit(tx, id, today, pct, Some(p.user_id)).await?;
     } else {
         sqlx::query("UPDATE leave.comp_off_credit SET state = 'not_credited', decided_by = $2, decided_at = now(), current_approver_user_id = NULL, updated_at = now(), updated_by = $2 WHERE id = $1")
             .bind(id)
@@ -268,12 +295,14 @@ pub async fn is_comp_off_type(tx: &mut OrgTx<'_>, leave_type: Uuid) -> Result<bo
 }
 
 /// Open credits usable for leave starting on `from` (not expired by then), earliest-expiring first (OQ-M02-09),
-/// with what is left of each, in hundredths of a day. Locks them.
+/// with what is left of each, in hundredths of a day. Only credits earned before the leave are usable. Callers hold
+/// the employee lock.
 async fn usable(tx: &mut OrgTx<'_>, employee: Uuid, from: NaiveDate) -> Result<Vec<(Uuid, i64, i64)>, DomainError> {
     Ok(sqlx::query_as(
         "SELECT c.id, (c.fraction * 100)::int8, coalesce((SELECT (sum(e.quantity) * 100)::int8 FROM leave.comp_off_ledger_entry e WHERE e.credit_id = c.id), 0)
-         FROM leave.comp_off_credit c WHERE c.employee_id = $1 AND c.state IN ('credited','partially_used') AND (c.expires_on IS NULL OR c.expires_on >= $2)
-         ORDER BY c.expires_on NULLS LAST, c.worked_date FOR UPDATE",
+         FROM leave.comp_off_credit c WHERE c.employee_id = $1 AND c.state IN ('credited','partially_used') AND c.worked_date < $2
+           AND (c.expires_on IS NULL OR c.expires_on >= $2)
+         ORDER BY c.expires_on NULLS LAST, c.worked_date",
     )
     .bind(employee)
     .bind(from)
@@ -283,6 +312,7 @@ async fn usable(tx: &mut OrgTx<'_>, employee: Uuid, from: NaiveDate) -> Result<V
 
 /// Comp-off available (hundredths of a day) for leave starting on `from`.
 pub async fn available_pct(tx: &mut OrgTx<'_>, employee: Uuid, from: NaiveDate) -> Result<i64, DomainError> {
+    lock_employee(tx, employee).await?;
     Ok(usable(tx, employee, from).await?.iter().map(|c| c.2).sum())
 }
 
@@ -299,8 +329,13 @@ async fn set_state(tx: &mut OrgTx<'_>, credit: Uuid) -> Result<(), DomainError> 
 
 /// C6/C7: debit an approved comp-off leave from the earliest-expiring credits (shortcut: usability is judged on the
 /// leave's first day, not per day; split per day when OQ-M02-09 is answered).
-pub async fn debit(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, request: Uuid, from: NaiveDate, mut pct: i64) -> Result<(), DomainError> {
-    for (credit, _, left) in usable(tx, employee, from).await? {
+pub async fn debit(tx: &mut OrgTx<'_>, actor: Option<Uuid>, employee: Uuid, request: Uuid, from: NaiveDate, mut pct: i64) -> Result<(), DomainError> {
+    lock_employee(tx, employee).await?;
+    let credits = usable(tx, employee, from).await?;
+    if credits.iter().map(|c| c.2).sum::<i64>() < pct {
+        return Err(DomainError::Refused("LIMIT_EXCEEDED", "not enough comp-off balance (CO-R2)".into()));
+    }
+    for (credit, _, left) in credits {
         if pct == 0 {
             break;
         }
@@ -322,14 +357,12 @@ pub async fn debit(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, request: Uui
         set_state(tx, credit).await?;
         pct -= take;
     }
-    if pct > 0 {
-        return Err(DomainError::Refused("LIMIT_EXCEEDED", "not enough comp-off balance (CO-R2)".into()));
-    }
     Ok(())
 }
 
 /// C8: a cancelled comp-off leave gives its days back. A credit that has lapsed meanwhile stays lapsed (GAP-SM-15).
-pub async fn reverse(tx: &mut OrgTx<'_>, actor: Uuid, request: Uuid, reason: &str) -> Result<(), DomainError> {
+pub async fn reverse(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, request: Uuid, reason: &str) -> Result<(), DomainError> {
+    lock_employee(tx, employee).await?;
     let credits: Vec<Uuid> = sqlx::query_scalar(
         "INSERT INTO leave.comp_off_ledger_entry (org_id, credit_id, entry_date, entry_kind, quantity, cause_kind, cause_id, reverses_entry_id, reason, created_by)
          SELECT app.current_org(), e.credit_id, current_date, 'reversal', -e.quantity, 'leave_request', $1, e.id, $2, $3
@@ -353,12 +386,19 @@ pub async fn expire_due(tx: &mut OrgTx<'_>) -> Result<Value, DomainError> {
     let today = crate::period::org_today(tx).await?;
     let due: Vec<(Uuid, Uuid, NaiveDate)> = sqlx::query_as(
         "SELECT id, employee_id, expires_on FROM leave.comp_off_credit
-         WHERE state IN ('credited','partially_used') AND expires_on < $1 ORDER BY expires_on FOR UPDATE",
+         WHERE state IN ('credited','partially_used') AND expires_on < $1 ORDER BY expires_on",
     )
     .bind(today)
     .fetch_all(&mut ***tx)
     .await?;
+    let mut lapsed = 0;
     for (id, employee, expires) in &due {
+        lock_employee(tx, *employee).await?;
+        let still: bool = sqlx::query_scalar("SELECT state IN ('credited','partially_used') FROM leave.comp_off_credit WHERE id = $1").bind(id).fetch_one(&mut ***tx).await?;
+        if !still {
+            continue;
+        }
+        lapsed += 1;
         sqlx::query(
             "INSERT INTO leave.comp_off_ledger_entry (org_id, credit_id, entry_date, entry_kind, quantity, cause_kind, cause_id, reason)
              SELECT app.current_org(), $1, $2 + 1, 'expiry', -rest, 'expiry_run', $1, 'comp-off expired unused (HW-05, HW-06 lapse)'
@@ -373,5 +413,5 @@ pub async fn expire_due(tx: &mut OrgTx<'_>) -> Result<Value, DomainError> {
         db::audit_system(tx, "comp_off_credit.lapse", "comp_off_credit", Some(*id), Some(json!({ "expires_on": expires }))).await?;
         event(tx, "CompOffExpired", *id, *employee).await?;
     }
-    Ok(json!({ "lapsed": due.len() }))
+    Ok(json!({ "lapsed": lapsed }))
 }

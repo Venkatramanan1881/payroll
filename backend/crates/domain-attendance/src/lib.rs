@@ -392,7 +392,7 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
                 .bind(compute_day(&input).state)
                 .execute(&mut ***tx)
                 .await?;
-            if date < today {
+            if Utc::now() >= cur.to {
                 comp_off::on_day(tx, employee, date, policy_version, &compute_day(&input)).await?; // the day may only now be over
             }
             return Ok(None);
@@ -483,7 +483,8 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
         .bind(json!({ "employee_id": employee, "attendance_date": date, "result_id": result }))
         .execute(&mut ***tx)
         .await?;
-    if date < today {
+    if Utc::now() >= cur.to {
+        // Only a day whose window has closed earns (a night shift into the next morning included).
         comp_off::on_day(tx, employee, date, policy_version, &out).await?;
     }
     Ok(Some(result))

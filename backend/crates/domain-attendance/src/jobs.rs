@@ -257,7 +257,16 @@ async fn leave_timeout(tx: &mut OrgTx<'_>, id: Uuid, listed: &str, timeout: Dura
         for d in sqlx::query_scalar::<_, NaiveDate>("SELECT leave_date FROM leave.leave_request_day WHERE leave_request_id = $1").bind(id).fetch_all(&mut ***tx).await? {
             blocked |= db::employee_locked(tx, employee, d, d.succ_opt()).await?;
         }
-        if let (Some(v), false) = (&v, blocked) {
+        let comp_off = crate::comp_off::is_comp_off_type(tx, leave_type).await?;
+        if let (true, Some(_), false) = (comp_off, &v, blocked) {
+            // D-25: comp-off leave is debited from comp-off credits; short of them, the request is escalated.
+            let total = crate::leave::total_pct(tx, id).await?;
+            match crate::comp_off::debit(tx, None, employee, id, from, total).await {
+                Ok(()) => {}
+                Err(DomainError::Refused("LIMIT_EXCEEDED", _)) => blocked = true,
+                Err(e) => return Err(e),
+            }
+        } else if let (Some(v), false) = (&v, blocked) {
             if v.paid {
                 let account = crate::leave::lock_account(tx, employee, leave_type).await?;
                 let total = crate::leave::total_pct(tx, id).await?;

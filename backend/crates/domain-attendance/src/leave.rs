@@ -623,7 +623,7 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
     let comp_off = crate::comp_off::is_comp_off_type(tx, r.leave_type).await?;
     if approve && comp_off {
         let total = total_pct(tx, id).await?;
-        crate::comp_off::debit(tx, p.user_id, r.employee, id, r.from, total).await?;
+        crate::comp_off::debit(tx, Some(p.user_id), r.employee, id, r.from, total).await?;
     } else if approve && v.paid {
         // LM-07 at decision: the balance may have moved since submission.
         let account = lock_account(tx, r.employee, r.leave_type).await?;
@@ -702,7 +702,7 @@ pub async fn cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, reason: &str) -
         .bind(p.user_id)
         .execute(&mut ***tx)
         .await?;
-        crate::comp_off::reverse(tx, p.user_id, id, reason.trim()).await?;
+        crate::comp_off::reverse(tx, p.user_id, r.employee, id, reason.trim()).await?;
         recalc_days(tx, r.employee, id, "leave_cancelled").await?;
     }
     db::audit(tx, p.user_id, "leave_request.cancel", "leave_request", Some(id), Some(json!({ "reason": reason.trim(), "was": r.state }))).await?;

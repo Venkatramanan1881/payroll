@@ -41,6 +41,15 @@
 - **Balance and ledger (CMP-07):** the balance is the sum of the ledger, shown with open credits and pending days.
 - **Slice 14 gap closed:** leave is refused on a day covered by an active full-day or several-day on-duty.
 
+## Review fixes
+- **Rejection is final:** a claim an approver rejected is never raised again by recalculations (only the system's own withdrawal lets a day earn again).
+- **Timeouts:** J3 auto-approval of `COMP_OFF` leave debits comp-off credits and escalates when they fall short (it never touches a leave account).
+- **Serialisation:** one employee's comp-off writes (earning, decisions, debits, reversals, expiry) take a per-employee transaction lock, so two approvals can never overdraw a credit and a cancel racing the expiry run never leaves days behind a lapsed credit. A debit checks the whole amount before posting anything.
+- **Night shifts:** a day earns only once its window has closed, not at midnight.
+- **Earned before taken:** a credit is usable only for leave after its worked date.
+- **Repeat decisions:** a closed credit answers only to whoever decided it (others get NOT_FOUND), as leave and on-duty do.
+- **Dates:** an approved credit's ledger entry carries the organisation's date.
+
 ## Not in this slice
 - **Waiting on open questions:**
   - Comp-off opening balances (OQ-C15-02).
@@ -51,6 +60,8 @@
   - The R9 register and comp-off shown inside the leave balances list.
   - Module switches (MODULE_DISABLED, MD-03), which are not enforced anywhere yet.
 - **Usability by date:** judged on the leave's first day, not per day.
+- **Pending comp-off leave** is not counted at submit (as for paid leave); approval re-checks the balance.
+- **No `explanation`** on credits, and no list paging or branch/department filters (as other lists).
 
 ## Review focus
 1. Ledger integrity:

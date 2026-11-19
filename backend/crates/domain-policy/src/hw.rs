@@ -68,7 +68,7 @@ impl HwSettings {
             }
         }
         if s.half_minutes >= s.full_minutes {
-            return Err("HW-04: half_day_hours is below full_day_hours".into());
+            return Err("HW-04: half_day_hours must be below full_day_hours".into());
         }
         Ok(s)
     }

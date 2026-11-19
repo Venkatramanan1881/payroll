@@ -92,6 +92,19 @@ async fn earn_approve_take_and_cancel(pool: PgPool) {
     assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/comp-off/credits/{id}/reject"), Some(json!({ "reason": "x" })), &key()).await.0, StatusCode::CONFLICT);
     assert_eq!(balance(&app, &w).await["balance"], "1.00");
 
+    // A rejected claim is final: recalculating the day never raises it again (SM-COMPOFF).
+    let off2 = today() - Duration::days(6);
+    work_off_day(&app, &s, &w, off2, 10).await;
+    let rid = credits(&app, &w).await.iter().find(|c| c["worked_date"] == json!(off2.to_string())).unwrap()["id"].as_str().unwrap().to_string();
+    let (st, r) = common::as_user(&app, &s.hr_token, "POST", &format!("/v1/comp-off/credits/{rid}/reject"), Some(json!({ "reason": "not authorised" })), &key()).await;
+    assert_eq!((st, r["state"].as_str()), (StatusCode::OK, Some("not_credited")), "{r}");
+    let mut tx = db::begin_org(&pool, s.org_id).await.unwrap();
+    sqlx::query("UPDATE attendance.attendance_day SET current_result_id = NULL WHERE employee_id = $1 AND attendance_date = $2").bind(w.employee_id).bind(off2).execute(&mut **tx).await.ok();
+    domain_attendance::recalculate(&mut tx, w.employee_id, off2, "recalculation", None).await.unwrap();
+    tx.commit().await.unwrap();
+    let again: Vec<Value> = credits(&app, &w).await.into_iter().filter(|c| c["worked_date"] == json!(off2.to_string())).collect();
+    assert_eq!(again.len(), 1, "{again:?}");
+
     // Taken as leave of the reserved type: more than the balance is refused; approval debits; cancelling gives it back.
     let t = comp_off_leave_type(&app, &s).await;
     let ask = |from: NaiveDate, to: NaiveDate| json!({ "leave_type_id": t, "from_date": from, "to_date": to, "from_part": "full", "to_part": "full", "reason": "rest" });
@@ -166,4 +179,39 @@ async fn half_day_system_credit_and_lapse(pool: PgPool) {
 
     let (st, b) = common::as_user(&app, &w.token, "POST", "/v1/comp-off/choices", Some(json!({ "worked_date": today() - Duration::days(3), "choice": "pay" })), &key()).await;
     assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("RULE_GROUP_DISABLED")), "{b}");
+}
+
+/// J3: an automatic approval of comp-off leave debits the credits, and escalates when they fall short.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn timeout_approval_debits_comp_off(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, Some(json!({ "HW-02": false }))).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    work_off_day(&app, &s, &w, today() - Duration::days(5), 10).await;
+    assert_eq!(balance(&app, &w).await["balance"], "1.00");
+    let v = json!({ "effective_from": "2026-01-01", "reason": "setup", "paid": false, "eligibility": {}, "credit_method": "annual_grant",
+        "accrual_timing": "end", "proration": "none", "year_end": "lapse", "negative_allowed_days": "0.00", "half_day_allowed": true, "min_notice_days": 0,
+        "approval_levels": "manager", "timeout_days": 1, "timeout_action": "auto_approve", "during_notice": "allow", "combine_allowed": true });
+    let (st, t) = common::as_user(&app, &s.hr_token, "POST", "/v1/leave/types", Some(json!({ "code": "COMP_OFF", "name": "Comp-off", "version": v })), &key()).await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    let t: Uuid = t["id"].as_str().unwrap().parse().unwrap();
+    let mut leaves = vec![];
+    for (day, age) in [(today() - Duration::days(2), 4), (today() - Duration::days(1), 3)] {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO leave.leave_request (org_id, id, employee_id, leave_type_id, from_date, to_date, state, requested_by, submitted_at)
+                     VALUES ($1, $2, $3, $4, $5, $5, 'pending_l1', $6, now() - make_interval(days => $7))")
+            .bind(s.org_id).bind(id).bind(w.employee_id).bind(t).bind(day).bind(w.user_id).bind(age).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO leave.leave_request_day (org_id, leave_request_id, leave_date, fraction) VALUES ($1, $2, $3, 1.0)")
+            .bind(s.org_id).bind(id).bind(day).execute(&pool).await.unwrap();
+        leaves.push(id);
+    }
+    let mut tx = db::begin_org(&pool, s.org_id).await.unwrap();
+    let r = domain_attendance::jobs::approval_timeouts(&mut tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!((r["leave"]["auto_approved"].as_i64(), r["leave"]["escalated"].as_i64()), (Some(1), Some(1)), "{r}");
+    assert_eq!(balance(&app, &w).await["balance"], "0.00", "the unpaid type still debits comp-off");
+    let states: Vec<String> = sqlx::query_scalar("SELECT state FROM leave.leave_request WHERE id = ANY($1) ORDER BY from_date").bind(&leaves).fetch_all(&pool).await.unwrap();
+    assert_eq!(states, vec!["approved".to_string(), "pending_l1".to_string()]);
 }
