@@ -290,6 +290,9 @@ pub async fn adjust(tx: &mut OrgTx<'_>, actor: Uuid, employee: Uuid, leave_type:
     if !known {
         return Err(invalid("leave_type_id"));
     }
+    if crate::comp_off::is_comp_off_type(tx, leave_type).await? {
+        return Err(invalid("comp-off balance comes from comp-off credits, not leave adjustments (D-25)"));
+    }
     if db::employee_locked(tx, employee, entry_date, entry_date.succ_opt()).await? {
         return Err(DomainError::PeriodLocked);
     }
@@ -422,6 +425,18 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewLeave)
         if clash {
             return Err(refused("OVERLAPPING_REQUEST", format!("{} is already requested", d.date)));
         }
+        // A day covered by an active full-day on-duty is a working day away, not a leave day.
+        let on_duty: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM perm.on_duty_request WHERE employee_id = $1 AND state IN ('pending_l1','pending_l2','approved')
+                            AND duration_kind IN ('full_day','several_days') AND $2 BETWEEN from_date AND to_date)",
+        )
+        .bind(employee)
+        .bind(d.date)
+        .fetch_one(&mut ***tx)
+        .await?;
+        if on_duty {
+            return Err(refused("OVERLAPPING_REQUEST", format!("{} is covered by on-duty", d.date)));
+        }
     }
     if !v.combine_allowed {
         // LM-14 block: no other leave type right before or after this stretch.
@@ -440,7 +455,12 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewLeave)
             return Err(refused("OVERLAPPING_REQUEST", "this leave type cannot be combined with another (LM-14)"));
         }
     }
-    if v.paid {
+    if crate::comp_off::is_comp_off_type(tx, r.leave_type).await? {
+        // D-25: comp-off is taken from comp-off credits, never below zero.
+        if crate::comp_off::available_pct(tx, employee, r.from).await? < total {
+            return Err(refused("LIMIT_EXCEEDED", "not enough comp-off balance (CO-R2)"));
+        }
+    } else if v.paid {
         let account = lock_account(tx, employee, r.leave_type).await?;
         if balance_pct(tx, account).await? - total < -v.negative_allowed {
             return Err(refused("LIMIT_EXCEEDED", "not enough leave balance (LM-07)"));
@@ -600,7 +620,11 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
             return Err(refused("OVERLAPPING_REQUEST", "another approved leave already covers these days"));
         }
     }
-    if approve && v.paid {
+    let comp_off = crate::comp_off::is_comp_off_type(tx, r.leave_type).await?;
+    if approve && comp_off {
+        let total = total_pct(tx, id).await?;
+        crate::comp_off::debit(tx, p.user_id, r.employee, id, r.from, total).await?;
+    } else if approve && v.paid {
         // LM-07 at decision: the balance may have moved since submission.
         let account = lock_account(tx, r.employee, r.leave_type).await?;
         let total = total_pct(tx, id).await?;
@@ -678,6 +702,7 @@ pub async fn cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, reason: &str) -
         .bind(p.user_id)
         .execute(&mut ***tx)
         .await?;
+        crate::comp_off::reverse(tx, p.user_id, id, reason.trim()).await?;
         recalc_days(tx, r.employee, id, "leave_cancelled").await?;
     }
     db::audit(tx, p.user_id, "leave_request.cancel", "leave_request", Some(id), Some(json!({ "reason": reason.trim(), "was": r.state }))).await?;

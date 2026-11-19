@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub mod approval;
+pub mod comp_off;
 pub mod jobs;
 pub mod leave;
 pub mod onduty;
@@ -391,6 +392,9 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
                 .bind(compute_day(&input).state)
                 .execute(&mut ***tx)
                 .await?;
+            if date < today {
+                comp_off::on_day(tx, employee, date, policy_version, &compute_day(&input)).await?; // the day may only now be over
+            }
             return Ok(None);
         }
     }
@@ -479,6 +483,9 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
         .bind(json!({ "employee_id": employee, "attendance_date": date, "result_id": result }))
         .execute(&mut ***tx)
         .await?;
+    if date < today {
+        comp_off::on_day(tx, employee, date, policy_version, &out).await?;
+    }
     Ok(Some(result))
 }
 
