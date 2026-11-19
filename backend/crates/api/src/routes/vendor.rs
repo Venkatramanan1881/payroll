@@ -415,3 +415,34 @@ pub async fn deactivate_vendor_user(mut vu: Vendor, Path(id): Path<Uuid>, header
     let body = v::deactivate_vendor_user(&mut vu.tx, vu.id, id, &b.reason).await?;
     done(vu.tx, StatusCode::OK, body).await
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Support access (vendor side)
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportIn {
+    reason: String,
+    requested_window_minutes: Option<i64>,
+}
+
+/// POST /v1/vendor/organisations/{id}/support-access-requests (PLT-13).
+pub async fn request_support(mut vu: Vendor, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    need(&vu.role, "PLT-13")?;
+    idempotency::key(&headers)?;
+    let b: SupportIn = parse(&raw)?;
+    let body = domain_iam::support::request(&mut vu.tx, vu.id, id, &b.reason, b.requested_window_minutes).await?;
+    done(vu.tx, StatusCode::CREATED, body).await
+}
+
+#[derive(Deserialize)]
+pub struct SupportQuery {
+    state: Option<String>,
+    organisation_id: Option<Uuid>,
+}
+
+/// GET /v1/vendor/support-access-grants (PLT-13): the caller's own grants.
+pub async fn my_support_grants(mut vu: Vendor, Query(q): Query<SupportQuery>) -> Result<Json<Value>, ApiError> {
+    need(&vu.role, "PLT-13")?;
+    Ok(Json(json!({ "items": domain_iam::support::list_for_vendor(&mut vu.tx, vu.id, q.state.as_deref(), q.organisation_id).await?, "next_cursor": null })))
+}

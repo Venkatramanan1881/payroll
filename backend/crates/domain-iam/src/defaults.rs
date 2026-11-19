@@ -2,6 +2,9 @@
 
 /// (system role code, operation code, grant kind, setting_ref): the default grants of the seven system roles (P9).
 pub const SYSTEM_ROLE_GRANTS: &[(&str, &str, &str, Option<&str>)] = &[
+    ("org_admin", "PLT-14", "approve", Some("VC-03")),
+    ("org_admin", "PLT-18", "all", None),
+    ("auditor", "PLT-18", "scoped", None),
     ("org_admin", "IAM-01", "all", None),
     ("org_admin", "IAM-02", "all", None),
     ("org_admin", "IAM-03", "all", None),

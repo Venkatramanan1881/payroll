@@ -24,6 +24,8 @@ const GRANTABLE: &[&str] = &[
     "PRM-12", "PRM-13", "CMP-01", "CMP-02", "CMP-03", "CMP-04", "CMP-05", "CMP-06", "CMP-07", "PER-01", "PER-02", "PER-03", "PER-04", "PER-05",
     "PER-06", "PER-07", "PER-08", "OBL-01", "OBL-02", "OBL-03", "OBL-04", "NTF-01", "RPT-01", "RPT-02", "RPT-03", "RPT-04", "RPT-05", "RPT-06",
     "DSH-01", "DSH-02", "DSH-03", "ADT-01", "ADT-02",
+    // Platform rows that organisation users act on: decide, end and read support access (VC-R6).
+    "PLT-14", "PLT-15", "PLT-18",
 ];
 /// P10 fixed denials inside the catalogue: no role may hold them.
 const FIXED_DENIALS: &[&str] = &["ADT-03", "ADT-04"];
@@ -730,8 +732,8 @@ mod tests {
 
     #[test]
     fn catalogue_and_module_gating() {
-        assert_eq!(GRANTABLE.len(), 117, "119 organisation rows minus the two fixed denials");
-        assert!(!GRANTABLE.iter().any(|c| c.starts_with("PLT-")));
+        assert_eq!(GRANTABLE.len(), 120, "119 organisation rows minus the two fixed denials, plus three organisation-side platform rows");
+        assert!(GRANTABLE.iter().filter(|c| c.starts_with("PLT-")).all(|c| ["PLT-14", "PLT-15", "PLT-18"].contains(c)));
         assert!(module_on("LVE-01", &[]) && !module_on("CMP-01", &[]) && module_on("CMP-01", &["M02".into()]));
         assert!(is_mobile("+919876543210") && !is_mobile("9876543210") && !is_mobile("+0123456789"));
         assert!(is_email("hr@example.in") && !is_email("hr@") && !is_email("@x.in") && !is_email("a@b") && !is_email("a b@x.in"));

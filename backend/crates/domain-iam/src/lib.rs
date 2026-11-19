@@ -7,3 +7,4 @@ pub mod totp;
 pub mod defaults;
 pub mod vendor;
 pub mod password;
+pub mod support;

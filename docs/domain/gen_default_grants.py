@@ -9,6 +9,8 @@ OUT = "backend/crates/domain-iam/src/defaults.rs"
 COLS = ["VA", "VS", "VR", "OA", "HR", "PO", "MGR", "SUP", "EMP", "AUD"]
 ORG_ROLES = {"OA": "org_admin", "HR": "hr_manager", "PO": "payroll_officer", "MGR": "manager", "SUP": "supervisor", "EMP": "employee", "AUD": "auditor"}
 VENDOR_ROLES = {"VA": "full_admin", "VS": "support", "VR": "read_only"}
+# Platform rows acted on by organisation users (support access decided, ended and logged inside the organisation).
+ORG_SIDE_PLT = {"PLT-14", "PLT-15", "PLT-18"}
 
 
 def cell(c):
@@ -36,7 +38,7 @@ org, vendor = [], []
 for code, cells in rows:
     for col, role in ORG_ROLES.items():
         kind, ref = cell(cells[col])
-        if kind and not code.startswith("PLT-") and code not in ("ADT-03", "ADT-04"):
+        if kind and (not code.startswith("PLT-") or code in ORG_SIDE_PLT) and code not in ("ADT-03", "ADT-04"):
             org.append((role, code, kind, ref))
     for col, role in VENDOR_ROLES.items():
         kind, ref = cell(cells[col])

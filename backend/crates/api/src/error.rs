@@ -30,6 +30,7 @@ pub enum ApiError {
     /// 409 with a catalogue code from ERROR_CATALOG.md and a detail.
     Refused(&'static str, String),
     RefusedWith(&'static str, String, serde_json::Value),
+    ValidationRows(String, serde_json::Value),
     /// Phone verified for several organisations: (choice token, [(candidate_ref, display_name)]).
     OrganisationChoiceRequired(String, Vec<(String, String)>),
     Internal(anyhow::Error),
@@ -55,7 +56,7 @@ impl ApiError {
             ApiError::SecondFactorRequired(..) => (StatusCode::UNAUTHORIZED, "SECOND_FACTOR_REQUIRED", "Enter the code from your authenticator app"),
             ApiError::OtpInvalid => (StatusCode::BAD_REQUEST, "OTP_INVALID", "The code is not correct"),
             ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED", "Too many attempts; try again later"),
-            ApiError::ValidationFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Request is not valid"),
+            ApiError::ValidationFailed(_) | ApiError::ValidationRows(..) => (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Request is not valid"),
             ApiError::OrganisationChoiceRequired(..) => (StatusCode::CONFLICT, "ORGANISATION_CHOICE_REQUIRED", "Choose an organisation"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Internal error"),
         }
@@ -77,6 +78,10 @@ impl IntoResponse for ApiError {
         });
         match self {
             ApiError::ValidationFailed(detail) | ApiError::IllegalTransition(detail) | ApiError::Refused(_, detail) => body["detail"] = json!(detail),
+            ApiError::ValidationRows(detail, rows) => {
+                body["detail"] = json!(detail);
+                body["errors"] = rows;
+            }
             ApiError::RefusedWith(_, detail, items) => {
                 body["detail"] = json!(detail);
                 body["errors"] = items;
@@ -141,6 +146,7 @@ impl From<db::DomainError> for ApiError {
             D::IdempotencyConflict => ApiError::IdempotencyConflict,
             D::Refused(code, detail) => ApiError::Refused(code, detail),
             D::RefusedWith(code, detail, items) => ApiError::RefusedWith(code, detail, items),
+            D::ValidationRows(detail, rows) => ApiError::ValidationRows(detail, rows),
             D::SelfApproval => ApiError::SelfApprovalForbidden,
             D::Forbidden => ApiError::Forbidden,
             D::Db(e) => e.into(),

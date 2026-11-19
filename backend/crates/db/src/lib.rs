@@ -94,6 +94,8 @@ pub enum DomainError {
     IdempotencyConflict,
     /// A business rule refused the command (409) with its catalogue code, e.g. RULE_GROUP_DISABLED, LIMIT_EXCEEDED.
     Refused(&'static str, String),
+    /// 422 with one error per invalid row in the problem's `errors` ({field, code, message}).
+    ValidationRows(String, serde_json::Value),
     /// As Refused, listing the blocking items in the problem's `errors` (e.g. PENDING_ITEMS_BLOCK_LOCK).
     RefusedWith(&'static str, String, serde_json::Value),
     /// BR-07: nobody decides their own request.
