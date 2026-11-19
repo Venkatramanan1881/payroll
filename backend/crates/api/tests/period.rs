@@ -25,10 +25,15 @@ async fn org_policy(app: &axum::Router, s: &common::SeedOrg) {
 
 /// DS-10: loss of pay at once (0), or absences left pending for `pending_days` waiting days.
 async fn policy_waiting(app: &axum::Router, s: &common::SeedOrg, pending_days: i64) {
+    policy_ds10(app, s, json!({ "action": if pending_days > 0 { "pending" } else { "loss_of_pay" }, "pending_days": pending_days })).await
+}
+
+/// An organisation policy from 2026-01-01 with this DS-10 document.
+async fn policy_ds10(app: &axum::Router, s: &common::SeedOrg, ds10: Value) {
     let (_, set, _) = common::call(app, s, "POST", "/v1/policy-sets", Some(json!({ "name": "Default", "effective_from": "2026-01-01" })), None).await;
     let v = set["versions"][0]["id"].as_str().unwrap().to_string();
     let (_, _, etag) = common::call(app, s, "GET", &format!("/v1/policy-versions/{v}"), None, None).await;
-    let doc = json!({ "schema_version": 1, "settings": { "DS-10": { "action": if pending_days > 0 { "pending" } else { "loss_of_pay" }, "pending_days": pending_days } } });
+    let doc = json!({ "schema_version": 1, "settings": { "DS-10": ds10 } });
     let (st, b, _) = common::call(app, s, "PUT", &format!("/v1/policy-versions/{v}/rule-groups/DS"), Some(doc), etag.as_deref()).await;
     assert_eq!(st, StatusCode::OK, "{b}");
     common::call(app, s, "POST", &format!("/v1/policy-versions/{v}/publish"), None, None).await;
@@ -438,4 +443,53 @@ async fn correction_beyond_the_window_is_refused(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(written, 0, "refused as a whole");
+}
+
+/// Review fixes: an unchanged auto-debit absence measures the same loss of pay (no adjustment); corrections chain from
+/// the latest measurement; a locked date with no result is refused; a period with posted corrections cannot be unlocked.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn measured_locked_days_keep_their_charge_and_chain(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    policy_ds10(&app, &s, json!({ "action": "auto_debit" })).await; // no leave type has balance: loss of pay
+    org_settings(&pool, s.org_id).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let (last, _) = periods(&app, &s).await;
+    let d = month_start(1) + Duration::days(2);
+    let body = json!({ "from": d, "to": d, "employee_ids": [w.employee_id], "reason": "check" });
+    common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/recalculations", Some(body.clone()), &key()).await;
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await.0, StatusCode::OK);
+    let (_, t) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/periods/{last}/totals"), None, &[]).await;
+    assert_eq!(t["items"][0]["deduction_days"], "1.00", "auto-debit with no balance is loss of pay: {t}");
+
+    // Inputs that look changed (fingerprint) but leave the day absent: measured with the same loss of pay, nothing posted.
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql("SET session_replication_role = replica").execute(&mut *conn).await.unwrap();
+    sqlx::query("UPDATE attendance.day_result SET input_fingerprint = '\\x00' WHERE employee_id = $1 AND attendance_date = $2").bind(w.employee_id).bind(d).execute(&mut *conn).await.unwrap();
+    sqlx::raw_sql("SET session_replication_role = origin").execute(&mut *conn).await.unwrap();
+    drop(conn);
+    let (st, job) = common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/recalculations", Some(body), &key()).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{job}");
+    let measured: i64 = sqlx::query_scalar("SELECT count(*) FROM attendance.day_result WHERE for_adjustment").fetch_one(&pool).await.unwrap();
+    let posted: i64 = sqlx::query_scalar("SELECT count(*) FROM period.period_adjustment").fetch_one(&pool).await.unwrap();
+    assert_eq!((measured, posted), (1, 0), "measured again, same outcome: no adjustment");
+
+    // Two different corrections chain: the second is measured against the first.
+    assert_eq!(hr_correct(&app, &s, &w, d).await.0, StatusCode::CREATED);
+    let at = |t: &str| format!("{d}T{t}:00Z");
+    let late = json!({ "employee_id": w.employee_id, "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at("05:30"), "proposed_out_at": at("12:30"), "reason": "came late" });
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/hr-corrections", Some(late), &key()).await.0, StatusCode::CREATED);
+    let chain: Vec<(Uuid, Uuid)> = sqlx::query_as("SELECT locked_result_id, new_result_id FROM period.period_adjustment ORDER BY created_at, days DESC").fetch_all(&pool).await.unwrap();
+    assert_eq!(chain.len(), 2, "two arrival times, two differences: {chain:?}");
+    assert_eq!(chain[1].0, chain[0].1, "the second correction is measured against the first");
+
+    // A locked date that never had a result cannot be corrected (nothing to measure against).
+    let (st, b) = hr_correct(&app, &s, &w, d + Duration::days(4)).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("PERIOD_LOCKED")), "{b}");
+
+    // OQ-C12-07: once its corrections are posted elsewhere, the period cannot be unlocked.
+    assert_eq!(patch_settings(&app, &s, json!({ "unlock": "with_org_admin_approval", "reason": "audit" })).await.0, StatusCode::OK);
+    let (st, b) = common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/unlock-requests"), Some(json!({ "reason": "redo" })), &key()).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("UNLOCK_NOT_ALLOWED")), "{b}");
 }

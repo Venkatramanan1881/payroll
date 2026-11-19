@@ -137,11 +137,23 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
 pub async fn measure_locked(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_kind: &str, trigger_ref: Option<Uuid>) -> Result<Option<(Uuid, Uuid)>, DomainError> {
     let Some(new) = produce(tx, employee, date, trigger_kind, trigger_ref, true).await? else { return Ok(None) };
     let previous: Option<Uuid> = sqlx::query_scalar("SELECT supersedes_result_id FROM attendance.day_result WHERE id = $1").bind(new).fetch_one(&mut ***tx).await?;
-    // A locked date that never had a result has nothing to measure against: the difference is not defined (OQ-C12-06).
     Ok(previous.map(|p| (p, new)))
 }
 
 async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_kind: &str, trigger_ref: Option<Uuid>, adjust: bool) -> Result<Option<Uuid>, DomainError> {
+    if adjust {
+        // A locked date that never had a result has nothing to measure a difference against (OQ-C12-06): refused
+        // before anything is written.
+        let locked_result: Option<Uuid> = sqlx::query_scalar("SELECT current_result_id FROM attendance.attendance_day WHERE employee_id = $1 AND attendance_date = $2")
+            .bind(employee)
+            .bind(date)
+            .fetch_optional(&mut ***tx)
+            .await?
+            .flatten();
+        if locked_result.is_none() {
+            return Err(DomainError::PeriodLocked);
+        }
+    }
     let Some(master) = master_branch_on(tx, employee, date).await? else { return Ok(None) };
     let noon = date.and_hms_opt(12, 0, 0).expect("valid time").and_utc();
     let master_tz = branch_tz(tx, master, noon).await?;
@@ -271,11 +283,21 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
             .await?;
     // Measuring for an adjustment compares with the latest measured result of the date, else the locked current one.
     let current = if adjust {
-        let measured: Option<Uuid> = sqlx::query_scalar("SELECT id FROM attendance.day_result WHERE attendance_day_id = $1 AND for_adjustment ORDER BY created_at DESC, produced_at DESC LIMIT 1")
-            .bind(day_id)
-            .fetch_optional(&mut ***tx)
-            .await?;
-        measured.or(current)
+        // The head of the chain of measured results that starts at the current (locked) result. Measurements made
+        // against an earlier result (before an unlock) are not part of it; the day row lock above serialises writers.
+        let head: Option<Uuid> = sqlx::query_scalar(
+            "WITH RECURSIVE chain AS (
+               SELECT id, 0 AS depth FROM attendance.day_result WHERE id = $2
+               UNION ALL
+               SELECT r.id, c.depth + 1 FROM attendance.day_result r JOIN chain c ON r.supersedes_result_id = c.id
+                WHERE r.attendance_day_id = $1 AND r.for_adjustment)
+             SELECT id FROM chain ORDER BY depth DESC LIMIT 1",
+        )
+        .bind(day_id)
+        .bind(current)
+        .fetch_optional(&mut ***tx)
+        .await?;
+        head.or(current)
     } else {
         current
     };
@@ -307,8 +329,9 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
         }
     }
     let mut out = compute_day(&input);
-    // shortcut: a measured locked day does not debit leave (DS-10 auto-debit); it is measured as computed. Revisit with OQ-C12-06.
-    if !adjust {
+    if adjust {
+        measure_absence_charge(tx, day_id, &mut out).await?;
+    } else {
         settle_absence_debit(tx, employee, date, day_id, &input.settings.leave_debit_order, &mut out).await?;
     }
     let costed_branch = branch; // EM-08 default: the branch worked
@@ -397,6 +420,36 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
 /// LV-04 order that has the balance; with none, it is loss of pay. A day that stops being such an absence gets its
 /// debit reversed. One debit per day ever (the ledger key is the attendance day); once reversed, a later absence on
 /// the same day is loss of pay.
+/// DS-10 for a measured locked day: the ledger is never touched (BR-06). An absence still covered by its open leave
+/// debit stays covered; any other absence due for charging is loss of pay, as it would be without balance.
+// shortcut: a measured day that stops being an absence keeps its leave debit; reversing ledger entries for locked days waits on OQ-C12-07.
+async fn measure_absence_charge(tx: &mut OrgTx<'_>, day_id: Uuid, out: &mut engine::day::DayOutput) -> Result<(), DomainError> {
+    let due_pct: i64 = if out.flags.iter().any(|f| f == "absence_charge_due") {
+        100
+    } else if out.flags.iter().any(|f| f == "absence_charge_due_half") {
+        50
+    } else {
+        0
+    };
+    out.flags.retain(|f| f != "absence_charge_due" && f != "absence_charge_due_half");
+    if due_pct == 0 {
+        return Ok(());
+    }
+    let debited: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM leave.leave_ledger_entry e WHERE e.cause_kind = 'attendance_day' AND e.cause_id = $1 AND e.entry_kind = 'absence_auto_debit'
+                          AND NOT EXISTS (SELECT 1 FROM leave.leave_ledger_entry r WHERE r.reverses_entry_id = e.id))",
+    )
+    .bind(day_id)
+    .fetch_one(&mut ***tx)
+    .await?;
+    if debited {
+        out.flags.push("absence_auto_debited".into());
+    } else {
+        out.effects.push(Effect { kind: "absence_lop", days_pct: Some(due_pct), minutes: None, reason_code: "absent_no_leave_balance".into(), rule_ref: "DS-10" });
+    }
+    Ok(())
+}
+
 async fn settle_absence_debit(
     tx: &mut OrgTx<'_>,
     employee: Uuid,

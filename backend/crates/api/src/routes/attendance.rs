@@ -112,12 +112,13 @@ pub async fn recalculate(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) 
                 Ok(Some(_)) => adjusted += 1,
                 Ok(None) => {}
                 Err(db::DomainError::Refused("ADJUSTMENT_WINDOW_EXCEEDED", _)) => beyond_window += 1,
+                Err(db::DomainError::PeriodLocked) => {} // locked with no result: nothing to measure against
                 Err(err) => return Err(err.into()),
             }
         }
     }
     let summary = json!({ "from": r.from, "to": r.to, "employees": employees.len(), "reason": r.reason, "results_written": written,
-                          "adjustments_posted": adjusted, "beyond_adjustment_window": beyond_window });
+                          "adjustments_posted": adjusted, "locked_dates_beyond_adjustment_window": beyond_window });
     db::audit(&mut tx, p.user_id, "attendance.recalculate", "attendance_day", None, Some(summary)).await?;
     let now = Utc::now();
     let body = json!({ "id": key, "kind": "attendance_recalculation", "state": "succeeded", "created_at": now, "finished_at": now,

@@ -24,7 +24,9 @@ pub struct Gcs {
 
 impl Gcs {
     pub fn new(bucket: String) -> Self {
-        Gcs { bucket, http: reqwest::Client::new() }
+        // A hung Google call must not hold a request and its database transaction open.
+        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().expect("HTTP client");
+        Gcs { bucket, http }
     }
 
     async fn metadata(&self, what: &str) -> Result<String> {

@@ -696,9 +696,14 @@ pub async fn list_unlocks(tx: &mut OrgTx<'_>, period: Uuid) -> Result<Vec<Value>
         .await?)
 }
 
-async fn unlock_allowed(tx: &mut OrgTx<'_>) -> Result<(), DomainError> {
+async fn unlock_allowed(tx: &mut OrgTx<'_>, period: Uuid) -> Result<(), DomainError> {
     if settings(tx).await?["unlock"] == "never" {
         return Err(DomainError::Refused("UNLOCK_NOT_ALLOWED", "the organisation's period settings never allow an unlock (PL-06)".into()));
+    }
+    // Corrections of this period already posted elsewhere would be paid twice once its days are recalculated (OQ-C12-07).
+    let posted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM period.period_adjustment WHERE source_period_id = $1)").bind(period).fetch_one(&mut ***tx).await?;
+    if posted {
+        return Err(DomainError::Refused("UNLOCK_NOT_ALLOWED", "corrections of this period were already posted to a later period (OQ-C12-07)".into()));
     }
     Ok(())
 }
@@ -709,7 +714,7 @@ pub async fn request_unlock(tx: &mut OrgTx<'_>, actor: Uuid, period: Uuid, reaso
         .fetch_optional(&mut ***tx)
         .await?
         .ok_or(DomainError::NotFound)?;
-    unlock_allowed(tx).await?;
+    unlock_allowed(tx, period).await?;
     if reason.trim().is_empty() {
         return Err(DomainError::Validation("a reason is required (AC-C12-05.2)".into()));
     }
@@ -757,7 +762,7 @@ pub async fn decide_unlock(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, approve: b
         return Err(DomainError::SelfApproval);
     }
     if approve {
-        unlock_allowed(tx).await?;
+        unlock_allowed(tx, period).await?;
     }
     let to = if approve { "approved" } else { "rejected" };
     sqlx::query("UPDATE period.unlock_request SET state = $2, decided_basis = 'approver', current_approver_user_id = NULL WHERE id = $1")
@@ -859,12 +864,19 @@ pub async fn post_adjustment(tx: &mut OrgTx<'_>, actor: Option<Uuid>, employee: 
     .await?;
     let Some((source, source_start, source_end)) = source else { return Ok(None) };
     // Locking the target row keeps a concurrent lock from freezing it while the adjustment is posted.
-    let target: Option<(Uuid, NaiveDate)> = sqlx::query_as(
-        "SELECT id, period_start FROM period.attendance_period WHERE period_start > $1 AND state <> 'locked' ORDER BY period_start LIMIT 1 FOR UPDATE",
-    )
-    .bind(source_end)
-    .fetch_optional(&mut ***tx)
-    .await?;
+    // FOR UPDATE with LIMIT returns nothing when a concurrent lock takes the first open period; a second look finds the next.
+    let mut target: Option<(Uuid, NaiveDate)> = None;
+    for _ in 0..2 {
+        target = sqlx::query_as(
+            "SELECT id, period_start FROM period.attendance_period WHERE period_start > $1 AND state <> 'locked' ORDER BY period_start LIMIT 1 FOR UPDATE",
+        )
+        .bind(source_end)
+        .fetch_optional(&mut ***tx)
+        .await?;
+        if target.is_some() {
+            break;
+        }
+    }
     let Some((target, target_start)) = target else {
         return Err(DomainError::IllegalTransition("there is no open period after the locked one to post the adjustment into".into()));
     };

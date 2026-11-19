@@ -258,15 +258,22 @@ pub async fn produce_export(State(state): State<AppState>, Auth(p, mut tx): Auth
     store.put(&path, bytes, "application/json").await.map_err(ApiError::Internal)?;
     period::record_export(&mut tx, p.user_id, export_id, id, &path, &checksum, &adjustments).await?;
     let url = store.signed_url(&path, LINK_SECS as u64).await.map_err(ApiError::Internal)?;
-    let body = json!({ "id": export_id, "kind": "payroll_input_export", "state": "succeeded", "created_at": now, "finished_at": Utc::now(),
-                       "download_url": url, "download_expires_at": now + Duration::seconds(LINK_SECS), "error_report_url": null });
-    done(tx, key, StatusCode::ACCEPTED, body).await
+    let mut body = json!({ "id": export_id, "kind": "payroll_input_export", "state": "succeeded", "created_at": now, "finished_at": Utc::now(),
+                           "download_url": null, "download_expires_at": null, "error_report_url": null });
+    // The stored answer (replayed for a retried key) carries no link: links expire and are bearer capabilities.
+    // A retry gets a fresh one from GET /v1/period/payroll-input-exports/{id}/download-link.
+    crate::idempotency::finish(&mut tx, key, StatusCode::ACCEPTED, &body).await?;
+    tx.commit().await?;
+    body["download_url"] = json!(url);
+    body["download_expires_at"] = json!(now + Duration::seconds(LINK_SECS));
+    Ok(reply(StatusCode::ACCEPTED, body))
 }
 
 /// GET /v1/periods/{id}/payroll-input-exports (PER-07).
 pub async fn list_exports(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
-    require(&mut tx, &p, "PER-07").await?;
-    Ok(Json(json!({ "items": period::list_exports(&mut tx, id).await?, "next_cursor": null })))
+    let all = matches!(require(&mut tx, &p, "PER-07").await?.scope, Scope::All);
+    let items: Vec<Value> = period::list_exports(&mut tx, id).await?.into_iter().filter(|x| all || x["produced_by"] == json!(p.user_id)).collect();
+    Ok(Json(json!({ "items": items, "next_cursor": null })))
 }
 
 /// GET /v1/period/payroll-input-exports/{id}/download-link (PER-07). An export holds the producer's scope, so a
