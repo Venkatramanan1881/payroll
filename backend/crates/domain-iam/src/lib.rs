@@ -3,3 +3,7 @@ pub mod authz;
 pub mod firebase;
 pub mod signin;
 pub mod tokens;
+pub mod totp;
+pub mod defaults;
+pub mod vendor;
+pub mod password;

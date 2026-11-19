@@ -28,11 +28,17 @@ pub async fn candidates(pool: &PgPool, mobile: &str) -> sqlx::Result<Vec<Candida
     let mut out = Vec::with_capacity(pairs.len());
     for (org_id, user_id) in pairs {
         let mut tx = db::begin_org(pool, org_id).await?;
-        let display_name: String = sqlx::query_scalar("SELECT display_name FROM platform.organisation WHERE id = $1")
-            .bind(org_id)
-            .fetch_one(&mut **tx)
-            .await?;
-        out.push(Candidate { org_id, user_id, display_name });
+        // Only phone users sign in by phone: a password admin with a mobile must still pass the password and AC-08.
+        let display_name: Option<String> = sqlx::query_scalar(
+            "SELECT o.display_name FROM platform.organisation o JOIN iam.user_account u ON u.org_id = o.id WHERE o.id = $1 AND u.id = $2 AND u.login_kind = 'mobile_otp'",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(display_name) = display_name {
+            out.push(Candidate { org_id, user_id, display_name });
+        }
     }
     Ok(out)
 }

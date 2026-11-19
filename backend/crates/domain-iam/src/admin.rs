@@ -33,7 +33,7 @@ const GATED: &[(&str, &str)] = &[("CMP-", "M02")];
 
 /// Optional modules switched on today (vendor entitlements, MD-01).
 async fn enabled_modules(tx: &mut OrgTx<'_>) -> Result<Vec<String>, DomainError> {
-    Ok(sqlx::query_scalar("SELECT module_code FROM platform.module_entitlement WHERE org_id = app.current_org() AND enabled AND valid @> current_date")
+    Ok(sqlx::query_scalar("SELECT module_code FROM platform.module_entitlement WHERE org_id = app.current_org() AND enabled AND valid @> (now() AT TIME ZONE 'Asia/Kolkata')::date")
         .fetch_all(&mut ***tx)
         .await?)
 }
@@ -428,7 +428,7 @@ pub async fn my_modules(tx: &mut OrgTx<'_>) -> Result<Value, DomainError> {
     let mut items: Vec<Value> = (1..=16).map(|n| json!({ "module_code": format!("C{n:02}"), "enabled": true })).collect();
     items.extend(["M01", "M02", "M03", "M04"].iter().map(|m| json!({ "module_code": m, "enabled": enabled.iter().any(|e| e == m) })));
     let mobile: Option<bool> = sqlx::query_scalar(
-        "SELECT p.mobile_app FROM platform.organisation_plan op JOIN platform.plan p ON p.id = op.plan_id WHERE op.org_id = app.current_org() AND op.valid @> current_date",
+        "SELECT p.mobile_app FROM platform.organisation_plan op JOIN platform.plan p ON p.id = op.plan_id WHERE op.org_id = app.current_org() AND op.valid @> (now() AT TIME ZONE 'Asia/Kolkata')::date",
     )
     .fetch_optional(&mut ***tx)
     .await?;

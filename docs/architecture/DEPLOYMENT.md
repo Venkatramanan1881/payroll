@@ -23,6 +23,9 @@ docker push asia-south1-docker.pkg.dev/<gcp-project>/payroll/api:<git-sha>
 | `FIREBASE_PROJECT_ID` | plain env | Phone sign-in token audience (D-12). |
 | `JOB_SECRET` | Secret Manager | **Jobs service only.** Enables `/internal/jobs/*`. 32+ characters (surrounding whitespace is trimmed), or the job endpoints stay off and a line is logged. |
 | `EXPORT_BUCKET` | plain env | Private Cloud Storage bucket for payroll input exports (D-19). Unset: exports are disabled and a line is logged. |
+| `MFA_ENCRYPTION_KEY` | Secret Manager | **API service** (admins sign in there). 32 random bytes, base64: encrypts admins' authenticator secrets (D-23). Missing: admin sign-in with the second step fails closed. Never rotate without re-enrolling admins. |
+| `VENDOR_GOOGLE_CLIENT_ID` | plain env | **Vendor service only.** OAuth client of the vendor console (Google ID token audience, D-22). |
+| `VENDOR_GOOGLE_DOMAIN` | plain env | **Vendor service only.** The vendor's Google Workspace domain; only its accounts sign in. Both unset: every `/v1/vendor` route answers 404. |
 | `TRUSTED_PROXY_HOPS` | plain env | `1` behind the Cloud Run front end (PC-05 client IP). |
 | `PORT` | Cloud Run | Set by the platform. |
 
@@ -35,7 +38,8 @@ Secrets never go into git, images or chat.
 - Migrations run as the project owner (`postgres`).
 - After migrations, run `docs/database/supabase_roles.sql` once per project. It creates two login roles, neither with rights of its own (members with SET, without inheriting):
   - `api_login` for the internet-facing API: a member of `app_api` only.
-  - `jobs_login` for the timed-jobs service: a member of `app_api` and `app_vendor`. `app_vendor` reads every tenant's platform rows, so only this private service holds it.
+  - `jobs_login` for the timed-jobs service: a member of `app_api` and `app_vendor`. `app_vendor` reads every tenant's platform rows, so only the private services hold it.
+  - `vendor_login` for the vendor console service: a member of `app_vendor` and `app_api` (organisation creation seeds the new organisation's own rows).
 - Every request transaction switches to `app_api`, so row-level security always applies.
 
 ### Migrations
@@ -57,6 +61,23 @@ DATABASE_URL=<owner connection> api migrate
 
 ## 4. Cloud Run service
 
+### Vendor console service (D-22)
+
+A third service from the same image serves `/v1/vendor/*` for vendor staff only:
+
+```
+gcloud run deploy payroll-vendor --image <image> --region asia-south1 \
+  --service-account payroll-vendor@<gcp-project>.iam.gserviceaccount.com \
+  --set-secrets DATABASE_URL=vendor-db-url:latest,APP_JWT_SECRET=jwt-secret:latest \
+  --set-env-vars FIREBASE_PROJECT_ID=<firebase-project>,TRUSTED_PROXY_HOPS=1,VENDOR_GOOGLE_CLIENT_ID=<oauth-client>,VENDOR_GOOGLE_DOMAIN=<your-domain> \
+  --min-instances 0
+```
+
+- `DATABASE_URL` connects as `vendor_login` (§3), the only login role that may become `app_vendor` besides the jobs service.
+- The public API service never sets the `VENDOR_GOOGLE_*` variables, so its vendor routes answer 404, and its `api_login` cannot become `app_vendor` anyway.
+- Create the first vendor user once, by SQL as the owner: `INSERT INTO platform.vendor_user (email, full_name, vendor_role) VALUES ('<you>@<your-domain>', '<name>', 'full_admin');`
+- Optional hardening: put the service behind Identity-Aware Proxy for your domain.
+
 ### Export bucket (D-19)
 
 - One private bucket per environment, in the database's region (production: `asia-south1`, Mumbai). Uniform bucket-level access; no public access.
@@ -70,8 +91,8 @@ DATABASE_URL=<owner connection> api migrate
 ```
 gcloud run deploy payroll-api --image <image> --region asia-south1 \
   --service-account payroll-api@<gcp-project>.iam.gserviceaccount.com \
-  --set-secrets DATABASE_URL=api-db-url:latest,APP_JWT_SECRET=jwt-secret:latest,JOB_SECRET=job-secret:latest \
-  --set-env-vars FIREBASE_PROJECT_ID=<firebase-project>,TRUSTED_PROXY_HOPS=1 \
+  --set-secrets DATABASE_URL=api-db-url:latest,APP_JWT_SECRET=jwt-secret:latest,MFA_ENCRYPTION_KEY=mfa-key:latest \
+  --set-env-vars FIREBASE_PROJECT_ID=<firebase-project>,TRUSTED_PROXY_HOPS=1,EXPORT_BUCKET=<bucket> \
   --min-instances 1 --cpu 1 --memory 512Mi
 ```
 

@@ -37,6 +37,13 @@ pub async fn begin_org(pool: &PgPool, org_id: Uuid) -> sqlx::Result<OrgTx<'stati
     Ok(OrgTx(tx))
 }
 
+/// A transaction as the vendor role (platform schema and audit log only, every organisation).
+pub async fn begin_vendor(pool: &PgPool) -> sqlx::Result<OrgTx<'static>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL ROLE app_vendor").execute(&mut *tx).await?;
+    Ok(OrgTx(tx))
+}
+
 /// Writes one insert-only audit entry in the caller's transaction, so it commits or rolls back with the change (TSD §3.3).
 pub async fn audit(
     tx: &mut OrgTx<'_>,

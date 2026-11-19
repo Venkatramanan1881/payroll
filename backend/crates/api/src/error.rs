@@ -21,6 +21,12 @@ pub enum ApiError {
     /// E18: (rule_ref, attempt_id, message shown to the employee).
     PunchRefused(String, uuid::Uuid, String),
     SelfApprovalForbidden,
+    /// AC-08: (challenge token, enrolment URI on the first sign-in).
+    SecondFactorRequired(String, Option<String>),
+    /// A wrong authenticator code (AC-C03-05.2).
+    OtpInvalid,
+    /// Too many attempts (TSD §15).
+    RateLimited,
     /// 409 with a catalogue code from ERROR_CATALOG.md and a detail.
     Refused(&'static str, String),
     RefusedWith(&'static str, String, serde_json::Value),
@@ -46,6 +52,9 @@ impl ApiError {
             ApiError::PunchRefused(..) => (StatusCode::UNPROCESSABLE_ENTITY, "PUNCH_REFUSED", "Punch refused"),
             ApiError::Refused(code, _) | ApiError::RefusedWith(code, ..) => (StatusCode::CONFLICT, *code, "Not allowed by the organisation's rules"),
             ApiError::SelfApprovalForbidden => (StatusCode::FORBIDDEN, "SELF_APPROVAL_FORBIDDEN", "You cannot decide your own request"),
+            ApiError::SecondFactorRequired(..) => (StatusCode::UNAUTHORIZED, "SECOND_FACTOR_REQUIRED", "Enter the code from your authenticator app"),
+            ApiError::OtpInvalid => (StatusCode::BAD_REQUEST, "OTP_INVALID", "The code is not correct"),
+            ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED", "Too many attempts; try again later"),
             ApiError::ValidationFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Request is not valid"),
             ApiError::OrganisationChoiceRequired(..) => (StatusCode::CONFLICT, "ORGANISATION_CHOICE_REQUIRED", "Choose an organisation"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Internal error"),
@@ -76,6 +85,12 @@ impl IntoResponse for ApiError {
                 body["rule_ref"] = json!(rule_ref);
                 body["attempt_id"] = json!(attempt_id);
                 body["detail"] = json!(message);
+            }
+            ApiError::SecondFactorRequired(challenge, uri) => {
+                body["challenge_token"] = json!(challenge);
+                if let Some(u) = uri {
+                    body["otpauth_uri"] = json!(u); // first sign-in: enrol this secret in the authenticator app
+                }
             }
             ApiError::OrganisationChoiceRequired(choice_token, cands) => {
                 body["choice_token"] = json!(choice_token);

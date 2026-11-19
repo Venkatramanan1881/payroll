@@ -8,7 +8,7 @@ info:
     (AC-V01-06.4, AC-V01-13.4). Organisation-level facts only, never employee data (P12, AC-V01-06.3, AC-V01-11.5): usage and
     health read the platform summary table `platform.organisation_usage` (written by J10), never client tables.
     Vendor role split (VC-05 full_admin / support / read_only) beyond the matrix VA column is G-01 / OQ-V01-14; read_only
-    users may view but every change is refused (AC-V01-13.2). Vendor sign-in is not defined here (OQ-V01-17).
+    users may view but every change is refused (AC-V01-13.2). Vendor sign-in: Google accounts of the vendor's domain (D-22).
     Dated rows (daterange) are exposed as `valid_from` (inclusive) / `valid_to` (exclusive, null = open).
     Read operations of the console carry PLT-10 (no separate view rows exist for plans, templates or organisations).
 security:
@@ -27,6 +27,48 @@ x-exempt-permissions:
   PLT-16: 'Viewing data under an active SupportAccessGrant is exercised through the normal client routes with a grant-bound token; no route of its own. Extent: G-02 / OQ-V01-12.'
   PLT-17: 'Changing settings or data under a grant is exercised through client routes, if at all: OQ-V01-12 / G-02 is open. Changing results is a fixed denial (P10).'
 paths:
+  /v1/vendor/auth/google/sign-in:
+    post:
+      operationId: vendorGoogleSignIn
+      summary: Vendor console sign-in with a Google account of the vendor's domain
+      description: |
+        D-22 (closes OQ-V01-17). The console obtains a Google ID token (Google Identity Services) and exchanges it here. The
+        token must be signed by Google, issued by accounts.google.com for the console's OAuth client, carry a verified email
+        and the vendor's Workspace domain (`hd`). The email must belong to an active vendor user. Returns a vendor access
+        token valid for one hour; there is no refresh token (sign in with Google again). Organisation users are refused.
+      tags: [Vendor users]
+      security: []
+      x-permission: SELF-AUTH
+      x-module: V01
+      x-scope: vendor
+      x-audit: true
+      x-events: []
+      x-idempotent: natural
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id_token]
+              properties:
+                id_token: { type: string, maxLength: 4000 }
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, expires_in, token_type]
+                properties:
+                  access_token: { type: string }
+                  expires_in: { type: integer, description: Seconds (3600). }
+                  token_type: { type: string, enum: [Bearer] }
+        '401': { $ref: 'common.yaml#/components/responses/Unauthenticated' }
+        '422': { $ref: 'common.yaml#/components/responses/ValidationFailed' }
+
   /v1/vendor/organisations:
     get:
       operationId: vendorListOrganisations

@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 pub const ACCESS_TTL_SECS: i64 = 900;
 
+/// Unknown fields are refused, so no other token type (choice, second-step challenge, vendor) can pass as an access token.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AccessClaims {
     pub sub: Uuid,
     pub org: Uuid,
@@ -65,15 +67,25 @@ pub fn parse_refresh(token: &str) -> Option<(Uuid, [u8; 32])> {
 #[derive(Debug, Serialize, Deserialize)]
 struct ChoiceClaims {
     cands: Vec<(Uuid, Uuid)>,
+    /// Set for a password sign-in: the chosen organisation's AC-08 second step still applies.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pw: bool,
     exp: i64,
 }
 
 pub fn issue_choice(secret: &[u8], cands: Vec<(Uuid, Uuid)>, now: i64) -> String {
-    encode(&Header::new(Algorithm::HS256), &ChoiceClaims { cands, exp: now + 300 }, &EncodingKey::from_secret(secret))
+    encode(&Header::new(Algorithm::HS256), &ChoiceClaims { cands, pw: false, exp: now + 300 }, &EncodingKey::from_secret(secret))
         .expect("HS256 encoding cannot fail")
 }
 
-pub fn verify_choice(secret: &[u8], token: &str, now: i64) -> Result<Vec<(Uuid, Uuid)>, TokenError> {
+/// A choice after a password sign-in: the chosen organisation's second step is still owed.
+pub fn issue_password_choice(secret: &[u8], cands: Vec<(Uuid, Uuid)>, now: i64) -> String {
+    encode(&Header::new(Algorithm::HS256), &ChoiceClaims { cands, pw: true, exp: now + 300 }, &EncodingKey::from_secret(secret))
+        .expect("HS256 encoding cannot fail")
+}
+
+/// (candidates, whether the second step is still owed).
+pub fn verify_choice(secret: &[u8], token: &str, now: i64) -> Result<(Vec<(Uuid, Uuid)>, bool), TokenError> {
     let mut v = Validation::new(Algorithm::HS256);
     v.validate_exp = false;
     v.required_spec_claims.clear();
@@ -81,7 +93,7 @@ pub fn verify_choice(secret: &[u8], token: &str, now: i64) -> Result<Vec<(Uuid, 
     if now > c.exp {
         return Err(TokenError);
     }
-    Ok(c.cands)
+    Ok((c.cands, c.pw))
 }
 
 #[cfg(test)]
@@ -121,5 +133,95 @@ mod tests {
         for bad in ["", "abc", "not-a-uuid.xxxx", &format!("{org}."), &format!("{org}.!!!")] {
             assert_eq!(parse_refresh(bad), None, "{bad}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Second-step challenge (AC-08) and vendor tokens (D-22). Each carries `typ` and refuses unknown fields.
+
+fn hs256() -> Validation {
+    let mut v = Validation::new(Algorithm::HS256);
+    v.validate_exp = false; // checked against `now`
+    v.required_spec_claims.clear();
+    v
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChallengeClaims {
+    typ: String,
+    cu: Uuid,
+    co: Uuid,
+    /// A new authenticator secret awaiting its first code, encrypted with the MFA key (base64url).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pend: Option<String>,
+    exp: i64,
+}
+
+pub const CHALLENGE_TTL_SECS: i64 = 300;
+
+pub fn issue_challenge(secret: &[u8], user: Uuid, org: Uuid, pending: Option<String>, now: i64) -> String {
+    let c = ChallengeClaims { typ: "mfa".into(), cu: user, co: org, pend: pending, exp: now + CHALLENGE_TTL_SECS };
+    encode(&Header::new(Algorithm::HS256), &c, &EncodingKey::from_secret(secret)).expect("HS256 encoding cannot fail")
+}
+
+/// (user, organisation, pending encrypted secret).
+pub fn verify_challenge(secret: &[u8], token: &str, now: i64) -> Result<(Uuid, Uuid, Option<String>), TokenError> {
+    let c = decode::<ChallengeClaims>(token, &DecodingKey::from_secret(secret), &hs256()).map_err(|_| TokenError)?.claims;
+    if c.typ != "mfa" || now > c.exp {
+        return Err(TokenError);
+    }
+    Ok((c.cu, c.co, c.pend))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VendorClaims {
+    typ: String,
+    vid: Uuid,
+    iat: i64,
+    exp: i64,
+}
+
+pub const VENDOR_TTL_SECS: i64 = 3600;
+
+pub fn issue_vendor(secret: &[u8], vendor_user: Uuid, now: i64) -> String {
+    let c = VendorClaims { typ: "vendor".into(), vid: vendor_user, iat: now, exp: now + VENDOR_TTL_SECS };
+    encode(&Header::new(Algorithm::HS256), &c, &EncodingKey::from_secret(secret)).expect("HS256 encoding cannot fail")
+}
+
+pub fn verify_vendor(secret: &[u8], token: &str, now: i64) -> Result<Uuid, TokenError> {
+    let c = decode::<VendorClaims>(token, &DecodingKey::from_secret(secret), &hs256()).map_err(|_| TokenError)?.claims;
+    if c.typ != "vendor" || now > c.exp {
+        return Err(TokenError);
+    }
+    Ok(c.vid)
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    const S: &[u8] = b"k";
+
+    #[test]
+    fn token_kinds_never_cross() {
+        let (u, o) = (Uuid::new_v4(), Uuid::new_v4());
+        let access = issue_access(S, u, o, None, 1_000);
+        let challenge = issue_challenge(S, u, o, Some("x".into()), 1_000);
+        let vendor = issue_vendor(S, u, 1_000);
+        let choice = issue_choice(S, vec![(o, u)], 1_000);
+        for t in [&challenge, &vendor, &choice] {
+            assert!(verify_access(S, t, 1_001).is_err(), "only access tokens are access tokens");
+        }
+        for t in [&access, &vendor, &choice] {
+            assert!(verify_challenge(S, t, 1_001).is_err());
+        }
+        for t in [&access, &challenge, &choice] {
+            assert!(verify_vendor(S, t, 1_001).is_err());
+        }
+        assert_eq!(verify_challenge(S, &challenge, 1_001).unwrap(), (u, o, Some("x".into())));
+        assert!(verify_challenge(S, &challenge, 1_000 + CHALLENGE_TTL_SECS + 1).is_err());
+        assert_eq!(verify_vendor(S, &vendor, 1_001).unwrap(), u);
     }
 }
