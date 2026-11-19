@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Bump when a rule's meaning changes, so unchanged inputs are still recalculated (BR-02, AT5).
-pub const ENGINE_VERSION: &str = "2";
+pub const ENGINE_VERSION: &str = "3";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Expected {
@@ -41,6 +41,10 @@ pub struct DayInput {
     pub leave: Option<LeaveCover>,
     /// An absence with no leave is due to be charged (DS-10 waiting days passed).
     pub absence_due: bool,
+    /// Approved permissions that count as worked (PM-12), as (from, to). Only the part not already covered by a
+    /// counted session is credited. The caller has already moved the shift's start or end past a permission at
+    /// either edge, so no late or early mark falls inside it.
+    pub credited: Vec<(DateTime<Utc>, DateTime<Utc>)>,
     pub settings: AttendanceSettings,
 }
 
@@ -291,6 +295,18 @@ fn compute_core(input: &DayInput) -> DayOutput {
     if out.break_min > 0 {
         step(&mut out.explanation, "BK-03", json!({ "gross": out.gross_min, "break": out.break_min, "paid": s.break_paid }), format!("net {} minutes", out.net_min));
     }
+    let credit: i64 = input
+        .credited
+        .iter()
+        .map(|(f, t)| {
+            let worked: i64 = out.sessions.iter().filter_map(|x| x.out_at.map(|o| minutes((*f).max(x.in_at), (*t).min(o)))).sum();
+            (minutes(*f, *t) - worked).max(0)
+        })
+        .sum();
+    if credit > 0 {
+        out.net_min += credit;
+        step(&mut out.explanation, "PM-12", json!({ "credited": credit }), format!("{credit} approved permission minutes count as worked"));
+    }
 
     let first_in = merged.first().map(|p| p.in_at);
     let last_closed_out = merged.iter().rev().find_map(|p| p.out.map(|o| o.1));
@@ -463,6 +479,7 @@ mod tests {
             cutoff_passed: false,
             leave: None,
             absence_due: false,
+            credited: vec![],
             settings: AttendanceSettings::default(),
         }
     }

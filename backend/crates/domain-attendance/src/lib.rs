@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod leave;
 pub mod openbal;
 pub mod period;
+pub mod permission;
 pub mod regularisation;
 
 /// Settings of a policy version for the engine. A switched-off LA, EC or BK group evaluates nothing (G2, BR-14);
@@ -120,6 +121,22 @@ fn split(a: &Shape, b: &Shape) -> DateTime<Utc> {
         (Some(_), None) => a.to,
         (None, _) => b.from,
     }
+}
+
+/// The employee's time zone on a date (master branch; India where none is dated).
+pub async fn employee_tz(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) -> Result<String, DomainError> {
+    let noon = date.and_hms_opt(12, 0, 0).expect("valid time").and_utc();
+    match master_branch_on(tx, employee, date).await? {
+        Some(b) => branch_tz(tx, b, noon).await,
+        None => Ok("Asia/Kolkata".into()),
+    }
+}
+
+/// The employee's shift start and end on a date, when the day has set times.
+pub async fn shift_times(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>, DomainError> {
+    let Some(master) = master_branch_on(tx, employee, date).await? else { return Ok(None) };
+    let tz = employee_tz(tx, employee, date).await?;
+    Ok(shape(tx, employee, date, &tz, master).await?.times)
 }
 
 /// Recalculates one employee's day (BR-03). Returns the new result id, or None when nothing was written:
@@ -258,15 +275,33 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
             Some(LeaveCover { half: Some(half), split_at })
         }
     };
+    // PM-R6 / PM-12: approved permissions. One at either edge of the shift moves that edge (no late or early mark
+    // inside it); permission minutes that count as worked are credited towards the day's hours.
+    let mut expected = cur.expected;
+    let mut credited = vec![];
+    for (from, to, worked) in permission::approved_on(tx, employee, date).await? {
+        if let Expected::Working { start_at, end_at, .. } = &mut expected {
+            if from <= *start_at && to > *start_at {
+                *start_at = to.min(*end_at);
+            }
+            if from < *end_at && to >= *end_at {
+                *end_at = from.max(*start_at);
+            }
+        }
+        if worked {
+            credited.push((from, to));
+        }
+    }
     // DS-10: an absence is charged once its waiting days have passed, never on the day itself (D-07b).
     let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE $1)::date").bind(&tz).fetch_one(&mut ***tx).await?;
     let absence_due = (today - date).num_days() >= settings.absence_wait_days().max(1);
     let input = DayInput {
-        expected: cur.expected,
+        expected,
         punches: rows.into_iter().map(|(id, at, excluded)| PunchIn { id, at, excluded }).collect(),
         cutoff_passed: Utc::now() >= cur.cutoff_at,
         leave,
         absence_due,
+        credited,
         settings,
     };
     let print = fingerprint(&input);

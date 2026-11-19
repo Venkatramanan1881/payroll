@@ -13,3 +13,4 @@ pub mod iam;
 pub mod vendor;
 pub mod openbal;
 pub mod support;
+pub mod permissions;
