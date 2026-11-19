@@ -1,6 +1,6 @@
 """Generates backend/crates/domain-iam/src/defaults.rs from PERMISSION_MATRIX.md (P9: the matrix is the default for the
 system roles). Run from the repository root after the matrix changes:  python docs/domain/gen_default_grants.py
-Cells: Y -> all, S -> scoped, Self -> self, A -> approve; '?' and '—' grant nothing (gaps stay closed until decided).
+Cells: Y -> all, S -> scoped, Self -> self, A -> approve; '—', '?' and any cell with an open '?' part grant nothing.
 Cfg(X) becomes setting_ref X. † (actor from a user story) is granted as written."""
 import re
 
@@ -13,6 +13,8 @@ VENDOR_ROLES = {"VA": "full_admin", "VS": "support", "VR": "read_only"}
 
 def cell(c):
     c = c.strip().replace("†", "")
+    if "?" in c:  # any open part (e.g. "S (location) / ? (selfie)") keeps the whole cell closed until the gap is decided
+        return None, None
     ref = re.search(r"Cfg\(([^)]*)\)", c)
     head = re.sub(r"Cfg\([^)]*\)", "", c).strip().split()
     kind = {"Y": "all", "S": "scoped", "Self": "self", "A": "approve"}.get(head[0] if head else "")

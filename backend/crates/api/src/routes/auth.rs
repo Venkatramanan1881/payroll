@@ -115,7 +115,7 @@ async fn after_password(state: &AppState, org_id: Uuid, user_id: Uuid, device: O
                 sqlx::query_scalar("SELECT email FROM iam.user_account WHERE id = $1").bind(user_id).fetch_one(&mut **tx).await?
             };
             let uri = domain_iam::totp::otpauth_uri(&secret, email.as_deref().unwrap_or("admin"));
-            (Some(b64.encode(domain_iam::totp::encrypt(&key, &secret))), Some(uri))
+            (Some(b64.encode(domain_iam::totp::encrypt(&key, &secret, &domain_iam::password::secret_aad(org_id, user_id)))), Some(uri))
         }
     };
     let challenge = tokens::issue_challenge(&state.jwt_secret, user_id, org_id, pending, unix_now());
@@ -154,19 +154,27 @@ pub async fn verify_second_factor(State(state): State<AppState>, req: Result<Jso
     }
     let (user_id, org_id, pending) = tokens::verify_challenge(&state.jwt_secret, &req.challenge_token, unix_now()).map_err(|_| ApiError::Unauthenticated)?;
     let key = state.mfa_key.ok_or_else(|| ApiError::Internal(anyhow::anyhow!("MFA_ENCRYPTION_KEY is not set")))?;
+    // Guessing is capped per user across every challenge and instance: 5 wrong codes in 15 minutes stop it.
+    if domain_iam::password::failed_codes(&state.pool, org_id, user_id).await? >= domain_iam::password::MAX_FAILED_CODES {
+        return Err(ApiError::RateLimited);
+    }
     let (_, stored) = domain_iam::password::second_step(&state.pool, org_id, user_id).await?;
     use base64::Engine;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     // A stored secret always wins; a pending one (first sign-in) counts only while nothing is stored yet.
-    let sealed = match (stored, pending) {
-        (Some(s), _) => s,
-        (None, Some(p)) => b64.decode(p).map_err(|_| ApiError::Unauthenticated)?,
+    let (sealed, pending_used) = match (stored, pending) {
+        (Some(s), _) => (s, false),
+        (None, Some(p)) => (b64.decode(p).map_err(|_| ApiError::Unauthenticated)?, true),
         (None, None) => return Err(ApiError::Unauthenticated),
     };
-    let secret = domain_iam::totp::decrypt(&key, &sealed).ok_or(ApiError::Unauthenticated)?;
+    let secret = domain_iam::totp::decrypt(&key, &sealed, &domain_iam::password::secret_aad(org_id, user_id)).ok_or(ApiError::Unauthenticated)?;
     if !domain_iam::totp::verify(&secret, &req.code, unix_now()) {
+        domain_iam::password::record_failed_code(&state.pool, org_id, user_id).await?;
         return Err(ApiError::OtpInvalid);
     }
-    domain_iam::password::store_secret(&state.pool, org_id, user_id, &sealed).await?;
+    // A first enrolment that lost a race to another one does not sign in: only the stored secret counts.
+    if pending_used && !domain_iam::password::store_secret(&state.pool, org_id, user_id, &sealed).await? {
+        return Err(ApiError::Unauthenticated);
+    }
     open(&state, org_id, user_id, None).await
 }

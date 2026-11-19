@@ -70,10 +70,10 @@ pub async fn google_sign_in(State(state): State<AppState>, raw: Bytes) -> Result
 }
 
 /// Creates: the client key makes a retry return what the first call created (one key, one organisation).
-async fn keyed(tx: &mut OrgTx<'static>, headers: &HeaderMap, action: &str) -> Result<(Uuid, Option<Uuid>), ApiError> {
+async fn keyed(vu: &mut Vendor, headers: &HeaderMap, action: &str) -> Result<(Uuid, Option<Uuid>), ApiError> {
     let key = idempotency::key(headers)?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))").bind(key.to_string()).execute(&mut ***tx).await?;
-    Ok((key, v::replay(tx, action, key).await?))
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))").bind(key.to_string()).execute(&mut **vu.tx).await?;
+    Ok((key, v::replay(&mut vu.tx, vu.id, action, key).await?))
 }
 
 async fn done(tx: OrgTx<'static>, status: StatusCode, body: Value) -> Result<Response, ApiError> {
@@ -164,7 +164,7 @@ pub struct OrgIn {
 /// POST /v1/vendor/organisations (PLT-01).
 pub async fn create_org(mut vu: Vendor, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     need(&vu.role, "PLT-01")?;
-    let (key, replay) = keyed(&mut vu.tx, &headers, "vendor.organisation_created").await?;
+    let (key, replay) = keyed(&mut vu, &headers, "vendor.organisation_created").await?;
     if let Some(org) = replay {
         let body = v::get_org(&mut vu.tx, org).await?;
         return done(vu.tx, StatusCode::CREATED, body).await;
@@ -338,7 +338,7 @@ impl PlanBody {
 
 pub async fn create_plan(mut vu: Vendor, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     need(&vu.role, "PLT-04")?;
-    let (key, replay) = keyed(&mut vu.tx, &headers, "vendor.plan_created").await?;
+    let (key, replay) = keyed(&mut vu, &headers, "vendor.plan_created").await?;
     if let Some(id) = replay {
         let body = v::get_plan(&mut vu.tx, id).await?;
         return done(vu.tx, StatusCode::CREATED, body).await;
@@ -381,7 +381,7 @@ pub struct VendorUserIn {
 
 pub async fn create_vendor_user(mut vu: Vendor, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     need(&vu.role, "PLT-12")?;
-    let (key, replay) = keyed(&mut vu.tx, &headers, "vendor.vendor_user_created").await?;
+    let (key, replay) = keyed(&mut vu, &headers, "vendor.vendor_user_created").await?;
     if let Some(id) = replay {
         let body = v::get_vendor_user(&mut vu.tx, id).await?;
         return done(vu.tx, StatusCode::CREATED, body).await;

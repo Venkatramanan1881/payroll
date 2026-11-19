@@ -6,6 +6,40 @@ use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+fn dummy_hash() -> &'static str {
+    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+        argon2::Argon2::default().hash_password(b"not a password", &SaltString::generate(&mut OsRng)).expect("hash").to_string()
+    })
+}
+
+/// Failed second-step codes for a user in the last 15 minutes (kept in the audit log, so every instance sees them).
+pub const MAX_FAILED_CODES: i64 = 5;
+
+pub async fn failed_codes(pool: &PgPool, org: Uuid, user: Uuid) -> Result<i64, db::DomainError> {
+    let mut tx = db::begin_org(pool, org).await?;
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM audit.audit_entry WHERE action = 'iam.second_factor_failed' AND target_id = $1 AND occurred_at > now() - interval '15 minutes'",
+    )
+    .bind(user)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// Records a failed code in its own transaction (the request itself fails).
+pub async fn record_failed_code(pool: &PgPool, org: Uuid, user: Uuid) -> Result<(), db::DomainError> {
+    let mut tx = db::begin_org(pool, org).await?;
+    db::audit(&mut tx, user, "iam.second_factor_failed", "user_account", Some(user), None).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Associated data binding an encrypted secret to its organisation and user (a copied ciphertext does not decrypt).
+pub fn secret_aad(org: Uuid, user: Uuid) -> Vec<u8> {
+    format!("{org}:{user}").into_bytes()
+}
+
 fn matches(hash: &str, password: &str) -> bool {
     PasswordHash::new(hash).is_ok_and(|h| argon2::Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
 }
@@ -19,6 +53,7 @@ pub async fn candidates(pool: &PgPool, email: &str, password: &str) -> sqlx::Res
     let pairs: Vec<(Uuid, Uuid)> = sqlx::query_as("SELECT org_id, user_id FROM iam.resolve_login(NULL, $1) ORDER BY org_id").bind(email).fetch_all(&mut *tx).await?;
     tx.commit().await?;
     let mut out = vec![];
+    let mut checked = false;
     for (org_id, user_id) in pairs {
         let mut tx = db::begin_org(pool, org_id).await?;
         let row: Option<(Option<String>, String)> = sqlx::query_as(
@@ -29,10 +64,15 @@ pub async fn candidates(pool: &PgPool, email: &str, password: &str) -> sqlx::Res
         .fetch_optional(&mut **tx)
         .await?;
         if let Some((Some(hash), display_name)) = row {
+            checked = true;
             if matches(&hash, password) {
                 out.push(Candidate { org_id, user_id, display_name });
             }
         }
+    }
+    if !checked {
+        // An unknown email costs the same Argon2 work as a known one, so timing does not reveal accounts.
+        matches(dummy_hash(), password);
     }
     Ok(out)
 }

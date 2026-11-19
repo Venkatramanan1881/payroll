@@ -64,7 +64,22 @@ Organisation admins sign in with email and password, plus an authenticator-app c
   - Create (email unique), change role (same role → 200), deactivate (already → 200).
   - A full admin cannot change or deactivate themselves, and the last active full admin cannot be removed.
 
+## Review fixes
+- **Phone sign-in only for phone users:** a password admin with a mobile can no longer bypass the password and AC-08 with an SMS code.
+- **Guessing capped:** 5 wrong authenticator codes in 15 minutes → 429 RATE_LIMITED for that user. The count lives in the audit log, so every instance sees it.
+- **First-enrolment race:** a first enrolment that loses a race does not get a session.
+- **Encrypted secrets** are bound to their organisation and user (AES-GCM associated data).
+- **Timing:** an unknown email costs the same Argon2 work as a known one.
+- **Vendor-user changes** are serialised, so two full admins cannot remove each other at once.
+- **VC-01 (`on_reach`)** can be set on the day the limit row starts.
+- **Dates:** platform rows use India's date throughout.
+- **Vendor create replays** are per vendor user.
+- **Generator:** a matrix cell with any open `?` part grants nothing (TCP-08 for HR is no longer granted).
+- **Deployment:** `MFA_ENCRYPTION_KEY` belongs to the API service (where admins sign in), not the vendor service; the API deploy command no longer carries `JOB_SECRET`.
+
 ## Not in this slice (slice 12)
+- An index on `audit_entry.change_ref` for vendor replays (Gate 3 amendment).
+- Replaying organisation commands by key (a retried change gets the dated-history refusal instead of the first answer).
 - Opening balances (C15).
 - Support access grants (VC-03, SM-SUPPORT).
 - Usage and health views (J10).

@@ -25,6 +25,8 @@ pub enum ApiError {
     SecondFactorRequired(String, Option<String>),
     /// A wrong authenticator code (AC-C03-05.2).
     OtpInvalid,
+    /// Too many attempts (TSD §15).
+    RateLimited,
     /// 409 with a catalogue code from ERROR_CATALOG.md and a detail.
     Refused(&'static str, String),
     RefusedWith(&'static str, String, serde_json::Value),
@@ -52,6 +54,7 @@ impl ApiError {
             ApiError::SelfApprovalForbidden => (StatusCode::FORBIDDEN, "SELF_APPROVAL_FORBIDDEN", "You cannot decide your own request"),
             ApiError::SecondFactorRequired(..) => (StatusCode::UNAUTHORIZED, "SECOND_FACTOR_REQUIRED", "Enter the code from your authenticator app"),
             ApiError::OtpInvalid => (StatusCode::BAD_REQUEST, "OTP_INVALID", "The code is not correct"),
+            ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED", "Too many attempts; try again later"),
             ApiError::ValidationFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_FAILED", "Request is not valid"),
             ApiError::OrganisationChoiceRequired(..) => (StatusCode::CONFLICT, "ORGANISATION_CHOICE_REQUIRED", "Choose an organisation"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "Internal error"),

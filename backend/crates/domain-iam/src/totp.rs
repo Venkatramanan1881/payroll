@@ -1,7 +1,7 @@
 //! Authenticator-app codes for the AC-08 second step (D-23): RFC 6238 TOTP (HMAC-SHA1, 30 s, 6 digits) and
 //! AES-256-GCM encryption of the shared secret at rest (`iam.user_account.mfa_secret_enc`).
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -60,21 +60,21 @@ pub fn otpauth_uri(secret: &[u8], account: &str) -> String {
     format!("otpauth://totp/Payroll:{}?secret={}&issuer=Payroll&algorithm=SHA1&digits=6&period=30", enc(account), base32(secret))
 }
 
-/// nonce (12 bytes) || ciphertext.
-pub fn encrypt(key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
+/// nonce (12 bytes) || ciphertext; `aad` binds it to its owner (organisation and user).
+pub fn encrypt(key: &[u8; 32], plain: &[u8], aad: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce);
     let mut out = nonce.to_vec();
-    out.extend(Aes256Gcm::new(key.into()).encrypt(Nonce::from_slice(&nonce), plain).expect("AES-GCM encryption cannot fail"));
+    out.extend(Aes256Gcm::new(key.into()).encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad }).expect("AES-GCM encryption cannot fail"));
     out
 }
 
-pub fn decrypt(key: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
+pub fn decrypt(key: &[u8; 32], sealed: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     if sealed.len() < 12 {
         return None;
     }
     let (nonce, ct) = sealed.split_at(12);
-    Aes256Gcm::new(key.into()).decrypt(Nonce::from_slice(nonce), ct).ok()
+    Aes256Gcm::new(key.into()).decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad }).ok()
 }
 
 #[cfg(test)]
@@ -105,9 +105,10 @@ mod tests {
     fn base32_and_encryption_round_trip() {
         assert_eq!(base32(b"foobar"), "MZXW6YTBOI"); // RFC 4648 test vector
         let key = [7u8; 32];
-        let sealed = encrypt(&key, b"secret");
-        assert_eq!(decrypt(&key, &sealed).as_deref(), Some(&b"secret"[..]));
-        assert!(decrypt(&[8u8; 32], &sealed).is_none());
+        let sealed = encrypt(&key, b"secret", b"org:user");
+        assert_eq!(decrypt(&key, &sealed, b"org:user").as_deref(), Some(&b"secret"[..]));
+        assert!(decrypt(&[8u8; 32], &sealed, b"org:user").is_none());
+        assert!(decrypt(&key, &sealed, b"org:other").is_none(), "bound to its owner");
         assert!(otpauth_uri(b"x", "hr@example.in").starts_with("otpauth://totp/Payroll:hr%40example.in?secret="));
     }
 }

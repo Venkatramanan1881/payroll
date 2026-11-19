@@ -154,3 +154,29 @@ async fn vendor_users(pool: PgPool) {
     assert_eq!(common::as_user(&app, &help, "GET", "/v1/vendor/organisations", None, &[]).await.0, StatusCode::UNAUTHORIZED, "deactivated: the token stops at once");
     assert_eq!(common::as_user(&app, &ops, "POST", &format!("/v1/vendor/vendor-users/{ops_id}/deactivate"), Some(json!({ "reason": "x" })), &key()).await.0, StatusCode::FORBIDDEN, "not yourself");
 }
+
+/// Not configured: every vendor route is 404. VC-01 can be set on the organisation's first day.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn vendor_routes_off_and_same_day_settings(pool: PgPool) {
+    let mut state = common::state(pool.clone());
+    state.vendor_verifier = None;
+    let off = api::router(state);
+    let (res, _) = common::send(&off, common::post_json("/v1/vendor/auth/google/sign-in", json!({ "id_token": "vendor:ops@probeyond.in" }))).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let app = common::app(pool.clone());
+    vendor_user(&pool, "ops@probeyond.in", "full_admin").await;
+    let ops = token(&app, "ops@probeyond.in").await;
+    let (_, plan) = common::as_user(&app, &ops, "POST", "/v1/vendor/plans", Some(json!({ "code": "STD", "name": "Standard", "modules": [], "mobile_app": false })), &key()).await;
+    let template: Uuid = sqlx::query_scalar("INSERT INTO platform.sector_template (code, name, content) VALUES ('office', 'Office', '{}') RETURNING id").fetch_one(&pool).await.unwrap();
+    let (_, org) = common::as_user(&app, &ops, "POST", "/v1/vendor/organisations", Some(org_body(template, plan["id"].as_str().unwrap())), &key()).await;
+    let id = org["id"].as_str().unwrap();
+    let mut h = key();
+    h.push(("if-match", etag(&app, &ops, &format!("/v1/vendor/organisations/{id}")).await));
+    let (st, changed) = common::as_user(&app, &ops, "POST", &format!("/v1/vendor/organisations/{id}/change-vendor-settings"),
+        Some(json!({ "on_reach": "allow_and_alert", "renewal_reminder_days": 30, "reason": "softer" })), &h).await;
+    assert_eq!((st, changed["employee_limit"]["on_reach"].as_str(), changed["subscription"]["renewal_reminder_days"].as_i64()),
+               (StatusCode::OK, Some("allow_and_alert"), Some(30)), "{changed}");
+    let (_, hist) = common::as_user(&app, &ops, "GET", &format!("/v1/vendor/organisations/{id}/history?kind=vendor_settings"), None, &[]).await;
+    assert_eq!(hist["items"].as_array().map(Vec::len), Some(1), "{hist}");
+}

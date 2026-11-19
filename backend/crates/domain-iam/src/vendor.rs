@@ -58,10 +58,12 @@ async fn audit_keyed(tx: &mut OrgTx<'_>, vendor_user: Uuid, org: Option<Uuid>, a
 
 /// Vendor creates are idempotent by the client's key, kept on their audit entry (`change_ref`): the organisation-scoped
 /// idempotency table cannot hold a request that has no organisation yet. Returns what that key already created.
-pub async fn replay(tx: &mut OrgTx<'_>, action: &str, key: Uuid) -> Result<Option<Uuid>, DomainError> {
-    Ok(sqlx::query_scalar("SELECT target_id FROM audit.audit_entry WHERE actor_kind = 'vendor_user' AND action = $1 AND change_ref = $2")
+// shortcut: no index on change_ref; add one (Gate 3 amendment) when the audit log grows large.
+pub async fn replay(tx: &mut OrgTx<'_>, vendor_user: Uuid, action: &str, key: Uuid) -> Result<Option<Uuid>, DomainError> {
+    Ok(sqlx::query_scalar("SELECT target_id FROM audit.audit_entry WHERE actor_kind = 'vendor_user' AND actor_id = $3 AND action = $1 AND change_ref = $2")
         .bind(action)
         .bind(key.to_string())
+        .bind(vendor_user)
         .fetch_optional(&mut ***tx)
         .await?
         .flatten())
@@ -80,12 +82,12 @@ fn reason_ok(r: &str) -> Result<(), DomainError> {
 const ORG_JSON: &str = "jsonb_build_object('id', o.id, 'display_name', o.display_name, 'legal_name', o.legal_name, 'state', o.state,
     'state_changed_at', o.state_changed_at, 'state_reason', o.state_reason, 'sector_template_id', o.sector_template_id, 'created_at', o.created_at,
     'updated_at', o.updated_at,
-    'plan_id', (SELECT p.plan_id FROM platform.organisation_plan p WHERE p.org_id = o.id AND p.valid @> current_date),
+    'plan_id', (SELECT p.plan_id FROM platform.organisation_plan p WHERE p.org_id = o.id AND p.valid @> (now() AT TIME ZONE 'Asia/Kolkata')::date),
     'modules', coalesce((SELECT jsonb_agg(jsonb_build_object('module_code', m.module_code, 'enabled', m.enabled, 'valid_from', lower(m.valid),
                           'valid_to', upper(m.valid), 'reason', m.reason, 'set_by', m.set_by, 'set_at', m.set_at) ORDER BY m.module_code, lower(m.valid))
                         FROM platform.module_entitlement m WHERE m.org_id = o.id), '[]'),
     'employee_limit', (SELECT jsonb_build_object('max_active', l.max_active, 'on_reach', l.on_reach, 'valid_from', lower(l.valid))
-                       FROM platform.employee_limit l WHERE l.org_id = o.id AND l.valid @> current_date),
+                       FROM platform.employee_limit l WHERE l.org_id = o.id AND l.valid @> (now() AT TIME ZONE 'Asia/Kolkata')::date),
     'subscription', (SELECT jsonb_build_object('start_date', s.start_date, 'renewal_date', s.renewal_date, 'billing_status', s.billing_status,
                        'renewal_reminder_days', s.renewal_reminder_days, 'auto_suspend_after_days', s.auto_suspend_after_days)
                      FROM platform.subscription s WHERE s.org_id = o.id))";
@@ -201,21 +203,21 @@ pub async fn create_org(tx: &mut OrgTx<'_>, vendor_user: Uuid, o: NewOrg, key: U
         .bind(vendor_user)
         .fetch_one(&mut ***tx)
         .await?;
-    sqlx::query("INSERT INTO platform.organisation_plan (org_id, plan_id, valid, set_by, reason) VALUES ($1, $2, daterange(current_date, NULL), $3, 'organisation created')")
+    sqlx::query("INSERT INTO platform.organisation_plan (org_id, plan_id, valid, set_by, reason) VALUES ($1, $2, daterange((now() AT TIME ZONE 'Asia/Kolkata')::date, NULL), $3, 'organisation created')")
         .bind(org)
         .bind(o.plan_id)
         .bind(vendor_user)
         .execute(&mut ***tx)
         .await?;
     for m in &o.modules {
-        sqlx::query("INSERT INTO platform.module_entitlement (org_id, module_code, enabled, valid, set_by, reason) VALUES ($1, $2, true, daterange(current_date, NULL), $3, 'organisation created')")
+        sqlx::query("INSERT INTO platform.module_entitlement (org_id, module_code, enabled, valid, set_by, reason) VALUES ($1, $2, true, daterange((now() AT TIME ZONE 'Asia/Kolkata')::date, NULL), $3, 'organisation created')")
             .bind(org)
             .bind(m)
             .bind(vendor_user)
             .execute(&mut ***tx)
             .await?;
     }
-    sqlx::query("INSERT INTO platform.employee_limit (org_id, max_active, on_reach, valid, set_by) VALUES ($1, $2, $3, daterange(current_date, NULL), $4)")
+    sqlx::query("INSERT INTO platform.employee_limit (org_id, max_active, on_reach, valid, set_by) VALUES ($1, $2, $3, daterange((now() AT TIME ZONE 'Asia/Kolkata')::date, NULL), $4)")
         .bind(org)
         .bind(o.max_active)
         .bind(&o.on_reach)
@@ -283,7 +285,7 @@ pub async fn create_org(tx: &mut OrgTx<'_>, vendor_user: Uuid, o: NewOrg, key: U
     sqlx::query("INSERT INTO iam.user_scope (org_id, user_id, scope_kind) VALUES ($1, $2, 'all')").bind(org).bind(admin).execute(&mut ***tx).await?;
     // OQ-V01-10: only the template's organisation settings are copied for now; policy sets and lists come later.
     if let Some(settings) = template.get("organisation_settings").filter(|s| s.is_object()) {
-        sqlx::query("INSERT INTO org.organisation_settings_version (org_id, effective_from, settings, schema_version, reason) VALUES ($1, current_date, $2, 1, 'from the sector template')")
+        sqlx::query("INSERT INTO org.organisation_settings_version (org_id, effective_from, settings, schema_version, reason) VALUES ($1, (now() AT TIME ZONE 'Asia/Kolkata')::date, $2, 1, 'from the sector template')")
             .bind(org)
             .bind(settings)
             .execute(&mut ***tx)
@@ -398,8 +400,17 @@ pub async fn change_vendor_settings(tx: &mut OrgTx<'_>, vendor_user: Uuid, org: 
     }
     let before = get_org(tx, org).await?;
     if let Some(r) = on_reach {
-        let max: Option<i32> = before["employee_limit"]["max_active"].as_i64().map(|m| m as i32);
-        change_limit(tx, vendor_user, org, max, Some(r), from, reason).await?;
+        if !["block", "allow_and_alert"].contains(&r) {
+            return Err(invalid("on_reach is block or allow_and_alert"));
+        }
+        let starts: Option<NaiveDate> = sqlx::query_scalar("SELECT lower(valid) FROM platform.employee_limit WHERE org_id = $1 AND upper_inf(valid)").bind(org).fetch_optional(&mut ***tx).await?;
+        if starts.is_some_and(|s| s >= from) {
+            // The open row starts today: VC-01 for that same day is set on it (old and new values are in the audit).
+            sqlx::query("UPDATE platform.employee_limit SET on_reach = $2 WHERE org_id = $1 AND upper_inf(valid)").bind(org).bind(r).execute(&mut ***tx).await?;
+        } else {
+            let max: Option<i32> = before["employee_limit"]["max_active"].as_i64().map(|m| m as i32);
+            change_limit(tx, vendor_user, org, max, Some(r), from, reason).await?;
+        }
     }
     if reminder.is_some() || auto_suspend.is_some() {
         let changed = sqlx::query(
@@ -660,6 +671,12 @@ pub async fn create_vendor_user(tx: &mut OrgTx<'_>, actor: Uuid, email: &str, fu
     Ok(u)
 }
 
+/// Serialises changes to vendor roles and activity (the last-full-admin check must see every concurrent change).
+async fn lock_vendor_users(tx: &mut OrgTx<'_>) -> Result<(), DomainError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('vendor-users'))").execute(&mut ***tx).await?;
+    Ok(())
+}
+
 /// At least one active full admin always remains; nobody changes or switches off their own vendor access.
 async fn full_admin_remains(tx: &mut OrgTx<'_>) -> Result<(), DomainError> {
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM platform.vendor_user WHERE active AND vendor_role = 'full_admin'").fetch_one(&mut ***tx).await?;
@@ -675,6 +692,7 @@ pub async fn change_vendor_role(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, role:
     if actor == id {
         return Err(DomainError::Forbidden);
     }
+    lock_vendor_users(tx).await?;
     let before = get_vendor_user(tx, id).await?;
     if before["vendor_role"] != role {
         sqlx::query("UPDATE platform.vendor_user SET vendor_role = $2, updated_at = now(), updated_by = $3 WHERE id = $1").bind(id).bind(role).bind(actor).execute(&mut ***tx).await?;
@@ -690,6 +708,7 @@ pub async fn deactivate_vendor_user(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, r
     if actor == id {
         return Err(DomainError::Forbidden);
     }
+    lock_vendor_users(tx).await?;
     let changed = sqlx::query("UPDATE platform.vendor_user SET active = false, updated_at = now(), updated_by = $2 WHERE id = $1 AND active").bind(id).bind(actor).execute(&mut ***tx).await?.rows_affected();
     let u = get_vendor_user(tx, id).await?;
     if changed == 1 {

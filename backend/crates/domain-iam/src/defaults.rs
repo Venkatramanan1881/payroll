@@ -44,7 +44,6 @@ pub const SYSTEM_ROLE_GRANTS: &[(&str, &str, &str, Option<&str>)] = &[
     ("manager", "TCP-06", "approve", None),
     ("hr_manager", "TCP-07", "scoped", None),
     ("employee", "TCP-07", "self", Some("AC-05")),
-    ("hr_manager", "TCP-08", "scoped", None),
     ("hr_manager", "TCP-09", "scoped", None),
     ("employee", "TCP-09", "self", None),
     ("auditor", "TCP-09", "scoped", None),
