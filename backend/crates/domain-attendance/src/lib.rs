@@ -278,7 +278,7 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
     // PM-R6 / PM-12: approved permissions. One at either edge of the shift moves that edge (no late or early mark
     // inside it); permission minutes that count as worked are credited towards the day's hours.
     let mut expected = cur.expected;
-    let mut credit_min = 0;
+    let mut credited = vec![];
     for (from, to, worked) in permission::approved_on(tx, employee, date).await? {
         if let Expected::Working { start_at, end_at, .. } = &mut expected {
             if from <= *start_at && to > *start_at {
@@ -289,7 +289,7 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
             }
         }
         if worked {
-            credit_min += (to - from).num_minutes().max(0);
+            credited.push((from, to));
         }
     }
     // DS-10: an absence is charged once its waiting days have passed, never on the day itself (D-07b).
@@ -301,7 +301,7 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
         cutoff_passed: Utc::now() >= cur.cutoff_at,
         leave,
         absence_due,
-        credit_min,
+        credited,
         settings,
     };
     let print = fingerprint(&input);

@@ -182,9 +182,10 @@ pub async fn cancel(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: Header
     if !hr && !own {
         return Err(ApiError::NotFound);
     }
-    if own && !hr {
+    if own {
         require(&mut tx, &p, "PRM-06").await?;
     }
+    let hr = hr && !own; // one's own permission follows PM-29's employee rule, whatever else one holds
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/permissions/requests/{id}/cancel"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);

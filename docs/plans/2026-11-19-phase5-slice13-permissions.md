@@ -40,6 +40,23 @@
   - **At the end:** the expected end moves to its start, so no early mark.
   - **Credit:** minutes that count as worked (PM-12) are credited to net minutes (`DayInput.credit_min`, explained as PM-12).
 
+## Review fixes
+- **Concurrency:** one employee's permission submissions, decisions and cancellations are serialised (a transaction lock per employee), so two approvals or submissions can never pass the same limit, cap or overlap check together.
+- **Night shifts:** a time before a night shift's start is the after-midnight part (D+1), so end-of-shift permissions work on night shifts.
+- **No double credit:** only the part of a permission not covered by a counted session is credited (the engine computes it from `DayInput.credited` intervals). Worked time is never counted twice.
+- **More options refused until built:**
+  - PM-11 unpaid;
+  - PM-21 false;
+  - PM-22;
+  - PM-17 auto actions (no permission timer runs; pending permissions do not escalate yet);
+  - `payroll_period` (OQ-C09-01);
+  - out-of-range numbers.
+- **Defaults:** an omitted `max_per_day` takes the BRD default 1 (explicit null = no cap).
+- **Leave on the same day:** a full-day leave day takes no permission; PM-20 governs half days.
+- **Time zones and retired types:** the application window uses the employee's own date. A retired type's version still governs permissions approved under it (PM-12, usage period).
+- **Audit:** the level-1 step of a two-level approval is audited and emits RequestApprovedAtLevel.
+- **Own cancellation:** cancelling one's own permission always follows the employee rule (PRM-06), even for an HR user.
+
 ## Not in this slice
 - **Not built yet:**
   - the PM-29 change route (OQ-C09-10);

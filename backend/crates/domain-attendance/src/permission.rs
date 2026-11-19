@@ -61,6 +61,29 @@ fn check_version(v: &Map<String, Value>) -> Result<(), DomainError> {
             return Err(invalid(format!("{k}: only {only} is available yet: {why}")));
         }
     }
+    let fixed = [
+        ("paid", json!(true), "PM-11 unpaid permissions are not available yet"),
+        ("adjacent_off_allowed", json!(true), "PM-21 is not enforced yet"),
+    ];
+    for (k, only, why) in fixed {
+        if v.get(k) != Some(&only) {
+            return Err(invalid(format!("{k}: only {only} is available yet ({why})")));
+        }
+    }
+    if v.get("max_consecutive_days").is_some_and(|c| !c.is_null()) {
+        return Err(invalid("max_consecutive_days: PM-22 is not enforced yet"));
+    }
+    if v.get("timeout_action").and_then(Value::as_str) != Some("escalate") {
+        return Err(invalid("timeout_action: only escalate is available yet (no permission timer runs, PM-17)"));
+    }
+    if v.get("limit_period").and_then(Value::as_str) == Some("payroll_period") {
+        return Err(invalid("limit_period: payroll_period waits on OQ-C09-01 (which cycle applies)"));
+    }
+    for k in ["min_minutes", "max_minutes", "limit_count", "limit_minutes", "max_per_day", "max_per_week", "after_event_days", "min_notice_minutes", "timeout_minutes"] {
+        if v.get(k).and_then(Value::as_i64).is_some_and(|n| !(0..=100_000).contains(&n)) {
+            return Err(invalid(format!("{k} is out of range")));
+        }
+    }
     if v.get("carry_forward_max").is_some_and(|c| !c.is_null()) {
         return Err(invalid("carry_forward_max: PM-23 carry forward is not available yet (OQ-C09-02)"));
     }
@@ -99,6 +122,9 @@ fn check_version(v: &Map<String, Value>) -> Result<(), DomainError> {
 
 async fn insert_version(tx: &mut OrgTx<'_>, actor: Uuid, ptype: Uuid, v: &Map<String, Value>) -> Result<Uuid, DomainError> {
     check_version(v)?;
+    let mut v = v.clone();
+    v.entry("max_per_day").or_insert(json!(1)); // PM-09 BRD default; an explicit null means no cap
+    let v = &v;
     // jsonb_populate_record maps the checked document onto the version row's columns (unknown keys were refused above).
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO perm.permission_type_version (org_id, permission_type_id, effective_from, reason, created_by,
@@ -204,7 +230,16 @@ pub async fn list_types(tx: &mut OrgTx<'_>, on: NaiveDate) -> Result<Vec<Value>,
         .await?)
 }
 
-/// The version in force on a date, as its stored row.
+/// The version in force on a date whether or not the type was retired since (for what was already approved).
+async fn version_any(tx: &mut OrgTx<'_>, ptype: Uuid, date: NaiveDate) -> Result<Option<Value>, DomainError> {
+    Ok(sqlx::query_scalar("SELECT to_jsonb(v) FROM perm.permission_type_version v WHERE v.permission_type_id = $1 AND v.effective_from <= $2 ORDER BY v.effective_from DESC LIMIT 1")
+        .bind(ptype)
+        .bind(date)
+        .fetch_optional(&mut ***tx)
+        .await?)
+}
+
+/// The version in force on a date, as its stored row (retired types offer nothing new).
 async fn version_on(tx: &mut OrgTx<'_>, ptype: Uuid, date: NaiveDate) -> Result<Option<Value>, DomainError> {
     Ok(sqlx::query_scalar(
         "SELECT to_jsonb(v) FROM perm.permission_type_version v JOIN perm.permission_type t ON t.id = v.permission_type_id
@@ -320,7 +355,14 @@ pub fn span_minutes(start: NaiveTime, end: NaiveTime) -> i64 {
 /// The permission's instants in the employee's zone (master branch on the date).
 async fn instants(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, start: NaiveTime, end: NaiveTime) -> Result<(DateTime<Utc>, DateTime<Utc>), DomainError> {
     let tz = crate::employee_tz(tx, employee, date).await?;
-    let from: DateTime<Utc> = sqlx::query_scalar("SELECT ($1::date + $2::time) AT TIME ZONE $3").bind(date).bind(start).bind(&tz).fetch_one(&mut ***tx).await?;
+    let mut from: DateTime<Utc> = sqlx::query_scalar("SELECT ($1::date + $2::time) AT TIME ZONE $3").bind(date).bind(start).bind(&tz).fetch_one(&mut ***tx).await?;
+    // A night shift (e.g. 22:00-06:00 on D): a time before the shift's start is the after-midnight part, on D+1.
+    if let Some((s, e)) = crate::shift_times(tx, employee, date).await? {
+        let next = from + Duration::days(1);
+        if from < s && next >= s && next < e {
+            from = next;
+        }
+    }
     Ok((from, from + Duration::minutes(span_minutes(start, end))))
 }
 
@@ -335,7 +377,14 @@ async fn event(tx: &mut OrgTx<'_>, kind: &str, id: Uuid, employee: Uuid) -> Resu
 }
 
 /// PM-R1/PM-R2: an employee's own application, refused before anything is written when any rule fails.
+/// Serialises one employee's permission writes, so limits, caps and overlap checks see every concurrent change.
+async fn lock_employee(tx: &mut OrgTx<'_>, employee: Uuid) -> Result<(), DomainError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('permission:' || $1::text))").bind(employee).execute(&mut ***tx).await?;
+    Ok(())
+}
+
 pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewPermission) -> Result<Uuid, DomainError> {
+    lock_employee(tx, employee).await?;
     let reason = r.reason.trim();
     if reason.is_empty() || reason.chars().count() > 500 {
         return Err(invalid("reason is required (1-500 characters, PM-28)"));
@@ -371,7 +420,8 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewPermis
     }
     // PM-14 / PM-15: when it may be applied.
     let now = Utc::now();
-    let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE 'Asia/Kolkata')::date").fetch_one(&mut ***tx).await?;
+    let tz = crate::employee_tz(tx, employee, r.date).await?;
+    let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE $1)::date").bind(&tz).fetch_one(&mut ***tx).await?;
     let window_ok = match v["apply_window"].as_str() {
         Some("before_only") => now < from,
         Some("before_or_on_day") => today <= r.date,
@@ -385,8 +435,10 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewPermis
         return Err(DomainError::PeriodLocked);
     }
     // PM-20: a half-day leave on the same day.
-    if v["same_day_half_leave_allowed"] == false && crate::leave::leave_on(tx, employee, r.date).await?.is_some_and(|half| half.is_some()) {
-        return Err(refused("OVERLAPPING_REQUEST", "a half-day leave is taken that day (PM-20)"));
+    match crate::leave::leave_on(tx, employee, r.date).await? {
+        Some(None) => return Err(refused("OVERLAPPING_REQUEST", "the day is a full-day leave")),
+        Some(Some(_)) if v["same_day_half_leave_allowed"] == false => return Err(refused("OVERLAPPING_REQUEST", "a half-day leave is taken that day (PM-20)")),
+        _ => {}
     }
     // Overlap with another active permission, and the PM-09 per-day / per-week caps (pending requests count).
     let overlapping: bool = sqlx::query_scalar(
@@ -459,7 +511,7 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewPermis
 async fn post_usage(tx: &mut OrgTx<'_>, id: Uuid, actor: Uuid) -> Result<(), DomainError> {
     let (employee, ptype, date, minutes): (Uuid, Uuid, NaiveDate, i32) =
         sqlx::query_as("SELECT employee_id, permission_type_id, permission_date, minutes FROM perm.permission_request WHERE id = $1").bind(id).fetch_one(&mut ***tx).await?;
-    let v = version_on(tx, ptype, date).await?.ok_or_else(|| invalid("permission type has no version in force"))?;
+    let v = version_any(tx, ptype, date).await?.ok_or_else(|| invalid("permission type has no version in force"))?;
     let (from, to) = limit_period(tx, v["limit_period"].as_str().unwrap_or("calendar_month"), date).await?;
     sqlx::query(
         "INSERT INTO perm.permission_usage_entry (org_id, employee_id, permission_type_id, limit_period, entry_kind, origin, count_delta, minutes_delta, cause_kind, cause_id, created_by)
@@ -503,6 +555,8 @@ async fn lock(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Row, DomainError> {
 
 /// SM-REQ R4/R5/R6 (PRM-03 level 1, PRM-04 level 2). Final approval re-checks the limit, posts usage and recalculates.
 pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, note: Option<&str>) -> Result<(), DomainError> {
+    let employee = employee_of(tx, id).await?;
+    lock_employee(tx, employee).await?;
     let r = lock(tx, id).await?;
     if p.user_id == r.requester || p.employee_id == Some(r.employee) {
         return Err(DomainError::SelfApproval); // BR-07
@@ -551,6 +605,8 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
             .bind(p.user_id)
             .execute(&mut ***tx)
             .await?;
+        db::audit(tx, p.user_id, "permission_request.approve_level_1", "permission_request", Some(id), Some(json!({ "comment": note }))).await?;
+        event(tx, "RequestApprovedAtLevel", id, r.employee).await?;
         return Ok(());
     }
     if approve {
@@ -583,6 +639,8 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
 /// PM-29: the employee before the start time (PRM-06); HR afterwards with a reason (PRM-07, checked by the caller).
 /// An approved permission gets a usage reversal and the day is recalculated.
 pub async fn cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, reason: &str, hr: bool) -> Result<(), DomainError> {
+    let employee = employee_of(tx, id).await?;
+    lock_employee(tx, employee).await?;
     let r = lock(tx, id).await?;
     match r.state.as_str() {
         "cancelled" => return Ok(()),
@@ -695,7 +753,7 @@ pub async fn approved_on(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) ->
     .await?;
     let mut out = vec![];
     for (ptype, start, end) in rows {
-        let worked = version_on(tx, ptype, date).await?.is_none_or(|v| v["counts_as_worked"] != false);
+        let worked = version_any(tx, ptype, date).await?.is_none_or(|v| v["counts_as_worked"] != false);
         let (from, to) = instants(tx, employee, date, start, end).await?;
         out.push((from, to, worked));
     }

@@ -113,15 +113,17 @@ async fn limits_auto_approval_and_versions(pool: PgPool) {
     let (_, t, _) = common::call(&app, &s, "POST", "/v1/permissions/types", Some(json!({ "code": "AUTO", "name": "Auto", "version": version("auto_within_limit") })), None).await;
     let ptype = t["id"].as_str().unwrap().to_string();
     let today = (Utc::now() + Duration::minutes(330)).date_naive();
+    // Three days of one calendar month (later days are allowed: the window only limits how late one applies).
+    use chrono::Datelike;
+    let base = if today.day() >= 3 { today - Duration::days(2) } else { today };
     let mut states = vec![];
-    for back in [2, 1, 0] {
-        let date = today - Duration::days(back);
+    for step in [0, 1, 2] {
+        let date = base + Duration::days(step);
         let body = json!({ "permission_type_id": ptype, "permission_date": date, "start_time": "13:00", "end_time": "13:30", "reason": "errand" });
         let (st, r) = common::as_user(&app, &w.token, "POST", "/v1/permissions/requests", Some(body), &key()).await;
         states.push((st, r["state"].as_str().map(str::to_string).or(r["code"].as_str().map(str::to_string))));
     }
-    let same_month = (today - Duration::days(2)).format("%m").to_string() == today.format("%m").to_string();
-    if same_month {
+    {
         assert_eq!(states, vec![(StatusCode::CREATED, Some("approved".into())), (StatusCode::CREATED, Some("approved".into())), (StatusCode::CONFLICT, Some("LIMIT_EXCEEDED".into()))],
                    "two a month, approved at once (PM-16); the third is over the limit");
     }
@@ -147,4 +149,40 @@ async fn limits_auto_approval_and_versions(pool: PgPool) {
     assert_eq!(st, StatusCode::CREATED, "{own}");
     let (st, b) = common::as_user(&app, &s.hr_token, "POST", &format!("/v1/permissions/requests/{}/approve", own["id"].as_str().unwrap()), None, &key()).await;
     assert_eq!((st, b["code"].as_str()), (StatusCode::FORBIDDEN, Some("SELF_APPROVAL_FORBIDDEN")));
+}
+
+/// Review fixes: an end-of-shift permission removes the early mark; worked time inside a permission is never
+/// credited twice; a full-day leave day takes no permission; options not enforced are refused.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn end_of_shift_and_no_double_credit(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    for (k, v) in [("paid", json!(false)), ("adjacent_off_allowed", json!(false)), ("timeout_action", json!("auto_approve")), ("limit_period", json!("payroll_period"))] {
+        let mut bad = version("manager");
+        bad[k] = v;
+        assert_eq!(common::call(&app, &s, "POST", "/v1/permissions/types", Some(json!({ "code": "X", "name": "X", "version": bad })), None).await.0, StatusCode::UNPROCESSABLE_ENTITY, "{k}");
+    }
+    let (_, t, _) = common::call(&app, &s, "POST", "/v1/permissions/types", Some(json!({ "code": "AUTO", "name": "Auto", "version": version("auto_within_limit") })), None).await;
+    let ptype = t["id"].as_str().unwrap().to_string();
+    let today = (Utc::now() + Duration::minutes(330)).date_naive();
+    let ask = |date: chrono::NaiveDate, start: &str, end: &str| json!({ "permission_type_id": ptype, "permission_date": date, "start_time": start, "end_time": end, "reason": "x" });
+
+    // Leaves at 17:00: an hour early, until a permission covers the last hour.
+    let d1 = today - Duration::days(1);
+    manual(&app, &s, &w, &[format!("{d1}T03:30:00Z"), format!("{d1}T11:30:00Z")]).await;
+    assert_eq!(day(&app, &s, &w, &d1.to_string()).await["early_minutes"], 60);
+    let (st, r) = common::as_user(&app, &w.token, "POST", "/v1/permissions/requests", Some(ask(d1, "17:00", "18:00")), &key()).await;
+    assert_eq!((st, r["state"].as_str()), (StatusCode::CREATED, Some("approved")), "{r}");
+    assert_eq!(day(&app, &s, &w, &d1.to_string()).await["early_minutes"], 0, "no early mark inside the permission");
+
+    // Worked straight through a middle-of-shift permission: nothing extra is credited.
+    let d2 = today - Duration::days(2);
+    manual(&app, &s, &w, &[format!("{d2}T03:30:00Z"), format!("{d2}T12:30:00Z")]).await;
+    let before = day(&app, &s, &w, &d2.to_string()).await["net_minutes"].clone();
+    let (st, _) = common::as_user(&app, &w.token, "POST", "/v1/permissions/requests", Some(ask(d2, "13:00", "14:00")), &key()).await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert_eq!(day(&app, &s, &w, &d2.to_string()).await["net_minutes"], before, "worked time inside the permission counts once");
 }
