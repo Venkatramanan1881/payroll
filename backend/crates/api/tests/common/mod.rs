@@ -40,8 +40,27 @@ impl domain_iam::firebase::PhoneTokenVerifier for FakeVerifier {
     }
 }
 
+/// In-memory Cloud Storage: files kept by path, links point at a fake host.
+#[derive(Default)]
+pub struct MemoryStore(pub std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+
+#[async_trait::async_trait]
+impl api::storage::ObjectStore for MemoryStore {
+    async fn put(&self, path: &str, body: Vec<u8>, _content_type: &str) -> anyhow::Result<()> {
+        self.0.lock().unwrap().insert(path.to_string(), body);
+        Ok(())
+    }
+    async fn signed_url(&self, path: &str, ttl_secs: u64) -> anyhow::Result<String> {
+        Ok(format!("https://storage.test/{path}?expires={ttl_secs}"))
+    }
+}
+
 pub fn state(pool: PgPool) -> api::AppState {
-    api::AppState { pool, jwt_secret: JWT_SECRET.to_vec(), phone_verifier: std::sync::Arc::new(FakeVerifier), job_secret: Some(JOB_SECRET.to_vec()) }
+    state_with_store(pool, std::sync::Arc::new(MemoryStore::default()))
+}
+
+pub fn state_with_store(pool: PgPool, store: std::sync::Arc<MemoryStore>) -> api::AppState {
+    api::AppState { pool, jwt_secret: JWT_SECRET.to_vec(), phone_verifier: std::sync::Arc::new(FakeVerifier), job_secret: Some(JOB_SECRET.to_vec()), store: Some(store) }
 }
 
 pub fn app(pool: PgPool) -> axum::Router {
@@ -90,7 +109,7 @@ pub async fn seed_org(pool: &PgPool) -> SeedOrg {
         .bind(org_id).bind(hr_user_id).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name, system_code) VALUES ($1, $2, 'HR Manager', 'hr_manager')")
         .bind(org_id).bind(role_id).execute(pool).await.unwrap();
-    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07", "TCP-11", "CMP-01", "TCP-04", "TCP-06", "TCP-07", "TCP-08", "TCP-09", "ATT-01", "ATT-06", "ATT-03", "ATT-04", "ATT-05", "LVE-01", "LVE-03", "LVE-04", "LVE-05", "LVE-06", "LVE-07", "LVE-08", "ORG-01", "ORG-02", "ORG-03", "ORG-04", "ORG-05", "ORG-06", "ORG-07", "PER-01", "PER-02", "PER-03", "PER-04", "PER-08"] {
+    for op in ["WRK-01", "WRK-02", "WRK-03", "WRK-08", "SCH-01", "SCH-02", "SCH-03", "SCH-04", "SCH-05", "POL-01", "POL-02", "POL-04", "POL-06", "POL-07", "TCP-11", "CMP-01", "TCP-04", "TCP-06", "TCP-07", "TCP-08", "TCP-09", "ATT-01", "ATT-06", "ATT-03", "ATT-04", "ATT-05", "LVE-01", "LVE-03", "LVE-04", "LVE-05", "LVE-06", "LVE-07", "LVE-08", "ORG-01", "ORG-02", "ORG-03", "ORG-04", "ORG-05", "ORG-06", "ORG-07", "PER-01", "PER-02", "PER-03", "PER-04", "PER-06", "PER-07", "PER-08"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')")
             .bind(org_id).bind(role_id).bind(op).execute(pool).await.unwrap();
     }

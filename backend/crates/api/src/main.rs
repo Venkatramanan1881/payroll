@@ -27,7 +27,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(_) => None,
     };
-    let app = api::router(api::AppState { pool, jwt_secret, phone_verifier, job_secret });
+    // EXPORT_BUCKET (D-19) enables payroll input exports; the service account needs object create on the bucket and
+    // roles/iam.serviceAccountTokenCreator on itself for signed links.
+    let store = std::env::var("EXPORT_BUCKET").ok().filter(|b| !b.trim().is_empty()).map(|b| {
+        std::sync::Arc::new(api::storage::Gcs::new(b.trim().to_string())) as std::sync::Arc<dyn api::storage::ObjectStore>
+    });
+    if store.is_none() {
+        eprintln!("EXPORT_BUCKET is not set: payroll input exports are disabled");
+    }
+    let app = api::router(api::AppState { pool, jwt_secret, phone_verifier, job_secret, store });
     // The peer address backs PC-05 when no trusted proxy header is present.
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())

@@ -122,11 +122,37 @@ fn split(a: &Shape, b: &Shape) -> DateTime<Utc> {
 }
 
 /// Recalculates one employee's day (BR-03). Returns the new result id, or None when nothing was written:
-/// unchanged inputs (BR-02, SM-DAY A11), a locked date (BR-06; adjustments come with period close), a future date,
+/// unchanged inputs (BR-02, SM-DAY A11), a locked date (BR-06; see `measure_locked`), a future date,
 /// not employed, nothing expected and nothing punched, or no policy version in force (the day is marked `exception`).
 pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_kind: &str, trigger_ref: Option<Uuid>) -> Result<Option<Uuid>, DomainError> {
     if db::employee_locked(tx, employee, date, date.succ_opt()).await? {
         return Ok(None);
+    }
+    produce(tx, employee, date, trigger_kind, trigger_ref, false).await
+}
+
+/// SM-DAY A10: a result for a locked date measured only for a PeriodAdjustment (`for_adjustment`, never current).
+/// It is compared with the latest result measured for the date, else the locked one, so the same inputs twice
+/// measure nothing new (SM-ADJ idempotency). Returns (previous result, new result), or None when unchanged.
+pub async fn measure_locked(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_kind: &str, trigger_ref: Option<Uuid>) -> Result<Option<(Uuid, Uuid)>, DomainError> {
+    let Some(new) = produce(tx, employee, date, trigger_kind, trigger_ref, true).await? else { return Ok(None) };
+    let previous: Option<Uuid> = sqlx::query_scalar("SELECT supersedes_result_id FROM attendance.day_result WHERE id = $1").bind(new).fetch_one(&mut ***tx).await?;
+    Ok(previous.map(|p| (p, new)))
+}
+
+async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_kind: &str, trigger_ref: Option<Uuid>, adjust: bool) -> Result<Option<Uuid>, DomainError> {
+    if adjust {
+        // A locked date that never had a result has nothing to measure a difference against (OQ-C12-06): refused
+        // before anything is written.
+        let locked_result: Option<Uuid> = sqlx::query_scalar("SELECT current_result_id FROM attendance.attendance_day WHERE employee_id = $1 AND attendance_date = $2")
+            .bind(employee)
+            .bind(date)
+            .fetch_optional(&mut ***tx)
+            .await?
+            .flatten();
+        if locked_result.is_none() {
+            return Err(DomainError::PeriodLocked);
+        }
     }
     let Some(master) = master_branch_on(tx, employee, date).await? else { return Ok(None) };
     let noon = date.and_hms_opt(12, 0, 0).expect("valid time").and_utc();
@@ -138,6 +164,9 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
 
     let resolved = domain_policy::assignment::resolve_policy(tx, employee, date, master).await?;
     let Some(policy_version) = resolved.and_then(|r| r.version_id) else {
+        if adjust {
+            return Ok(None);
+        }
         sqlx::query("INSERT INTO attendance.attendance_day (org_id, employee_id, attendance_date, processing_state) VALUES (app.current_org(), $1, $2, 'exception') ON CONFLICT DO NOTHING")
             .bind(employee)
             .bind(date)
@@ -252,6 +281,26 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
             .bind(date)
             .fetch_one(&mut ***tx)
             .await?;
+    // Measuring for an adjustment compares with the latest measured result of the date, else the locked current one.
+    let current = if adjust {
+        // The head of the chain of measured results that starts at the current (locked) result. Measurements made
+        // against an earlier result (before an unlock) are not part of it; the day row lock above serialises writers.
+        let head: Option<Uuid> = sqlx::query_scalar(
+            "WITH RECURSIVE chain AS (
+               SELECT id, 0 AS depth FROM attendance.day_result WHERE id = $2
+               UNION ALL
+               SELECT r.id, c.depth + 1 FROM attendance.day_result r JOIN chain c ON r.supersedes_result_id = c.id
+                WHERE r.attendance_day_id = $1 AND r.for_adjustment)
+             SELECT id FROM chain ORDER BY depth DESC LIMIT 1",
+        )
+        .bind(day_id)
+        .bind(current)
+        .fetch_optional(&mut ***tx)
+        .await?;
+        head.or(current)
+    } else {
+        current
+    };
     if let Some(c) = current {
         let same: bool = sqlx::query_scalar(
             "SELECT input_fingerprint = $2 AND policy_version_id = $3 AND shift_version_id IS NOT DISTINCT FROM $4 AND schedule_tz = $5
@@ -266,6 +315,9 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
         .bind(branch)
         .fetch_one(&mut ***tx)
         .await?;
+        if same && adjust {
+            return Ok(None);
+        }
         if same {
             // After an unlock (SM-DAY A8) an unchanged day leaves `locked` for the state its inputs give.
             sqlx::query("UPDATE attendance.attendance_day SET processing_state = $2, updated_at = now() WHERE id = $1 AND processing_state = 'locked'")
@@ -277,15 +329,19 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
         }
     }
     let mut out = compute_day(&input);
-    settle_absence_debit(tx, employee, date, day_id, &input.settings.leave_debit_order, &mut out).await?;
+    if adjust {
+        measure_absence_charge(tx, day_id, &mut out).await?;
+    } else {
+        settle_absence_debit(tx, employee, date, day_id, &input.settings.leave_debit_order, &mut out).await?;
+    }
     let costed_branch = branch; // EM-08 default: the branch worked
     let result: Uuid = sqlx::query_scalar(
         "INSERT INTO attendance.day_result (org_id, attendance_day_id, employee_id, attendance_date, supersedes_result_id, policy_version_id,
            shift_version_id, schedule_tz, costed_branch_id, input_fingerprint, engine_version, trigger_kind, trigger_ref,
            gross_minutes, break_minutes, net_minutes, late_minutes, early_minutes, early_arrival_minutes, overtime_identified_minutes,
-           late_mark, early_mark, day_status, day_fraction_present, flags, sessions, explanation)
+           late_mark, early_mark, day_status, day_fraction_present, flags, sessions, explanation, for_adjustment)
          VALUES (app.current_org(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NULL,
-           $19, $20, $21, $22::numeric / 100, $23, $24, $25) RETURNING id",
+           $19, $20, $21, $22::numeric / 100, $23, $24, $25, $26) RETURNING id",
     )
     .bind(day_id)
     .bind(employee)
@@ -312,6 +368,7 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
     .bind(&out.flags)
     .bind(json!(out.sessions))
     .bind(json!(out.explanation))
+    .bind(adjust)
     .fetch_one(&mut ***tx)
     .await?;
     for u in &out.punches_used {
@@ -342,6 +399,9 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
         .execute(&mut ***tx)
         .await?;
     }
+    if adjust {
+        return Ok(Some(result)); // never current (BR-06)
+    }
     sqlx::query("UPDATE attendance.attendance_day SET current_result_id = $2, processing_state = $3, updated_at = now() WHERE id = $1")
         .bind(day_id)
         .bind(result)
@@ -360,6 +420,36 @@ pub async fn recalculate(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, tr
 /// LV-04 order that has the balance; with none, it is loss of pay. A day that stops being such an absence gets its
 /// debit reversed. One debit per day ever (the ledger key is the attendance day); once reversed, a later absence on
 /// the same day is loss of pay.
+/// DS-10 for a measured locked day: the ledger is never touched (BR-06). An absence still covered by its open leave
+/// debit stays covered; any other absence due for charging is loss of pay, as it would be without balance.
+// shortcut: a measured day that stops being an absence keeps its leave debit; reversing ledger entries for locked days waits on OQ-C12-07.
+async fn measure_absence_charge(tx: &mut OrgTx<'_>, day_id: Uuid, out: &mut engine::day::DayOutput) -> Result<(), DomainError> {
+    let due_pct: i64 = if out.flags.iter().any(|f| f == "absence_charge_due") {
+        100
+    } else if out.flags.iter().any(|f| f == "absence_charge_due_half") {
+        50
+    } else {
+        0
+    };
+    out.flags.retain(|f| f != "absence_charge_due" && f != "absence_charge_due_half");
+    if due_pct == 0 {
+        return Ok(());
+    }
+    let debited: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM leave.leave_ledger_entry e WHERE e.cause_kind = 'attendance_day' AND e.cause_id = $1 AND e.entry_kind = 'absence_auto_debit'
+                          AND NOT EXISTS (SELECT 1 FROM leave.leave_ledger_entry r WHERE r.reverses_entry_id = e.id))",
+    )
+    .bind(day_id)
+    .fetch_one(&mut ***tx)
+    .await?;
+    if debited {
+        out.flags.push("absence_auto_debited".into());
+    } else {
+        out.effects.push(Effect { kind: "absence_lop", days_pct: Some(due_pct), minutes: None, reason_code: "absent_no_leave_balance".into(), rule_ref: "DS-10" });
+    }
+    Ok(())
+}
+
 async fn settle_absence_debit(
     tx: &mut OrgTx<'_>,
     employee: Uuid,

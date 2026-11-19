@@ -98,15 +98,28 @@ pub async fn recalculate(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) 
     .fetch_all(&mut **tx)
     .await?;
     let employees: Vec<Uuid> = filtered.into_iter().filter(|e| sees(&visible, Some(*e))).collect();
-    let mut written = 0;
+    let (mut written, mut adjusted, mut beyond_window) = (0, 0, 0);
     for e in &employees {
         for d in r.from.iter_days().take(days as usize + 1) {
-            if domain_attendance::recalculate(&mut tx, *e, d, "hr_request", Some(key)).await?.is_some() {
-                written += 1;
+            if !db::employee_locked(&mut tx, *e, d, d.succ_opt()).await? {
+                if domain_attendance::recalculate(&mut tx, *e, d, "hr_request", Some(key)).await?.is_some() {
+                    written += 1;
+                }
+                continue;
+            }
+            // SM-DAY A10: a locked date posts its difference as an adjustment; one older than PL-07 is skipped and counted.
+            match domain_attendance::period::post_adjustment(&mut tx, Some(p.user_id), *e, d, "hr_request", Some(key)).await {
+                Ok(Some(_)) => adjusted += 1,
+                Ok(None) => {}
+                Err(db::DomainError::Refused("ADJUSTMENT_WINDOW_EXCEEDED", _)) => beyond_window += 1,
+                Err(db::DomainError::PeriodLocked) => {} // locked with no result: nothing to measure against
+                Err(err) => return Err(err.into()),
             }
         }
     }
-    db::audit(&mut tx, p.user_id, "attendance.recalculate", "attendance_day", None, Some(json!({ "from": r.from, "to": r.to, "employees": employees.len(), "reason": r.reason, "results_written": written }))).await?;
+    let summary = json!({ "from": r.from, "to": r.to, "employees": employees.len(), "reason": r.reason, "results_written": written,
+                          "adjustments_posted": adjusted, "locked_dates_beyond_adjustment_window": beyond_window });
+    db::audit(&mut tx, p.user_id, "attendance.recalculate", "attendance_day", None, Some(summary)).await?;
     let now = Utc::now();
     let body = json!({ "id": key, "kind": "attendance_recalculation", "state": "succeeded", "created_at": now, "finished_at": now,
                        "download_url": null, "download_expires_at": null, "error_report_url": null });
