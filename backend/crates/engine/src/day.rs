@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Bump when a rule's meaning changes, so unchanged inputs are still recalculated (BR-02, AT5).
-pub const ENGINE_VERSION: &str = "3";
+pub const ENGINE_VERSION: &str = "4";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Expected {
@@ -45,6 +45,8 @@ pub struct DayInput {
     /// counted session is credited. The caller has already moved the shift's start or end past a permission at
     /// either edge, so no late or early mark falls inside it.
     pub credited: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    /// An approved full-day (or several-day) on-duty covers the day: it counts as worked (PM-R6).
+    pub on_duty_day: bool,
     pub settings: AttendanceSettings,
 }
 
@@ -136,6 +138,14 @@ fn status_of(pct: i64, quarter_days: bool) -> &'static str {
 /// The day with approved leave applied: a full leave day is `leave`; a half day is calculated on the other half
 /// (start or end moved to the split point, E12, LA-20) and shown as `half_day_leave`.
 pub fn compute_day(input: &DayInput) -> DayOutput {
+    if input.on_duty_day {
+        let mut out = DayOutput { status: "on_duty", state: "provisional", fraction_pct: 100, ..DayOutput::default() };
+        for p in &input.punches {
+            out.punches_used.push(PunchUse { id: p.id, direction: None, session_no: None, excluded: Some("on_duty".into()) });
+        }
+        step(&mut out.explanation, "PM-R6", json!({}), "approved on-duty for the whole day counts as worked".into());
+        return out;
+    }
     let Some(leave) = &input.leave else { return compute_core(input) };
     let mut rest = input.clone();
     rest.leave = None;
@@ -480,6 +490,7 @@ mod tests {
             leave: None,
             absence_due: false,
             credited: vec![],
+            on_duty_day: false,
             settings: AttendanceSettings::default(),
         }
     }

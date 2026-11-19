@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub mod approval;
 pub mod jobs;
 pub mod leave;
+pub mod onduty;
 pub mod openbal;
 pub mod period;
 pub mod permission;
@@ -277,7 +278,7 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
     };
     // PM-R6 / PM-12: approved permissions. One at either edge of the shift moves that edge (no late or early mark
     // inside it); permission minutes that count as worked are credited towards the day's hours.
-    let mut expected = cur.expected;
+    let mut expected = cur.expected.clone();
     let mut credited = vec![];
     for (from, to, worked) in permission::approved_on(tx, employee, date).await? {
         if let Expected::Working { start_at, end_at, .. } = &mut expected {
@@ -292,6 +293,34 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
             credited.push((from, to));
         }
     }
+    // PM-R6 / OD: approved on-duty. A full day (or one of several days) covers the day; hours behave like a
+    // permission that counts as worked; a half day covers the half without kept punches (OQ-C09-12).
+    let mut on_duty_day = false;
+    for cover in onduty::approved_on(tx, employee, date).await? {
+        let (from, to) = match cover {
+            onduty::Cover::Day => {
+                on_duty_day = true;
+                continue;
+            }
+            onduty::Cover::Hours(a, b) => (a, b),
+            onduty::Cover::Half => {
+                let Expected::Working { start_at, end_at, .. } = &cur.expected else { continue };
+                let (start_at, end_at) = (*start_at, *end_at);
+                let mid = leave.as_ref().and_then(|l| l.split_at).unwrap_or(start_at + (end_at - start_at) / 2);
+                let first_kept = rows.iter().find(|r| r.2.is_none()).map(|r| r.1);
+                if first_kept.is_some_and(|t| t < mid) { (mid, end_at) } else { (start_at, mid) }
+            }
+        };
+        if let Expected::Working { start_at, end_at, .. } = &mut expected {
+            if from <= *start_at && to > *start_at {
+                *start_at = to.min(*end_at);
+            }
+            if from < *end_at && to >= *end_at {
+                *end_at = from.max(*start_at);
+            }
+        }
+        credited.push((from, to));
+    }
     // DS-10: an absence is charged once its waiting days have passed, never on the day itself (D-07b).
     let today: NaiveDate = sqlx::query_scalar("SELECT (now() AT TIME ZONE $1)::date").bind(&tz).fetch_one(&mut ***tx).await?;
     let absence_due = (today - date).num_days() >= settings.absence_wait_days().max(1);
@@ -302,6 +331,7 @@ async fn produce(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate, trigger_ki
         leave,
         absence_due,
         credited,
+        on_duty_day,
         settings,
     };
     let print = fingerprint(&input);
