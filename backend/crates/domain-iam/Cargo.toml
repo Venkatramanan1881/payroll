@@ -7,9 +7,11 @@ edition = "2021"
 db = { path = "../db" }
 sqlx.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 serde.workspace = true
 jsonwebtoken = "9"
 sha2 = "0.10"
+argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
 tokio.workspace = true

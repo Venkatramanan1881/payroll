@@ -17,7 +17,10 @@ pub async fn route(tx: &mut OrgTx<'_>, kind: &str, employee: Uuid, level: i16, t
         .await?;
     let source = rule.as_ref().map_or(if level == 1 { "reporting_manager" } else { "hr" }, |r| r.0.as_str());
     let routed = match source {
-        "named_user" => rule.and_then(|r| r.1),
+        "named_user" => match rule.and_then(|r| r.1) {
+            Some(u) => sqlx::query_scalar("SELECT id FROM iam.user_account WHERE id = $1 AND active").bind(u).fetch_optional(&mut ***tx).await?,
+            None => None,
+        },
         "reporting_manager" => sqlx::query_scalar(
             "SELECT u.id FROM workforce.employee_assignment a JOIN iam.user_account u ON u.employee_id = a.manager_employee_id AND u.active
              WHERE a.employee_id = $1 AND a.kind = 'reporting_manager' AND a.valid @> $2::date ORDER BY u.created_at LIMIT 1",

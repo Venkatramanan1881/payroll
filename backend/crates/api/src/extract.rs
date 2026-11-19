@@ -26,6 +26,15 @@ pub async fn authenticate(state: &AppState, headers: &HeaderMap, is_write: bool)
         .fetch_optional(&mut **tx)
         .await?;
     let Some((true, employee_id)) = user else { return Err(ApiError::Unauthenticated) };
+    if let Some(sid) = claims.sid {
+        let live: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM iam.session WHERE id = $1 AND revoked_at IS NULL AND expires_at > now())")
+            .bind(sid)
+            .fetch_one(&mut **tx)
+            .await?;
+        if !live {
+            return Err(ApiError::Unauthenticated);
+        }
+    }
     let org_state: Option<String> = sqlx::query_scalar("SELECT state FROM platform.organisation WHERE id = $1")
         .bind(claims.org)
         .fetch_optional(&mut **tx)

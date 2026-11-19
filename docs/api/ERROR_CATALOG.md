@@ -44,6 +44,7 @@ Every error is `application/problem+json` (RFC 9457), as defined by `Problem` in
 | `DUPLICATE_PUNCH` | 200 (per item) | Offline batch item already stored; not an error for the batch | TSD §9.3 |
 | `PENDING_ITEMS_BLOCK_LOCK` | 409 | Lock refused because PL-05 = block and the checklist has items. `errors` lists the blocking ChecklistItems (period.yaml), not field errors | PL-05 |
 | `UNLOCK_NOT_ALLOWED` | 409 | PL-06 = never | PL-06 |
+| `ALREADY_EXISTS` | 409 | A unique value is already in use (user mobile, email or employee link; role name) | UM-R1, AC-06 |
 | `CONFLICTING_SETTINGS` | 409 | Saving settings that conflict where the BRD requires a refusal | K4 |
 | `SETTINGS_WARNING` | 200 (warning list) | Settings saved, with warnings (e.g. PD/LA overlap, §10.3.4) | K4 |
 | `FILE_TYPE_NOT_ALLOWED` | 422 | Upload type or size not allowed | DC-06, TSD §11 |
