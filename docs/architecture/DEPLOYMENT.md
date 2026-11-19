@@ -22,6 +22,7 @@ docker push asia-south1-docker.pkg.dev/<gcp-project>/payroll/api:<git-sha>
 | `APP_JWT_SECRET` | Secret Manager | Signs access tokens. 32+ random bytes. |
 | `FIREBASE_PROJECT_ID` | plain env | Phone sign-in token audience (D-12). |
 | `JOB_SECRET` | Secret Manager | **Jobs service only.** Enables `/internal/jobs/*`. 32+ characters (surrounding whitespace is trimmed), or the job endpoints stay off and a line is logged. |
+| `EXPORT_BUCKET` | plain env | Private Cloud Storage bucket for payroll input exports (D-19). Unset: exports are disabled and a line is logged. |
 | `TRUSTED_PROXY_HOPS` | plain env | `1` behind the Cloud Run front end (PC-05 client IP). |
 | `PORT` | Cloud Run | Set by the platform. |
 
@@ -55,6 +56,16 @@ DATABASE_URL=<owner connection> api migrate
 - Supabase's own migration list still shows the earlier console-applied 0001–0009; our history is `_sqlx_migrations`.
 
 ## 4. Cloud Run service
+
+### Export bucket (D-19)
+
+- One private bucket per environment, in the database's region (production: `asia-south1`, Mumbai). Uniform bucket-level access; no public access.
+- Files are written as `<org_id>/payroll-input/<period_id>/<export_id>.json`.
+- The API service account needs:
+  - `roles/storage.objectCreator` and `roles/storage.objectViewer` on the bucket;
+  - `roles/iam.serviceAccountTokenCreator` on **itself**, so it can sign download links through `signBlob` (no key file).
+- Optional: a lifecycle rule that deletes objects after the retention period you choose.
+
 
 ```
 gcloud run deploy payroll-api --image <image> --region asia-south1 \

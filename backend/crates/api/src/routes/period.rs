@@ -2,13 +2,14 @@
 
 use crate::routes::org::require_org_wide;
 use crate::routes::sched::{done, if_match, parse, reply, start};
-use crate::{ApiError, Auth};
+use crate::{ApiError, AppState, Auth};
 use axum::body::Bytes;
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
-use chrono::NaiveDate;
+use chrono::{Duration, NaiveDate, Utc};
+use sha2::{Digest, Sha256};
 use db::OrgTx;
 use domain_attendance::period::{self, NewCycle, PeriodFilter, ScopeFilter};
 use domain_iam::authz::{require, Principal, Scope};
@@ -208,4 +209,78 @@ pub struct TotalsQuery {
 pub async fn totals(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, Query(q): Query<TotalsQuery>) -> Result<Json<Value>, ApiError> {
     let s = scope(&mut tx, &p, "PER-08").await?;
     Ok(Json(json!({ "items": period::totals(&mut tx, id, &s, q.employee_id).await?, "next_cursor": null })))
+}
+
+#[derive(Deserialize)]
+pub struct AdjustmentQuery {
+    target_period_id: Option<Uuid>,
+    source_period_id: Option<Uuid>,
+    employee_id: Option<Uuid>,
+    state: Option<String>,
+}
+
+/// GET /v1/period/adjustments (PER-08), within scope.
+pub async fn list_adjustments(Auth(p, mut tx): Auth, Query(q): Query<AdjustmentQuery>) -> Result<Json<Value>, ApiError> {
+    let s = scope(&mut tx, &p, "PER-08").await?;
+    let f = period::AdjustmentFilter { target_period_id: q.target_period_id, source_period_id: q.source_period_id, employee_id: q.employee_id, state: q.state };
+    Ok(Json(json!({ "items": period::list_adjustments(&mut tx, &f, &s).await?, "next_cursor": null })))
+}
+
+/// Signed links live this long (TB-02, AC-C12-07.5).
+const LINK_SECS: i64 = 900;
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ExportIn {
+    format: Option<String>,
+}
+
+/// POST /v1/periods/{id}/payroll-input-exports (PER-06, G-31): `PayrollInput v1` for the employees in scope, stored
+/// in Cloud Storage (D-19); the job answers at once with a short-lived signed link.
+pub async fn produce_export(State(state): State<AppState>, Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    let s = scope(&mut tx, &p, "PER-06").await?;
+    let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/periods/{id}/payroll-input-exports"), &raw).await?;
+    if let Some(r) = replay {
+        return Ok(r);
+    }
+    let f: ExportIn = optional(&raw)?;
+    if f.format.as_deref().is_some_and(|f| f != "json") {
+        return Err(ApiError::ValidationFailed("only json is produced in V1: the spreadsheet layout is OQ-C12-11".into()));
+    }
+    let store = state.store.clone().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("EXPORT_BUCKET is not set")))?;
+    let (export_id, now) = (Uuid::now_v7(), Utc::now());
+    let (doc, adjustments) = period::payroll_input(&mut tx, id, &s, export_id, now).await?;
+    let bytes = serde_json::to_vec(&doc).map_err(|e| ApiError::Internal(e.into()))?;
+    let checksum: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let org: Uuid = sqlx::query_scalar("SELECT app.current_org()").fetch_one(&mut **tx).await?;
+    let path = format!("{org}/payroll-input/{id}/{export_id}.json"); // TB-02: the organisation id leads the path
+    // shortcut: a failed commit after the upload leaves an unreferenced file; a bucket lifecycle rule can sweep those.
+    store.put(&path, bytes, "application/json").await.map_err(ApiError::Internal)?;
+    period::record_export(&mut tx, p.user_id, export_id, id, &path, &checksum, &adjustments).await?;
+    let url = store.signed_url(&path, LINK_SECS as u64).await.map_err(ApiError::Internal)?;
+    let body = json!({ "id": export_id, "kind": "payroll_input_export", "state": "succeeded", "created_at": now, "finished_at": Utc::now(),
+                       "download_url": url, "download_expires_at": now + Duration::seconds(LINK_SECS), "error_report_url": null });
+    done(tx, key, StatusCode::ACCEPTED, body).await
+}
+
+/// GET /v1/periods/{id}/payroll-input-exports (PER-07).
+pub async fn list_exports(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
+    require(&mut tx, &p, "PER-07").await?;
+    Ok(Json(json!({ "items": period::list_exports(&mut tx, id).await?, "next_cursor": null })))
+}
+
+/// GET /v1/period/payroll-input-exports/{id}/download-link (PER-07). An export holds the producer's scope, so a
+/// branch-scoped caller gets only their own exports; every download is audited (DOMAIN_MODEL §10).
+pub async fn download_link(State(state): State<AppState>, Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
+    let all = matches!(require(&mut tx, &p, "PER-07").await?.scope, Scope::All);
+    let export = period::get_export(&mut tx, id).await?;
+    if !all && export["produced_by"] != json!(p.user_id) {
+        return Err(ApiError::NotFound);
+    }
+    let store = state.store.clone().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("EXPORT_BUCKET is not set")))?;
+    let path = period::export_path(&mut tx, id).await?;
+    let url = store.signed_url(&path, LINK_SECS as u64).await.map_err(ApiError::Internal)?;
+    db::audit(&mut tx, p.user_id, "period.payroll_input_downloaded", "payroll_input_export", Some(id), None).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "url": url, "expires_at": Utc::now() + Duration::seconds(LINK_SECS) })))
 }

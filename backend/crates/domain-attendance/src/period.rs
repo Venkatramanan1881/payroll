@@ -1,6 +1,6 @@
 //! Attendance periods (C12, SM-PERIOD): cycles, period generation and housekeeping (J7), period settings PL-03..07,
 //! the pre-lock checklist (PL-R2), period totals (layer 5), lock (PL-R3, BR-06) and unlock through Organisation Admin
-//! approval (PL-06, BR-07). Adjustments after lock (PL-R4) and the payroll input export (MD-06) come next.
+//! approval (PL-06, BR-07), adjustments after lock (PL-R4, SM-ADJ) and the payroll input document (MD-06).
 
 use crate::approval::{step, steps_sql, Step};
 use chrono::{Datelike, Duration, NaiveDate};
@@ -632,6 +632,11 @@ pub async fn lock(tx: &mut OrgTx<'_>, actor: Uuid, period: Uuid, comment: Option
     .bind(actor)
     .execute(&mut ***tx)
     .await?;
+    sqlx::query("UPDATE period.period_adjustment SET state = 'frozen', updated_at = now(), updated_by = $2 WHERE target_period_id = $1 AND state = 'posted'")
+        .bind(period)
+        .bind(actor)
+        .execute(&mut ***tx)
+        .await?;
     sqlx::query("UPDATE attendance.attendance_day SET processing_state = 'locked', updated_at = now() WHERE attendance_date BETWEEN $1 AND $2 AND employee_id = ANY($3)")
         .bind(from)
         .bind(to)
@@ -768,6 +773,12 @@ pub async fn decide_unlock(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, approve: b
             .fetch_one(&mut ***tx)
             .await?;
         sqlx::query("DELETE FROM period.lock_coverage WHERE period_id = $1").bind(period).execute(&mut ***tx).await?;
+        // Adjustments frozen into this period may change again until it is re-locked; exported ones stay exported (OQ-C12-07).
+        sqlx::query("UPDATE period.period_adjustment SET state = 'posted', updated_at = now(), updated_by = $2 WHERE target_period_id = $1 AND state = 'frozen'")
+            .bind(period)
+            .bind(actor)
+            .execute(&mut ***tx)
+            .await?;
         sqlx::query("UPDATE period.attendance_period SET state = 'unlocked', updated_at = now(), updated_by = $2 WHERE id = $1")
             .bind(period)
             .bind(actor)
@@ -807,6 +818,272 @@ pub async fn decide_unlock(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, approve: b
     get_unlock(tx, id).await
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Adjustments (PL-R4, E15, SM-ADJ)
+
+fn signed_days(cents: i64) -> String {
+    format!("{}{}", if cents < 0 { "-" } else { "" }, days_text(cents.abs()))
+}
+
+/// (day status, late, early, deduction cents by reason) of one result.
+async fn result_view(tx: &mut OrgTx<'_>, id: Uuid) -> Result<(String, i64, i64, BTreeMap<&'static str, i64>), DomainError> {
+    let (status, late, early, effects): (String, i32, i32, Value) = sqlx::query_as(
+        "SELECT r.day_status, r.late_minutes, r.early_minutes,
+                coalesce((SELECT jsonb_agg(jsonb_build_object('kind', x.effect_kind, 'days', (x.days * 100)::bigint))
+                          FROM attendance.day_effect x WHERE x.result_id = r.id AND x.days > 0), '[]')
+         FROM attendance.day_result r WHERE r.id = $1",
+    )
+    .bind(id)
+    .fetch_one(&mut ***tx)
+    .await?;
+    let mut lines: BTreeMap<&'static str, i64> = BTreeMap::new();
+    for x in effects.as_array().into_iter().flatten() {
+        *lines.entry(reason_of(x["kind"].as_str().unwrap_or(""))).or_default() += x["days"].as_i64().unwrap_or(0);
+    }
+    Ok((status, i64::from(late), i64::from(early), lines))
+}
+
+/// SM-ADJ Q1: a changed input for a locked date posts only the difference to the first open period after the locked
+/// one (PL-R4, AC-C12-06.3), tagged with the original date. The difference is measured against the date's latest
+/// measured result, else the locked one (OQ-C12-06), so repeated corrections add up and the same inputs twice post
+/// nothing (AC-C12-06.5). PL-07: a source more than that many periods back -> ADJUSTMENT_WINDOW_EXCEEDED (OQ-C12-04).
+/// Returns the adjustment id, or None when the date is not locked or nothing changed.
+pub async fn post_adjustment(tx: &mut OrgTx<'_>, actor: Option<Uuid>, employee: Uuid, date: NaiveDate, trigger: &str, trigger_ref: Option<Uuid>) -> Result<Option<Uuid>, DomainError> {
+    let source: Option<(Uuid, NaiveDate, NaiveDate)> = sqlx::query_as(
+        "SELECT p.id, p.period_start, p.period_end FROM period.lock_coverage c JOIN period.attendance_period p ON p.id = c.period_id
+         WHERE c.employee_id = $1 AND c.dates @> $2::date",
+    )
+    .bind(employee)
+    .bind(date)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let Some((source, source_start, source_end)) = source else { return Ok(None) };
+    // Locking the target row keeps a concurrent lock from freezing it while the adjustment is posted.
+    let target: Option<(Uuid, NaiveDate)> = sqlx::query_as(
+        "SELECT id, period_start FROM period.attendance_period WHERE period_start > $1 AND state <> 'locked' ORDER BY period_start LIMIT 1 FOR UPDATE",
+    )
+    .bind(source_end)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let Some((target, target_start)) = target else {
+        return Err(DomainError::IllegalTransition("there is no open period after the locked one to post the adjustment into".into()));
+    };
+    let back: i64 = sqlx::query_scalar("SELECT count(*) FROM period.attendance_period WHERE period_start >= $1 AND period_start < $2")
+        .bind(source_start)
+        .bind(target_start)
+        .fetch_one(&mut ***tx)
+        .await?;
+    let window = settings(tx).await?["adjustment_past_periods"].as_i64().unwrap_or(3);
+    if back > window {
+        return Err(DomainError::Refused(
+            "ADJUSTMENT_WINDOW_EXCEEDED",
+            format!("{date} is {back} periods back; the organisation allows corrections {window} periods back (PL-07)"),
+        ));
+    }
+    let Some((previous, new)) = crate::measure_locked(tx, employee, date, trigger, trigger_ref).await? else { return Ok(None) };
+    let (old_status, old_late, old_early, old_lines) = result_view(tx, previous).await?;
+    let (new_status, new_late, new_early, new_lines) = result_view(tx, new).await?;
+    let mut reasons: Vec<&str> = old_lines.keys().chain(new_lines.keys()).copied().collect();
+    reasons.sort();
+    reasons.dedup();
+    let lines: Vec<Value> = reasons
+        .iter()
+        .map(|r| (*r, new_lines.get(r).copied().unwrap_or(0) - old_lines.get(r).copied().unwrap_or(0)))
+        .filter(|(_, d)| *d != 0)
+        .map(|(r, d)| json!({ "reason": r, "days": signed_days(d), "explanation_refs": [new.to_string()] }))
+        .collect();
+    let deduction_change: i64 = new_lines.values().sum::<i64>() - old_lines.values().sum::<i64>();
+    if lines.is_empty() && old_status == new_status && old_late == new_late && old_early == new_early {
+        return Ok(None); // the inputs changed, the outcome did not
+    }
+    let difference = json!({
+        "day_status": { "from": old_status, "to": new_status },
+        "late_minutes": new_late - old_late, "early_minutes": new_early - old_early,
+        "deduction_lines": lines, "measured_against_result_id": previous,
+    });
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO period.period_adjustment (org_id, employee_id, original_date, source_period_id, locked_result_id, new_result_id, difference, days,
+                                               target_period_id, created_by, updated_by)
+         VALUES (app.current_org(), $1, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $9) RETURNING id",
+    )
+    .bind(employee)
+    .bind(date)
+    .bind(source)
+    .bind(previous)
+    .bind(new)
+    .bind(&difference)
+    .bind(signed_days(-deduction_change)) // payable days move opposite to deductions
+    .bind(target)
+    .bind(actor)
+    .fetch_one(&mut ***tx)
+    .await?;
+    match actor {
+        Some(a) => db::audit(tx, a, "period.adjustment_posted", "period_adjustment", Some(id), Some(difference.clone())).await?,
+        None => db::audit_system(tx, "period.adjustment_posted", "period_adjustment", Some(id), Some(difference.clone())).await?,
+    }
+    sqlx::query("INSERT INTO app.outbox (org_id, event_type, aggregate_id, payload) VALUES (app.current_org(), 'AdjustmentPosted', $1, $2)")
+        .bind(id)
+        .bind(json!({ "employee_id": employee, "original_date": date, "target_period_id": target }))
+        .execute(&mut ***tx)
+        .await?;
+    Ok(Some(id))
+}
+
+const ADJUSTMENT_JSON: &str = "jsonb_build_object('id', a.id, 'employee_id', a.employee_id, 'original_date', a.original_date,
+    'source_period_id', a.source_period_id, 'target_period_id', a.target_period_id, 'locked_result_id', a.locked_result_id,
+    'new_result_id', a.new_result_id, 'days', to_char(a.days, 'FM9990.00'), 'difference', a.difference, 'state', a.state,
+    'created_at', a.created_at, 'explanation', (SELECT r.explanation FROM attendance.day_result r WHERE r.id = a.new_result_id))";
+
+pub struct AdjustmentFilter {
+    pub target_period_id: Option<Uuid>,
+    pub source_period_id: Option<Uuid>,
+    pub employee_id: Option<Uuid>,
+    pub state: Option<String>,
+}
+
+/// GET adjustments, for employees in scope on their original date.
+pub async fn list_adjustments(tx: &mut OrgTx<'_>, f: &AdjustmentFilter, scope: &ScopeFilter) -> Result<Vec<Value>, DomainError> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT {ADJUSTMENT_JSON} FROM period.period_adjustment a
+         WHERE ($1::uuid IS NULL OR a.target_period_id = $1) AND ($2::uuid IS NULL OR a.source_period_id = $2)
+           AND ($3::uuid IS NULL OR a.employee_id = $3) AND ($4::text IS NULL OR a.state = $4)
+           AND (($5::uuid[] IS NULL AND $6::uuid[] IS NULL) OR EXISTS (
+                 SELECT 1 FROM workforce.employee_assignment s WHERE s.employee_id = a.employee_id AND s.valid @> a.original_date
+                   AND ((s.kind = 'master_branch' AND s.branch_id = ANY($5)) OR (s.kind = 'department' AND s.list_entry_id = ANY($6)))))
+         ORDER BY a.original_date, a.created_at"
+    ))
+    .bind(f.target_period_id)
+    .bind(f.source_period_id)
+    .bind(f.employee_id)
+    .bind(&f.state)
+    .bind(&scope.0)
+    .bind(&scope.1)
+    .fetch_all(&mut ***tx)
+    .await?)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// PayrollInput v1 (MD-06, DOMAIN_MODEL §7)
+
+/// The `PayrollInput v1` document for a locked period and the employees in scope, with the ids of the adjustments it
+/// carries. Built only from frozen data, so exporting twice gives the same employees section (AC-C12-07.3).
+pub async fn payroll_input(tx: &mut OrgTx<'_>, period: Uuid, scope: &ScopeFilter, export_id: Uuid, produced_at: chrono::DateTime<chrono::Utc>) -> Result<(Value, Vec<Uuid>), DomainError> {
+    let (state, from, to, _) = bounds_of(tx, period).await?;
+    if state != "locked" {
+        return Err(DomainError::IllegalTransition("the payroll input is produced from a locked period (OQ-C12-11)".into()));
+    }
+    let totals = totals(tx, period, scope, None).await?;
+    let adjustments = list_adjustments(
+        tx,
+        &AdjustmentFilter { target_period_id: Some(period), source_period_id: None, employee_id: None, state: None },
+        scope,
+    )
+    .await?;
+    let mut people: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    for t in totals {
+        let mut e = Map::new();
+        for k in ["employee_id", "payable_days", "deduction_days", "deduction_lines", "late_minutes", "early_minutes", "overtime_identified_minutes", "pay_hold", "branch_days"] {
+            e.insert(k.into(), t[k].clone());
+        }
+        e.insert("adjustments".into(), json!([]));
+        people.insert(t["employee_id"].as_str().unwrap_or("").to_string(), e);
+    }
+    let mut ids = vec![];
+    for a in &adjustments {
+        let emp = a["employee_id"].as_str().unwrap_or("").to_string();
+        // Someone who left in the earlier period still receives their arrear here, with no totals of their own.
+        let e = people.entry(emp.clone()).or_insert_with(|| {
+            json!({ "employee_id": emp, "payable_days": "0.00", "deduction_days": "0.00", "deduction_lines": [], "late_minutes": 0, "early_minutes": 0,
+                    "overtime_identified_minutes": null, "pay_hold": false, "branch_days": [], "adjustments": [] })
+            .as_object()
+            .cloned()
+            .expect("object")
+        });
+        let d = &a["difference"];
+        e["adjustments"].as_array_mut().expect("array").push(json!({
+            "adjustment_id": a["id"], "original_date": a["original_date"], "source_period_id": a["source_period_id"], "days": a["days"],
+            "deduction_lines": d["deduction_lines"], "late_minutes": d["late_minutes"], "early_minutes": d["early_minutes"],
+            "explanation_refs": [a["new_result_id"]],
+        }));
+        if let Some(id) = a["id"].as_str().and_then(|s| s.parse().ok()) {
+            ids.push(id);
+        }
+    }
+    let codes: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, employee_code FROM workforce.employee WHERE id::text = ANY($1)")
+        .bind(people.keys().cloned().collect::<Vec<_>>())
+        .fetch_all(&mut ***tx)
+        .await?;
+    let mut employees: Vec<Value> = people
+        .into_values()
+        .map(|mut e| {
+            let id = e["employee_id"].as_str().unwrap_or("").to_string();
+            let code = codes.iter().find(|c| c.0.to_string() == id).map_or(String::new(), |c| c.1.clone());
+            e.insert("employee_code".into(), code.into());
+            let refs: Vec<Value> = e["deduction_lines"].as_array().into_iter().flatten().flat_map(|l| l["explanation_refs"].as_array().cloned().unwrap_or_default()).collect();
+            e.insert("explanation_refs".into(), refs.into());
+            Value::Object(e)
+        })
+        .collect();
+    employees.sort_by(|a, b| a["employee_code"].as_str().cmp(&b["employee_code"].as_str()));
+    let doc = json!({
+        "contract_version": "PayrollInput v1", "export_id": export_id, "produced_at": produced_at,
+        "period": { "id": period, "period_start": from, "period_end": to }, "employees": employees,
+    });
+    Ok((doc, ids))
+}
+
+/// Records an export once its file is stored: the export row, its adjustments (SM-ADJ Q3: frozen -> exported).
+pub async fn record_export(tx: &mut OrgTx<'_>, actor: Uuid, export_id: Uuid, period: Uuid, path: &str, checksum: &str, adjustments: &[Uuid]) -> Result<Value, DomainError> {
+    sqlx::query(
+        "INSERT INTO period.payroll_input_export (org_id, id, period_id, file_path, checksum, produced_by, created_by) VALUES (app.current_org(), $1, $2, $3, $4, $5, $5)",
+    )
+    .bind(export_id)
+    .bind(period)
+    .bind(path)
+    .bind(checksum)
+    .bind(actor)
+    .execute(&mut ***tx)
+    .await?;
+    sqlx::query("INSERT INTO period.payroll_input_export_adjustment (org_id, export_id, adjustment_id, created_by) SELECT app.current_org(), $1, a, $3 FROM unnest($2::uuid[]) a")
+        .bind(export_id)
+        .bind(adjustments)
+        .bind(actor)
+        .execute(&mut ***tx)
+        .await?;
+    sqlx::query("UPDATE period.period_adjustment SET state = 'exported', updated_at = now(), updated_by = $2 WHERE id = ANY($1) AND state = 'frozen'")
+        .bind(adjustments)
+        .bind(actor)
+        .execute(&mut ***tx)
+        .await?;
+    db::audit(tx, actor, "period.payroll_input_exported", "payroll_input_export", Some(export_id), Some(json!({ "period_id": period, "checksum": checksum, "adjustments": adjustments.len() }))).await?;
+    get_export(tx, export_id).await
+}
+
+const EXPORT_JSON: &str = "jsonb_build_object('id', x.id, 'period_id', x.period_id, 'contract_version', x.contract_version, 'produced_by', x.produced_by,
+    'produced_at', x.produced_at, 'checksum', x.checksum,
+    'adjustment_ids', coalesce((SELECT jsonb_agg(j.adjustment_id ORDER BY j.adjustment_id) FROM period.payroll_input_export_adjustment j WHERE j.export_id = x.id), '[]'))";
+
+pub async fn get_export(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainError> {
+    sqlx::query_scalar(&format!("SELECT {EXPORT_JSON} FROM period.payroll_input_export x WHERE x.id = $1"))
+        .bind(id)
+        .fetch_optional(&mut ***tx)
+        .await?
+        .ok_or(DomainError::NotFound)
+}
+
+pub async fn list_exports(tx: &mut OrgTx<'_>, period: Uuid) -> Result<Vec<Value>, DomainError> {
+    bounds_of(tx, period).await?;
+    Ok(sqlx::query_scalar(&format!("SELECT {EXPORT_JSON} FROM period.payroll_input_export x WHERE x.period_id = $1 ORDER BY x.produced_at DESC"))
+        .bind(period)
+        .fetch_all(&mut ***tx)
+        .await?)
+}
+
+/// The stored file of an export (TB-02: the path starts with the organisation id).
+pub async fn export_path(tx: &mut OrgTx<'_>, id: Uuid) -> Result<String, DomainError> {
+    sqlx::query_scalar("SELECT file_path FROM period.payroll_input_export WHERE id = $1").bind(id).fetch_optional(&mut ***tx).await?.ok_or(DomainError::NotFound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +1107,6 @@ mod tests {
     #[test]
     fn reason_lines() {
         assert_eq!((reason_of("absence_lop"), reason_of("uninformed_absence_cut"), reason_of("late_slab")), ("lop", "uninformed_absence_extra_cut", "late_early_penalty"));
-        assert_eq!(days_text(150), "1.50");
+        assert_eq!((days_text(150), signed_days(-100), signed_days(-25)), ("1.50".into(), "-1.00".into(), "-0.25".into()));
     }
 }

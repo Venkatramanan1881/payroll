@@ -2,6 +2,7 @@ mod error;
 mod extract;
 mod idempotency;
 mod routes;
+pub mod storage;
 
 pub use error::ApiError;
 pub use extract::{authenticate, unix_now, Auth};
@@ -17,6 +18,8 @@ pub struct AppState {
     pub phone_verifier: Arc<dyn domain_iam::firebase::PhoneTokenVerifier>,
     /// Bearer secret for /internal/jobs; None disables the job endpoints.
     pub job_secret: Option<Vec<u8>>,
+    /// Payroll input export files (D-19); None when EXPORT_BUCKET is not set.
+    pub store: Option<Arc<dyn storage::ObjectStore>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -112,6 +115,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/period/unlock-requests/{id}/approve", post(routes::period::approve_unlock))
         .route("/v1/period/unlock-requests/{id}/reject", post(routes::period::reject_unlock))
         .route("/v1/periods/{id}/totals", get(routes::period::totals))
+        .route("/v1/period/adjustments", get(routes::period::list_adjustments))
+        .route("/v1/periods/{id}/payroll-input-exports", post(routes::period::produce_export).get(routes::period::list_exports))
+        .route("/v1/period/payroll-input-exports/{id}/download-link", get(routes::period::download_link))
         .route("/v1/employees", post(routes::employees::create))
         .route("/v1/employees/{employee_id}", get(routes::employees::get).patch(routes::employees::patch))
         .route("/v1/employees/{employee_id}/assignments", get(routes::employees::list_assignments))

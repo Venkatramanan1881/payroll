@@ -333,3 +333,109 @@ async fn checklist_and_totals_respect_scope(pool: PgPool) {
     assert_eq!((st, &c["items"]), (StatusCode::OK, &json!([])));
     assert_eq!(common::as_user(&app, &b2, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await.0, StatusCode::FORBIDDEN, "lock is organisation-wide");
 }
+
+async fn hr_correct(app: &axum::Router, s: &common::SeedOrg, w: &common::Worker, d: NaiveDate) -> (StatusCode, Value) {
+    let at = |t: &str| format!("{d}T{t}:00Z");
+    let body = json!({ "employee_id": w.employee_id, "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at("03:30"), "proposed_out_at": at("12:30"), "reason": "device fault" });
+    common::as_user(app, &s.hr_token, "POST", "/v1/attendance/hr-corrections", Some(body), &key()).await
+}
+
+/// E15 / AC-C12-06.1-06.5: a corrected locked day stays locked; the difference is posted once to the next open period,
+/// frozen with it, and carried by the payroll input export, which is identical when taken twice (AC-C12-07.3).
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn correction_after_lock_posts_an_adjustment_and_exports(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let store = std::sync::Arc::new(common::MemoryStore::default());
+    let app = api::router(common::state_with_store(pool.clone(), store.clone()));
+    org_policy(&app, &s).await;
+    org_settings(&pool, s.org_id).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let (last, _) = periods(&app, &s).await;
+    let (_, list) = common::as_user(&app, &s.hr_token, "GET", "/v1/periods", None, &[]).await;
+    let oldest = list["items"][2]["id"].as_str().unwrap().to_string();
+    let d = month_start(2) + Duration::days(2);
+    let body = json!({ "from": d, "to": d, "employee_ids": [w.employee_id], "reason": "check" });
+    common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/recalculations", Some(body), &key()).await;
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{oldest}/lock"), None, &key()).await.0, StatusCode::OK);
+
+    let (st, r) = hr_correct(&app, &s, &w, d).await;
+    assert_eq!((st, r["state"].as_str()), (StatusCode::CREATED, Some("approved")), "{r}");
+    let (_, adj) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/period/adjustments?employee_id={}", w.employee_id), None, &[]).await;
+    let a = &adj["items"][0];
+    assert_eq!(adj["items"].as_array().map(Vec::len), Some(1), "{adj}");
+    assert_eq!(
+        (a["original_date"].as_str(), a["source_period_id"].as_str(), a["target_period_id"].as_str(), a["days"].as_str(), a["state"].as_str()),
+        (Some(&*d.to_string()), Some(&*oldest), Some(&*last), Some("1.00"), Some("posted")),
+        "one-day arrear into the next open period: {a}"
+    );
+    assert_eq!((a["difference"]["day_status"]["to"].as_str(), a["difference"]["deduction_lines"][0]["days"].as_str()), (Some("present"), Some("-1.00")), "{a}");
+    let (_, day) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/attendance/employees/{}/days/{d}", w.employee_id), None, &[]).await;
+    assert_eq!(day["current_result"]["day_status"], "absent", "the locked day itself never changes: {day}");
+
+    // The same inputs again post nothing (AC-C12-06.5).
+    let body = json!({ "from": d, "to": d, "employee_ids": [w.employee_id], "reason": "again" });
+    common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/recalculations", Some(body), &key()).await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM period.period_adjustment").fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 1);
+
+    let export = format!("/v1/periods/{last}/payroll-input-exports");
+    let (st, b) = common::as_user(&app, &s.hr_token, "POST", &export, None, &key()).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("ILLEGAL_TRANSITION")), "export after lock only: {b}");
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await.0, StatusCode::OK);
+    let state: String = sqlx::query_scalar("SELECT state FROM period.period_adjustment").fetch_one(&pool).await.unwrap();
+    assert_eq!(state, "frozen", "SM-ADJ Q2");
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", &export, Some(json!({ "format": "xlsx" })), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, job) = common::as_user(&app, &s.hr_token, "POST", &export, None, &key()).await;
+    assert_eq!((st, job["state"].as_str()), (StatusCode::ACCEPTED, Some("succeeded")), "{job}");
+    assert!(job["download_url"].as_str().unwrap().starts_with(&format!("https://storage.test/{}/payroll-input/{last}/", s.org_id)), "{job}");
+    let (_, again) = common::as_user(&app, &s.hr_token, "POST", &export, None, &key()).await;
+
+    let files: Vec<Value> = store.0.lock().unwrap().values().map(|b| serde_json::from_slice(b).unwrap()).collect();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["employees"], files[1]["employees"], "exported twice: identical content");
+    let doc = files.iter().find(|f| f["export_id"] == job["id"]).unwrap();
+    let e = &doc["employees"][0];
+    assert_eq!(
+        (doc["contract_version"].as_str(), e["employee_code"].as_str(), e["adjustments"][0]["original_date"].as_str(), e["adjustments"][0]["days"].as_str()),
+        (Some("PayrollInput v1"), Some("HQ-0001"), Some(&*d.to_string()), Some("1.00")),
+        "{doc}"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM period.period_adjustment").fetch_one(&pool).await.unwrap();
+    assert_eq!(state, "exported", "SM-ADJ Q3");
+
+    let (_, exports) = common::as_user(&app, &s.hr_token, "GET", &export, None, &[]).await;
+    assert_eq!((exports["items"].as_array().map(Vec::len), exports["items"][0]["adjustment_ids"].as_array().map(Vec::len)), (Some(2), Some(1)), "{exports}");
+    let again_id = again["id"].as_str().unwrap();
+    let (st, link) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/period/payroll-input-exports/{again_id}/download-link"), None, &[]).await;
+    assert_eq!((st, link["url"].as_str().map(|u| u.contains(again_id))), (StatusCode::OK, Some(true)), "{link}");
+    let downloads: i64 = sqlx::query_scalar("SELECT count(*) FROM audit.audit_entry WHERE action = 'period.payroll_input_downloaded'").fetch_one(&pool).await.unwrap();
+    assert_eq!(downloads, 1, "every download is audited");
+    let other = common::seed_org(&pool).await;
+    let uri = format!("/v1/period/payroll-input-exports/{}/download-link", job["id"].as_str().unwrap());
+    assert_eq!(common::as_user(&app, &other.hr_token, "GET", &uri, None, &[]).await.0, StatusCode::NOT_FOUND);
+}
+
+/// PL-07: a correction older than the window is refused and nothing is written (OQ-C12-04).
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn correction_beyond_the_window_is_refused(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s).await;
+    org_settings(&pool, s.org_id).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let (last, _) = periods(&app, &s).await;
+    let d = month_start(1) + Duration::days(2);
+    let body = json!({ "from": d, "to": d, "employee_ids": [w.employee_id], "reason": "check" });
+    common::as_user(&app, &s.hr_token, "POST", "/v1/attendance/recalculations", Some(body), &key()).await;
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await.0, StatusCode::OK);
+    assert_eq!(patch_settings(&app, &s, json!({ "adjustment_past_periods": 0, "reason": "no corrections" })).await.0, StatusCode::OK);
+    let (st, b) = hr_correct(&app, &s, &w, d).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("ADJUSTMENT_WINDOW_EXCEEDED")), "{b}");
+    let written: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM attendance.regularisation_request) + (SELECT count(*) FROM period.period_adjustment)")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(written, 0, "refused as a whole");
+}

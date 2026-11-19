@@ -216,12 +216,15 @@ pub async fn hr_correct(tx: &mut OrgTx<'_>, p: &Principal, r: NewRequest) -> Res
         return Err(refused("RULE_GROUP_DISABLED", "direct correction by HR is switched off (RG-10)"));
     }
     check_shape(tx, &r, master).await?;
-    if db::employee_locked(tx, r.employee, r.date, r.date.succ_opt()).await? {
-        return Err(DomainError::PeriodLocked);
-    }
+    // E15: HR's correction of a locked date is the post-lock route (OQ-C12-03): the day stays as locked and the
+    // difference is posted to the next open period (PL-R4).
+    let locked = db::employee_locked(tx, r.employee, r.date, r.date.succ_opt()).await?;
     let id = insert(tx, p.user_id, &r, "hr_direct", "approved", None, Some("approver")).await?;
     db::audit(tx, p.user_id, "regularisation.hr_correct", "regularisation_request", Some(id), Some(audit_step("approved", 1, Some(r.reason.trim()), None))).await?;
     apply(tx, p.user_id, id).await?;
+    if locked {
+        crate::period::post_adjustment(tx, Some(p.user_id), r.employee, r.date, "regularisation", Some(id)).await?;
+    }
     event(tx, "RequestApproved", id, r.employee).await?;
     Ok(id)
 }
