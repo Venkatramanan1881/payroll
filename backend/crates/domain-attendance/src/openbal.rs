@@ -42,11 +42,30 @@ pub async fn get_batch(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainErro
         .ok_or(DomainError::NotFound)
 }
 
-pub async fn list_batches(tx: &mut OrgTx<'_>, state: Option<&str>) -> Result<Vec<Value>, DomainError> {
-    Ok(sqlx::query_scalar(&format!("SELECT {} FROM openbal.opening_balance_batch b WHERE ($1::text IS NULL OR b.state = $1) ORDER BY b.created_at DESC", batch_sql()))
-        .bind(state)
-        .fetch_all(&mut ***tx)
+/// `visible`: None = every batch; else batches holding at least one of these employees (11).
+pub async fn list_batches(tx: &mut OrgTx<'_>, state: Option<&str>, visible: Option<&[Uuid]>) -> Result<Vec<Value>, DomainError> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT {} FROM openbal.opening_balance_batch b WHERE ($1::text IS NULL OR b.state = $1)
+           AND ($2::uuid[] IS NULL OR EXISTS (SELECT 1 FROM openbal.opening_balance_entry e WHERE e.batch_id = b.id AND e.employee_id = ANY($2)))
+         ORDER BY b.created_at DESC",
+        batch_sql()
+    ))
+    .bind(state)
+    .bind(visible)
+    .fetch_all(&mut ***tx)
+    .await?)
+}
+
+pub async fn batch_visible(tx: &mut OrgTx<'_>, id: Uuid, visible: Option<&[Uuid]>) -> Result<bool, DomainError> {
+    Ok(sqlx::query_scalar("SELECT $2::uuid[] IS NULL OR EXISTS (SELECT 1 FROM openbal.opening_balance_entry e WHERE e.batch_id = $1 AND e.employee_id = ANY($2))")
+        .bind(id)
+        .bind(visible)
+        .fetch_one(&mut ***tx)
         .await?)
+}
+
+pub async fn batch_state(tx: &mut OrgTx<'_>, id: Uuid) -> Result<String, DomainError> {
+    Ok(lock_batch(tx, id).await?.0)
 }
 
 pub async fn get_entry(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainError> {
@@ -73,8 +92,10 @@ pub async fn list_entries(tx: &mut OrgTx<'_>, batch: Uuid, employee: Option<Uuid
     .await?)
 }
 
-/// The employees an entry list touches (callers check scope on them).
+/// The employees an entry list touches (callers check scope on them), read under the batch row lock so no entry
+/// slips in between the scope check and the command.
 pub async fn batch_employees(tx: &mut OrgTx<'_>, batch: Uuid) -> Result<Vec<Uuid>, DomainError> {
+    lock_batch(tx, batch).await?;
     Ok(sqlx::query_scalar("SELECT DISTINCT employee_id FROM openbal.opening_balance_entry WHERE batch_id = $1").bind(batch).fetch_all(&mut ***tx).await?)
 }
 
@@ -104,17 +125,19 @@ async fn check_entry(tx: &mut OrgTx<'_>, e: &EntryIn) -> Result<Option<String>, 
                 return Ok(Some("leave_type_id is not a leave type of the organisation".into()));
             }
         }
-        ("late_counter" | "early_counter", None, None) => {}
-        ("comp_off" | "permission_used", ..) => return Ok(Some(format!("{} opening balances arrive with their module (not yet available)", e.kind))),
+        // shortcut: counters wait for the period-counter rebuild that reads them (LA-18 / EC-17); accepting them now would silently drop them.
+        ("comp_off" | "permission_used" | "late_counter" | "early_counter", ..) => {
+            return Ok(Some(format!("{} opening balances arrive with the module that uses them (not yet available)", e.kind)))
+        }
         ("leave", ..) => return Ok(Some("leave needs leave_type_id (and no permission_type_id)".into())),
-        _ => return Ok(Some("balance_kind is leave, comp_off, permission_used, late_counter or early_counter; counters take no type".into())),
+        _ => return Ok(Some("balance_kind is leave, comp_off, permission_used, late_counter or early_counter".into())),
     }
     let employed: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM workforce.employee WHERE id = $1)").bind(e.employee).fetch_one(&mut ***tx).await?;
     if !employed {
         return Ok(Some("employee not found".into()));
     }
     if db::employee_locked(tx, e.employee, e.as_of, e.as_of.succ_opt()).await? {
-        return Ok(Some("as_of_date is in a locked period (BR-06)".into()));
+        return Err(DomainError::PeriodLocked); // BR-06
     }
     Ok(None)
 }
@@ -243,12 +266,19 @@ pub async fn remove_entry(tx: &mut OrgTx<'_>, actor: Uuid, batch: Uuid, entry: U
 
 /// Whoever created the batch or any of its entries, or submitted it, never approves it (BR-07).
 async fn involved(tx: &mut OrgTx<'_>, batch: Uuid, actor: Uuid, created_by: Uuid, submitted_by: Option<Uuid>) -> Result<bool, DomainError> {
-    let entered: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM openbal.opening_balance_entry WHERE batch_id = $1 AND created_by = $2)")
-        .bind(batch)
-        .bind(actor)
-        .fetch_one(&mut ***tx)
-        .await?;
-    Ok(entered || actor == created_by || submitted_by == Some(actor))
+    // Entered, edited, removed or submitted at any time (a reject clears `submitted_by`; the audit keeps every hand).
+    // Deciding (a rejection) is not contributing, so an approver who rejected may still approve the corrected batch.
+    let touched: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM openbal.opening_balance_entry WHERE batch_id = $1 AND (created_by = $2 OR updated_by = $2))
+             OR EXISTS (SELECT 1 FROM audit.audit_entry WHERE actor_id = $2
+                          AND action IN ('openbal.batch_created','openbal.entries_added','openbal.entry_edited','openbal.entry_removed','openbal.batch_submitted')
+                          AND (target_id = $1 OR after_value->>'batch_id' = $1::text OR after_value->'before'->>'batch_id' = $1::text))",
+    )
+    .bind(batch)
+    .bind(actor)
+    .fetch_one(&mut ***tx)
+    .await?;
+    Ok(touched || actor == created_by || submitted_by == Some(actor))
 }
 
 /// B4: draft -> pending approval (OB-01 = with Organisation Admin approval only).
@@ -282,6 +312,15 @@ pub async fn confirm(tx: &mut OrgTx<'_>, actor: Uuid, batch: Uuid, comment: Opti
             }
             let requester = submitted_by.unwrap_or(created_by);
             step(tx, Step { kind: "opening_balance", request_id: batch, level: 1, action: "approved", requester, actor: Some(actor), on_behalf_of: None, comment }).await?;
+        }
+    }
+    let live: Vec<(Uuid, NaiveDate)> = sqlx::query_as("SELECT employee_id, as_of_date FROM openbal.opening_balance_entry WHERE batch_id = $1 AND superseded_by_entry_id IS NULL")
+        .bind(batch)
+        .fetch_all(&mut ***tx)
+        .await?;
+    for (employee, as_of) in live {
+        if db::employee_locked(tx, employee, as_of, as_of.succ_opt()).await? {
+            return Err(DomainError::PeriodLocked); // locked since the entry was made (BR-06)
         }
     }
     let leave: Vec<(Uuid, Uuid, Uuid, String, NaiveDate)> = sqlx::query_as(
@@ -355,6 +394,9 @@ pub async fn change_entry(tx: &mut OrgTx<'_>, actor: Uuid, entry: Uuid, value: &
     if lock_batch(tx, batch).await?.0 != "confirmed" || superseded.is_some() {
         return Err(DomainError::IllegalTransition("only a live entry of a confirmed batch is changed this way".into()));
     }
+    if db::employee_locked(tx, employee, old_as_of, old_as_of.succ_opt()).await? {
+        return Err(DomainError::PeriodLocked); // the old opening sits in a locked period: its reversal cannot be dated there
+    }
     let new = EntryIn { employee, kind: kind.clone(), leave_type, permission_type: None, value: value.to_string(), as_of: as_of.unwrap_or(old_as_of) };
     if let Some(p) = check_entry(tx, &new).await? {
         return Err(DomainError::Validation(p));
@@ -392,7 +434,7 @@ pub async fn change_entry(tx: &mut OrgTx<'_>, actor: Uuid, entry: Uuid, value: &
             )
             .bind(account)
             .bind(entry)
-            .bind(new.as_of)
+            .bind(old_as_of)
             .bind(reason.trim())
             .bind(actor)
             .bind(ledger)

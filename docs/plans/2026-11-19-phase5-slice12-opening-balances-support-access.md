@@ -58,7 +58,21 @@
 - **Action log (PLT-18):** audit entries carrying the grant id. Data access under a grant (a grant-bound token, PLT-16) is G-02 / OQ-V01-12: not built, so a grant grants no data access yet.
 - **Matrix:** PLT-14, PLT-15 and PLT-18 are organisation-side operations. They become grantable to organisation roles and the generator emits their organisation cells (Organisation Admin: PLT-14 approve under Cfg(VC-03), PLT-18; Auditor: PLT-18 scoped).
 
+## Review fixes
+- **OB-01 rights are separate:** entering, draft confirmation and submission need an entering grant (all/scoped). A pending batch is decided only by an approve-type holder, so a second HR Manager can no longer bypass the Organisation Admin.
+- **Scope:** only a full or approve grant over scope `all` sees the whole organisation. A self-only reader sees their own balances and only the batches holding them.
+- **BR-07 counts everyone who entered, edited, removed or submitted** (entries' `updated_by` plus the audit), not only the creator and the current submitter. A rejecting approver may still approve the corrected batch.
+- **Locked periods:** confirmation re-checks them for every live entry (PERIOD_LOCKED), and the PERIOD_LOCKED code is used everywhere for a locked as-of date.
+- **Late and early counters are refused for now:** no counter rebuild reads them yet, so accepting them would silently drop them.
+- **Corrections:** a change's reversal is dated on the old as-of date; adding entries needs If-Match on the batch; batch-wide checks run under the batch row lock.
+- **Support access:**
+  - The requested window length is kept (on the request's audit entry) and used when approval gives no `window_end`.
+  - Requests replay by key.
+  - A deactivated vendor user's active grants end with them.
+- **Known gap:** organisations created before this slice lack the Organisation Admin's default PLT-14/PLT-18 grants. Only test organisations exist, so nothing to backfill.
+
 ## Not in this slice
+- Late and early counter opening balances (with the period-counter rebuild).
 - The spreadsheet upload (needs `/v1/files/upload-links`).
 - Comp-off and permission opening balances (slice 13).
 - OB-01 and OB-02 setting routes.

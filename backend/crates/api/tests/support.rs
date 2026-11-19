@@ -41,8 +41,11 @@ async fn request_approve_end_and_expiry(pool: PgPool) {
     let request = format!("/v1/vendor/organisations/{}/support-access-requests", s.org_id);
     assert_eq!(common::as_user(&app, &viewer, "POST", &request, Some(json!({ "reason": "x" })), &key()).await.0, StatusCode::FORBIDDEN, "read_only cannot request");
 
-    let (st, g) = common::as_user(&app, &ops, "POST", &request, Some(json!({ "reason": "ticket 42", "requested_window_minutes": 60 })), &key()).await;
+    let k = key();
+    let (st, g) = common::as_user(&app, &ops, "POST", &request, Some(json!({ "reason": "ticket 42", "requested_window_minutes": 60 })), &k).await;
     assert_eq!((st, g["state"].as_str()), (StatusCode::CREATED, Some("requested")), "VC-03 on by default: {g}");
+    let (_, again) = common::as_user(&app, &ops, "POST", &request, Some(json!({ "reason": "ticket 42", "requested_window_minutes": 60 })), &k).await;
+    assert_eq!(again["id"], g["id"], "a retried request is the same grant");
     let id = g["id"].as_str().unwrap().to_string();
     let (_, mine) = common::as_user(&app, &ops, "GET", "/v1/vendor/support-access-grants", None, &[]).await;
     assert_eq!(mine["items"].as_array().map(Vec::len), Some(1));
@@ -71,6 +74,12 @@ async fn request_approve_end_and_expiry(pool: PgPool) {
     let (_, second) = common::as_user(&app, &ops, "POST", &request, Some(json!({ "reason": "ticket 43" })), &key()).await;
     let (_, rej) = common::as_user(&app, &oa, "POST", &format!("/v1/support-access-grants/{}/reject", second["id"].as_str().unwrap()), Some(json!({ "reason": "not now" })), &key()).await;
     assert_eq!(rej["state"], "rejected");
+    // Approved without a window_end: the requested length applies (30 minutes, not the 2-hour default).
+    let (_, short) = common::as_user(&app, &ops, "POST", &request, Some(json!({ "reason": "quick look", "requested_window_minutes": 30 })), &key()).await;
+    let (_, ok) = common::as_user(&app, &oa, "POST", &format!("/v1/support-access-grants/{}/approve", short["id"].as_str().unwrap()), None, &key()).await;
+    let start: chrono::DateTime<chrono::Utc> = ok["window_start"].as_str().unwrap().parse().unwrap();
+    let end: chrono::DateTime<chrono::Utc> = ok["window_end"].as_str().unwrap().parse().unwrap();
+    assert_eq!((end - start).num_minutes(), 30, "{ok}");
     sqlx::query("UPDATE platform.organisation SET support_access_needs_approval = false WHERE id = $1").bind(s.org_id).execute(&pool).await.unwrap();
     let (_, direct) = common::as_user(&app, &ops, "POST", &request, Some(json!({ "reason": "urgent" })), &key()).await;
     assert_eq!(direct["state"], "active", "{direct}");
@@ -78,5 +87,7 @@ async fn request_approve_end_and_expiry(pool: PgPool) {
         .bind(direct["id"].as_str().unwrap().parse::<Uuid>().unwrap()).execute(&pool).await.unwrap();
     let (_, expired) = common::as_user(&app, &oa, "GET", "/v1/support-access-grants?state=expired", None, &[]).await;
     assert_eq!(expired["items"].as_array().map(Vec::len), Some(1), "{expired}");
+    let expired_id = expired["items"][0]["id"].as_str().unwrap();
+    assert_eq!(common::as_user(&app, &oa, "POST", &format!("/v1/support-access-grants/{expired_id}/end"), Some(json!({ "reason": "x" })), &key()).await.0, StatusCode::CONFLICT, "an expired grant is not ended");
     assert_eq!(common::as_user(&app, &ops, "POST", &request, Some(json!({ "reason": "x", "requested_window_minutes": 9999 })), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
 }

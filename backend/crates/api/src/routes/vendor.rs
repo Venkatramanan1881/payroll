@@ -429,9 +429,13 @@ pub struct SupportIn {
 /// POST /v1/vendor/organisations/{id}/support-access-requests (PLT-13).
 pub async fn request_support(mut vu: Vendor, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     need(&vu.role, "PLT-13")?;
-    idempotency::key(&headers)?;
+    let (key, replay) = keyed(&mut vu, &headers, "support.requested").await?;
+    if let Some(grant) = replay {
+        let body = sqlx::query_scalar::<_, Value>("SELECT jsonb_build_object('id', id, 'state', state) FROM platform.support_access_grant WHERE id = $1").bind(grant).fetch_one(&mut **vu.tx).await?;
+        return done(vu.tx, StatusCode::CREATED, body).await;
+    }
     let b: SupportIn = parse(&raw)?;
-    let body = domain_iam::support::request(&mut vu.tx, vu.id, id, &b.reason, b.requested_window_minutes).await?;
+    let body = domain_iam::support::request(&mut vu.tx, vu.id, id, &b.reason, b.requested_window_minutes, key).await?;
     done(vu.tx, StatusCode::CREATED, body).await
 }
 

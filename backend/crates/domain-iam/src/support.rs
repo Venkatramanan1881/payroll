@@ -19,7 +19,7 @@ const GRANT_JSON: &str = "jsonb_build_object('id', g.id, 'org_id', g.org_id, 've
 // Vendor side (runs as app_vendor)
 
 /// S1 / S2: requested (VC-03 on) or active at once (off). Every request is new (AC-V01-09.3).
-pub async fn request(tx: &mut OrgTx<'_>, vendor_user: Uuid, org: Uuid, reason: &str, window_minutes: Option<i64>) -> Result<Value, DomainError> {
+pub async fn request(tx: &mut OrgTx<'_>, vendor_user: Uuid, org: Uuid, reason: &str, window_minutes: Option<i64>, key: Uuid) -> Result<Value, DomainError> {
     let reason = reason.trim();
     if reason.is_empty() || reason.chars().count() > 1000 {
         return Err(DomainError::Validation("reason is required (1-1000 characters)".into()));
@@ -30,7 +30,6 @@ pub async fn request(tx: &mut OrgTx<'_>, vendor_user: Uuid, org: Uuid, reason: &
     }
     let needs: Option<bool> = sqlx::query_scalar("SELECT support_access_needs_approval FROM platform.organisation WHERE id = $1").bind(org).fetch_optional(&mut ***tx).await?;
     let needs = needs.ok_or(DomainError::NotFound)?;
-    // The requested length rides on the window columns until a decision sets the real window.
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO platform.support_access_grant (org_id, vendor_user_id, reason, state, window_start, window_end)
          VALUES ($1, $2, $3, $4, CASE WHEN $4 = 'active' THEN now() END, CASE WHEN $4 = 'active' THEN now() + make_interval(mins => $5) END) RETURNING id",
@@ -43,13 +42,14 @@ pub async fn request(tx: &mut OrgTx<'_>, vendor_user: Uuid, org: Uuid, reason: &
     .fetch_one(&mut ***tx)
     .await?;
     sqlx::query(
-        "INSERT INTO audit.audit_entry (org_id, actor_kind, actor_id, action, target_type, target_id, after_value)
-         VALUES ($1, 'vendor_user', $2, 'support.requested', 'support_access_grant', $3, $4)",
+        "INSERT INTO audit.audit_entry (org_id, actor_kind, actor_id, action, target_type, target_id, after_value, change_ref)
+         VALUES ($1, 'vendor_user', $2, 'support.requested', 'support_access_grant', $3, $4, $5)",
     )
     .bind(org)
     .bind(vendor_user)
     .bind(id)
     .bind(json!({ "reason": reason, "window_minutes": minutes, "needs_approval": needs }))
+    .bind(key.to_string())
     .execute(&mut ***tx)
     .await?;
     get(tx, id).await
@@ -108,7 +108,15 @@ pub async fn approve(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, window_end: Opti
         s => return Err(DomainError::IllegalTransition(format!("the grant is {s}"))),
     }
     let now = chrono::Utc::now();
-    let end = window_end.unwrap_or(now + chrono::Duration::minutes(DEFAULT_WINDOW_MINUTES));
+    // Without a window_end the requested length applies (kept on the request's audit entry).
+    let requested: Option<i64> = sqlx::query_scalar(
+        "SELECT (after_value->>'window_minutes')::bigint FROM audit.audit_entry WHERE action = 'support.requested' AND target_id = $1 ORDER BY occurred_at LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&mut ***tx)
+    .await?
+    .flatten();
+    let end = window_end.unwrap_or(now + chrono::Duration::minutes(requested.unwrap_or(DEFAULT_WINDOW_MINUTES)));
     if end <= now || end > now + chrono::Duration::minutes(MAX_WINDOW_MINUTES) {
         return Err(DomainError::Validation(format!("window_end is in the next {MAX_WINDOW_MINUTES} minutes")));
     }

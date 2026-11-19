@@ -11,7 +11,7 @@ use axum::Json;
 use chrono::NaiveDate;
 use db::OrgTx;
 use domain_attendance::openbal::{self as ob, EntryIn};
-use domain_iam::authz::{require, Principal, Scope};
+use domain_iam::authz::{require, GrantKind, Principal, Scope};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -19,10 +19,20 @@ use uuid::Uuid;
 /// The caller's employees for `op`: None = the whole organisation (any grant kind over scope `all`, so an
 /// approve-type grant of the Organisation Admin covers every batch), else the listed employees.
 async fn scope(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<Option<Vec<Uuid>>, ApiError> {
-    if matches!(require(tx, p, op).await?.scope, Scope::All) {
+    let g = require(tx, p, op).await?;
+    if matches!((g.kind, &g.scope), (GrantKind::All | GrantKind::Scoped | GrantKind::Approve, Scope::All)) {
         return Ok(None);
     }
     visible_employees(tx, p, op).await
+}
+
+/// The grant kinds the caller holds for `op` across roles (approving and entering are different rights, OB-01).
+async fn kinds(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<Vec<String>, ApiError> {
+    Ok(sqlx::query_scalar("SELECT g.grant_kind FROM iam.role_grant g JOIN iam.user_role r ON r.role_id = g.role_id WHERE r.user_id = $1 AND g.operation_code = $2")
+        .bind(p.user_id)
+        .bind(op)
+        .fetch_all(&mut ***tx)
+        .await?)
 }
 
 /// Batch-wide commands need every employee of the batch in scope.
@@ -85,14 +95,18 @@ pub struct BatchQuery {
 
 /// GET /v1/opening-balances/batches (OBL-04).
 pub async fn list_batches(Auth(p, mut tx): Auth, Query(q): Query<BatchQuery>) -> Result<Json<Value>, ApiError> {
-    scope(&mut tx, &p, "OBL-04").await?;
-    Ok(Json(json!({ "items": ob::list_batches(&mut tx, q.state.as_deref()).await?, "next_cursor": null })))
+    let visible = scope(&mut tx, &p, "OBL-04").await?;
+    Ok(Json(json!({ "items": ob::list_batches(&mut tx, q.state.as_deref(), visible.as_deref()).await?, "next_cursor": null })))
 }
 
 /// GET /v1/opening-balances/batches/{id} (OBL-04).
 pub async fn get_batch(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
-    scope(&mut tx, &p, "OBL-04").await?;
-    Ok(reply(StatusCode::OK, ob::get_batch(&mut tx, id).await?))
+    let visible = scope(&mut tx, &p, "OBL-04").await?;
+    let batch = ob::get_batch(&mut tx, id).await?;
+    if !ob::batch_visible(&mut tx, id, visible.as_deref()).await? {
+        return Err(ApiError::NotFound);
+    }
+    Ok(reply(StatusCode::OK, batch))
 }
 
 #[derive(Deserialize)]
@@ -112,6 +126,8 @@ pub async fn add_entries(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: H
     if b.entries.is_empty() {
         return Err(ApiError::ValidationFailed("at least one entry".into()));
     }
+    ob::batch_state(&mut tx, id).await?; // locks the batch before the If-Match comparison
+    if_match(&headers, &ob::get_batch(&mut tx, id).await?)?;
     let (list, out) = entries(b.entries, &visible)?;
     let body = ob::add_entries(&mut tx, p.user_id, id, &list, &out).await?;
     done(tx, key, StatusCode::OK, body).await
@@ -176,6 +192,18 @@ pub async fn remove_entry(Auth(p, mut tx): Auth, Path((id, entry)): Path<(Uuid, 
 
 async fn batch_command(Auth(p, mut tx): Auth, id: Uuid, headers: HeaderMap, raw: Bytes, what: &str) -> Result<Response, ApiError> {
     whole_batch(&mut tx, &p, "OBL-02", id).await?;
+    let held = kinds(&mut tx, &p, "OBL-02").await?;
+    let approver = held.iter().any(|k| k == "approve");
+    let enterer = held.iter().any(|k| k == "all" || k == "scoped");
+    // OB-01: HR enters and confirms (or submits); only an approve-type holder decides a pending batch.
+    let allowed = match (what, ob::batch_state(&mut tx, id).await?.as_str()) {
+        ("confirm", "pending_approval") | ("reject", _) => approver,
+        ("confirm", "confirmed") => approver || enterer,
+        _ => enterer,
+    };
+    if !allowed {
+        return Err(ApiError::Forbidden);
+    }
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/opening-balances/batches/{id}/{what}"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);

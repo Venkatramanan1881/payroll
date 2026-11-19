@@ -713,6 +713,7 @@ pub async fn deactivate_vendor_user(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, r
     let u = get_vendor_user(tx, id).await?;
     if changed == 1 {
         full_admin_remains(tx).await?;
+        sqlx::query("UPDATE platform.support_access_grant SET state = 'ended', ended_at = now() WHERE vendor_user_id = $1 AND state = 'active'").bind(id).execute(&mut ***tx).await?;
         audit(tx, actor, None, "vendor.vendor_user_deactivated", "vendor_user", Some(id), json!({ "reason": reason })).await?;
     }
     Ok(u)
