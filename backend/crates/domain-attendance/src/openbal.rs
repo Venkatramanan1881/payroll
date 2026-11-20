@@ -108,6 +108,11 @@ pub struct EntryIn {
     pub as_of: NaiveDate,
 }
 
+/// A whole, non-negative value such as "3" or "3.00".
+fn whole(v: &str) -> bool {
+    !v.starts_with('-') && v.split_once('.').is_none_or(|(_, f)| f.chars().all(|c| c == '0'))
+}
+
 fn value_ok(v: &str) -> bool {
     let body = v.strip_prefix('-').unwrap_or(v);
     body.split_once('.').is_some_and(|(i, d)| (1..=5).contains(&i.len()) && d.len() == 2 && i.bytes().chain(d.bytes()).all(|b| b.is_ascii_digit()))
@@ -128,10 +133,20 @@ async fn check_entry(tx: &mut OrgTx<'_>, e: &EntryIn) -> Result<Option<String>, 
                 return Ok(Some("comp-off is not a leave balance (D-25); comp-off opening balances are not available yet".into()));
             }
         }
-        // shortcut: counters wait for the period-counter rebuild that reads them (LA-18 / EC-17); accepting them now would silently drop them.
-        ("comp_off" | "permission_used" | "late_counter" | "early_counter", ..) => {
-            return Ok(Some(format!("{} opening balances arrive with the module that uses them (not yet available)", e.kind)))
+        // D-33: counters and permission use are whole numbers (marks / permissions taken), never negative.
+        ("late_counter" | "early_counter", None, None) | ("permission_used", None, Some(_)) if !whole(&e.value) => {
+            return Ok(Some(format!("{} is a whole number of 0 or more, e.g. 3.00", e.kind)))
         }
+        ("late_counter" | "early_counter", None, None) => {}
+        ("permission_used", None, Some(t)) => {
+            let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM perm.permission_type WHERE id = $1)").bind(t).fetch_one(&mut ***tx).await?;
+            if !known {
+                return Ok(Some("permission_type_id is not a permission type of the organisation".into()));
+            }
+        }
+        ("permission_used", ..) => return Ok(Some("permission_used needs permission_type_id (and no leave_type_id)".into())),
+        ("late_counter" | "early_counter", ..) => return Ok(Some(format!("{} takes no leave or permission type", e.kind))),
+        ("comp_off", ..) => return Ok(Some("comp-off opening balances wait on OQ-C15-02 (their expiry)".into())),
         ("leave", ..) => return Ok(Some("leave needs leave_type_id (and no permission_type_id)".into())),
         _ => return Ok(Some("balance_kind is leave, comp_off, permission_used, late_counter or early_counter".into())),
     }
@@ -223,8 +238,8 @@ pub async fn add_entries(tx: &mut OrgTx<'_>, actor: Uuid, batch: Uuid, entries: 
 }
 
 /// Entry within its batch (NotFound when the ids do not belong together).
-async fn entry_of(tx: &mut OrgTx<'_>, batch: Uuid, entry: Uuid) -> Result<(Uuid, String, Option<Uuid>), DomainError> {
-    let row: Option<(Uuid, String, Option<Uuid>)> = sqlx::query_as("SELECT employee_id, balance_kind, leave_type_id FROM openbal.opening_balance_entry WHERE id = $1 AND batch_id = $2")
+async fn entry_of(tx: &mut OrgTx<'_>, batch: Uuid, entry: Uuid) -> Result<(Uuid, String, Option<Uuid>, Option<Uuid>), DomainError> {
+    let row: Option<(Uuid, String, Option<Uuid>, Option<Uuid>)> = sqlx::query_as("SELECT employee_id, balance_kind, leave_type_id, permission_type_id FROM openbal.opening_balance_entry WHERE id = $1 AND batch_id = $2")
         .bind(entry)
         .bind(batch)
         .fetch_optional(&mut ***tx)
@@ -234,13 +249,13 @@ async fn entry_of(tx: &mut OrgTx<'_>, batch: Uuid, entry: Uuid) -> Result<(Uuid,
 
 pub async fn edit_entry(tx: &mut OrgTx<'_>, actor: Uuid, batch: Uuid, entry: Uuid, value: Option<&str>, as_of: Option<NaiveDate>) -> Result<Value, DomainError> {
     draft_only(&lock_batch(tx, batch).await?.0)?;
-    let (employee, kind, leave_type) = entry_of(tx, batch, entry).await?;
+    let (employee, kind, leave_type, permission_type) = entry_of(tx, batch, entry).await?;
     let current = get_entry(tx, entry).await?;
     let e = EntryIn {
         employee,
         kind,
         leave_type,
-        permission_type: None,
+        permission_type,
         value: value.map(str::to_string).unwrap_or_else(|| current["value"].as_str().unwrap_or("").to_string()),
         as_of: as_of.or_else(|| current["as_of_date"].as_str().and_then(|d| d.parse().ok())).ok_or_else(|| DomainError::Validation("as_of_date".into()))?,
     };
@@ -336,6 +351,16 @@ pub async fn confirm(tx: &mut OrgTx<'_>, actor: Uuid, batch: Uuid, comment: Opti
     for (entry, employee, leave_type, value, as_of) in leave {
         post_opening(tx, actor, entry, employee, leave_type, &value, as_of).await?;
     }
+    let used: Vec<(Uuid, Uuid, Uuid, i32, NaiveDate)> = sqlx::query_as(
+        "SELECT id, employee_id, permission_type_id, value::int4, as_of_date FROM openbal.opening_balance_entry
+         WHERE batch_id = $1 AND balance_kind = 'permission_used' AND superseded_by_entry_id IS NULL AND value <> 0",
+    )
+    .bind(batch)
+    .fetch_all(&mut ***tx)
+    .await?;
+    for (entry, employee, ptype, count, as_of) in used {
+        crate::permission::post_opening_usage(tx, actor, entry, employee, ptype, count, as_of).await?;
+    }
     sqlx::query("UPDATE openbal.opening_balance_batch SET state = 'confirmed', confirmed_by = $2, confirmed_at = now(), updated_by = $2 WHERE id = $1")
         .bind(batch)
         .bind(actor)
@@ -377,7 +402,7 @@ pub async fn reject(tx: &mut OrgTx<'_>, actor: Uuid, batch: Uuid, reason: &str) 
 }
 
 /// batch, employee, kind, leave type, as-of date, superseded by.
-type EntryRow = (Uuid, Uuid, String, Option<Uuid>, NaiveDate, Option<Uuid>);
+type EntryRow = (Uuid, Uuid, String, Option<Uuid>, NaiveDate, Option<Uuid>, Option<Uuid>);
 
 /// B7 (OB-02): a new entry supersedes a confirmed one; leave reverses the old opening and posts the new one.
 pub async fn change_entry(tx: &mut OrgTx<'_>, actor: Uuid, entry: Uuid, value: &str, as_of: Option<NaiveDate>, reason: &str) -> Result<Value, DomainError> {
@@ -388,19 +413,19 @@ pub async fn change_entry(tx: &mut OrgTx<'_>, actor: Uuid, entry: Uuid, value: &
         return Err(DomainError::Validation("reason is required (1-1000 characters)".into()));
     }
     let row: Option<EntryRow> = sqlx::query_as(
-        "SELECT batch_id, employee_id, balance_kind, leave_type_id, as_of_date, superseded_by_entry_id FROM openbal.opening_balance_entry WHERE id = $1 FOR UPDATE",
+        "SELECT batch_id, employee_id, balance_kind, leave_type_id, as_of_date, superseded_by_entry_id, permission_type_id FROM openbal.opening_balance_entry WHERE id = $1 FOR UPDATE",
     )
     .bind(entry)
     .fetch_optional(&mut ***tx)
     .await?;
-    let (batch, employee, kind, leave_type, old_as_of, superseded) = row.ok_or(DomainError::NotFound)?;
+    let (batch, employee, kind, leave_type, old_as_of, superseded, permission_type) = row.ok_or(DomainError::NotFound)?;
     if lock_batch(tx, batch).await?.0 != "confirmed" || superseded.is_some() {
         return Err(DomainError::IllegalTransition("only a live entry of a confirmed batch is changed this way".into()));
     }
     if db::employee_locked(tx, employee, old_as_of, old_as_of.succ_opt()).await? {
         return Err(DomainError::PeriodLocked); // the old opening sits in a locked period: its reversal cannot be dated there
     }
-    let new = EntryIn { employee, kind: kind.clone(), leave_type, permission_type: None, value: value.to_string(), as_of: as_of.unwrap_or(old_as_of) };
+    let new = EntryIn { employee, kind: kind.clone(), leave_type, permission_type, value: value.to_string(), as_of: as_of.unwrap_or(old_as_of) };
     if let Some(p) = check_entry(tx, &new).await? {
         return Err(DomainError::Validation(p));
     }
@@ -409,8 +434,8 @@ pub async fn change_entry(tx: &mut OrgTx<'_>, actor: Uuid, entry: Uuid, value: &
     // The pointer first (deferred FK), then the replacement: the live-entry index never sees two.
     sqlx::query("UPDATE openbal.opening_balance_entry SET superseded_by_entry_id = $2, updated_by = $3 WHERE id = $1").bind(entry).bind(id).bind(actor).execute(&mut ***tx).await?;
     sqlx::query(
-        "INSERT INTO openbal.opening_balance_entry (org_id, id, batch_id, employee_id, balance_kind, leave_type_id, value, as_of_date, change_reason, created_by, updated_by)
-         VALUES (app.current_org(), $1, $2, $3, $4, $5, $6::numeric, $7, $8, $9, $9)",
+        "INSERT INTO openbal.opening_balance_entry (org_id, id, batch_id, employee_id, balance_kind, leave_type_id, permission_type_id, value, as_of_date, change_reason, created_by, updated_by)
+         VALUES (app.current_org(), $1, $2, $3, $4, $5, $10, $6::numeric, $7, $8, $9, $9)",
     )
     .bind(id)
     .bind(batch)
@@ -421,8 +446,17 @@ pub async fn change_entry(tx: &mut OrgTx<'_>, actor: Uuid, entry: Uuid, value: &
     .bind(new.as_of)
     .bind(reason.trim())
     .bind(actor)
+    .bind(permission_type)
     .execute(&mut ***tx)
     .await?;
+    if let Some(t) = permission_type {
+        crate::permission::reverse_opening_usage(tx, actor, entry, reason.trim()).await?;
+        if let Ok(count) = value.split('.').next().unwrap_or("0").parse::<i32>() {
+            if count != 0 {
+                crate::permission::post_opening_usage(tx, actor, id, employee, t, count, new.as_of).await?;
+            }
+        }
+    }
     if let Some(t) = leave_type {
         let old: Option<(Uuid, Uuid)> = sqlx::query_as(
             "SELECT id, account_id FROM leave.leave_ledger_entry WHERE cause_kind = 'opening_balance_entry' AND cause_id = $1 AND entry_kind = 'opening'",

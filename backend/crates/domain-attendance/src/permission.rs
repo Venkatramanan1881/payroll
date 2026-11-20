@@ -508,6 +508,44 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, employee: Uuid, r: NewPermis
 }
 
 /// PM-R4: one usage entry per approved request, counted in the period of its date (idempotent by the request).
+/// OB-R2: an opening count of permissions already used, against the limit period containing `as_of`.
+pub(crate) async fn post_opening_usage(tx: &mut OrgTx<'_>, actor: Uuid, entry: Uuid, employee: Uuid, ptype: Uuid, count: i32, as_of: NaiveDate) -> Result<(), DomainError> {
+    let kind = version_any(tx, ptype, as_of).await?.and_then(|v| v["limit_period"].as_str().map(str::to_string)).unwrap_or_else(|| "calendar_month".into());
+    let (from, to) = limit_period(tx, &kind, as_of).await?;
+    sqlx::query(
+        "INSERT INTO perm.permission_usage_entry (org_id, employee_id, permission_type_id, limit_period, entry_kind, origin, count_delta, minutes_delta, cause_kind, cause_id, reason, created_by)
+         VALUES (app.current_org(), $1, $2, daterange($3, $4, '[]'), 'usage', 'opening', $5, 0, 'opening_balance_entry', $6, 'opening balance (OB-R2)', $7) ON CONFLICT DO NOTHING",
+    )
+    .bind(employee)
+    .bind(ptype)
+    .bind(from)
+    .bind(to)
+    .bind(count)
+    .bind(entry)
+    .bind(actor)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(())
+}
+
+/// B7: a changed opening count reverses the old one.
+pub(crate) async fn reverse_opening_usage(tx: &mut OrgTx<'_>, actor: Uuid, entry: Uuid, reason: &str) -> Result<(), DomainError> {
+    sqlx::query(
+        "INSERT INTO perm.permission_usage_entry (org_id, employee_id, permission_type_id, limit_period, entry_kind, origin, count_delta, minutes_delta,
+           cause_kind, cause_id, reverses_entry_id, reason, created_by)
+         SELECT app.current_org(), e.employee_id, e.permission_type_id, e.limit_period, 'reversal', e.origin, -e.count_delta, -e.minutes_delta,
+                'opening_balance_entry', e.cause_id, e.id, $2, $3
+         FROM perm.permission_usage_entry e WHERE e.cause_kind = 'opening_balance_entry' AND e.cause_id = $1 AND e.entry_kind = 'usage'
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(entry)
+    .bind(reason)
+    .bind(actor)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(())
+}
+
 async fn post_usage(tx: &mut OrgTx<'_>, id: Uuid, actor: Uuid) -> Result<(), DomainError> {
     let (employee, ptype, date, minutes): (Uuid, Uuid, NaiveDate, i32) =
         sqlx::query_as("SELECT employee_id, permission_type_id, permission_date, minutes FROM perm.permission_request WHERE id = $1").bind(id).fetch_one(&mut ***tx).await?;

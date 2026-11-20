@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 pub mod approval;
 pub mod comp_off;
+pub mod counters;
 pub mod jobs;
 pub mod leave;
 pub mod onduty;

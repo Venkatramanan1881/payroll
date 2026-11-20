@@ -51,11 +51,11 @@ async fn confirm_posts_once_and_changes_supersede(pool: PgPool) {
     let cl = leave_type(&app, &s, "CL").await;
     let leave = json!({ "employee_id": w.employee_id, "balance_kind": "leave", "leave_type_id": cl, "value": "5.00", "as_of_date": "2026-04-01" });
 
-    let bad = json!({ "entries": [leave, { "employee_id": w.employee_id, "balance_kind": "late_counter", "value": "2.00", "as_of_date": "2026-04-01" },
+    let bad = json!({ "entries": [leave, { "employee_id": w.employee_id, "balance_kind": "late_counter", "value": "2.50", "as_of_date": "2026-04-01" },
                                   { "employee_id": Uuid::new_v4(), "balance_kind": "leave", "leave_type_id": cl, "value": "1.0", "as_of_date": "2026-04-01" }] });
     let (st, b, _) = common::call(&app, &s, "POST", "/v1/opening-balances/batches", Some(bad), None).await;
     assert_eq!((st, b["errors"].as_array().map(Vec::len), b["errors"][0]["field"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some(2), Some("entries[1]")),
-               "counters wait for their rebuild; unknown employees and bad values are row errors: {b}");
+               "a counter is whole marks; unknown employees and bad values are row errors: {b}");
     let batches: i64 = sqlx::query_scalar("SELECT count(*) FROM openbal.opening_balance_batch").fetch_one(&pool).await.unwrap();
     assert_eq!(batches, 0, "nothing saved when a row fails");
 

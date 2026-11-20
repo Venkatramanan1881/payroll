@@ -96,6 +96,9 @@ pub struct AttendanceSettings {
     pub absence_pending_days: i64,  // DS-10
     pub flag_punches_on_leave: bool, // LV-01 (ignore vs flag)
     pub leave_debit_order: Vec<uuid::Uuid>, // LV-04
+    /// Period-end penalties: read at period end, never by the day, so kept out of the day fingerprint.
+    #[serde(skip)]
+    pub penalties: crate::penalty::Penalties,
 }
 
 impl Default for AttendanceSettings {
@@ -135,6 +138,7 @@ impl Default for AttendanceSettings {
             absence_pending_days: 3,
             flag_punches_on_leave: true,
             leave_debit_order: vec![],
+            penalties: Default::default(),
         }
     }
 }
@@ -215,6 +219,9 @@ impl AttendanceSettings {
         let obj = doc.as_object().ok_or("settings must be an object")?;
         let mut w = Vec::new();
         for (key, v) in obj {
+            if self.penalties.apply_key(group, key, v, &mut w)? {
+                continue;
+            }
             match (group, key.as_str()) {
                 ("PR", "PR-01") => {
                     let m = pick(v, key, &["paired", "first_in_last_out", "direction_tagged"])?;
@@ -330,7 +337,7 @@ mod tests {
         let w = s.apply("LA", &json!({ "LA-03": 15, "LA-05": [{ "from": 16, "to": 60, "action": "late_mark" }, { "from": 61, "action": "full_day" }], "LA-06": true })).unwrap();
         assert_eq!(s.late_grace, 15);
         assert_eq!(s.late_slabs[1].action, SlabAction::FullDay);
-        assert_eq!(w, ["LA-06 is stored but not evaluated yet"]);
+        assert!(w.is_empty() && s.penalties.late.count_on, "{w:?}");
     }
 
     #[test]
