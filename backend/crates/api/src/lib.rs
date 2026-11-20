@@ -140,6 +140,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/punch-flags/{id}/reject", post(routes::punches::reject_flag))
         .route("/v1/manual-attendance", post(routes::punches::manual))
         .route("/v1/attendance/employees/{employee_id}/days/{date}", get(routes::attendance::get_day))
+        .route("/v1/attendance/employees/{employee_id}/counters", get(routes::attendance::counters))
         .route("/v1/attendance/daily", get(routes::attendance::daily))
         .route("/v1/attendance/recalculations", post(routes::attendance::recalculate))
         .route("/v1/attendance/regularisation-requests", post(routes::regularisation::submit).get(routes::regularisation::list))

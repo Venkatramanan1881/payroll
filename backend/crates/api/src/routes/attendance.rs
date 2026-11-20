@@ -125,3 +125,17 @@ pub async fn recalculate(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) 
                        "download_url": null, "download_expires_at": null, "error_report_url": null });
     done(tx, key, StatusCode::ACCEPTED, body).await
 }
+
+#[derive(Deserialize)]
+pub struct CountersQuery {
+    date: NaiveDate,
+}
+
+/// GET /v1/attendance/employees/{employee_id}/counters?date= (ATT-13): counters and period penalties (preview until lock).
+pub async fn counters(Auth(p, mut tx): Auth, Path(employee): Path<Uuid>, Query(q): Query<CountersQuery>) -> Result<Json<Value>, ApiError> {
+    let visible = visible_employees(&mut tx, &p, "ATT-13").await?;
+    if !sees(&visible, Some(employee)) {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Json(domain_attendance::counters::view(&mut tx, employee, q.date).await?))
+}

@@ -34,10 +34,15 @@ Answers given by the project owner in session. Each decision closes the listed q
 | D-22 | 2026-11-19 | How do vendor staff sign in to the vendor console? (OQ-V01-17) | **Google accounts restricted to the vendor's domain** (Google ID token; no vendor passwords stored). | OQ-V01-17 | Contract amendment: POST /v1/vendor/auth/google/sign-in |
 | D-23 | 2026-11-19 | What is the admins' second sign-in step (AC-08)? (OQ-C03-06, method) | **Authenticator-app code (TOTP)**, enrolled at the first password sign-in. | OQ-C03-06 (method only; who is an admin user stays open) | — |
 | D-24 | 2026-11-19 | Slice 11 scope | **Split:** slice 11 = vendor console core and admin sign-in; slice 12 = opening balances, support access, usage/health, templates, announcements. | — | — |
-| D-25 | 2026-11-19 | How is comp-off taken (OQ-M02-08)? | **As leave of the reserved leave type code `COMP_OFF`.** It follows that type's leave rules (half day, notice, approval); its balance is the comp-off ledger, used earliest-expiring first (OQ-M02-09), never negative. | OQ-M02-08, OQ-M02-09 (order only) | � |
-| D-26 | 2026-11-19 | Comp-off expiry outcome in V1 (OQ-M02-01) | **Lapse.** HW-06 = pay one extra day is refused until payroll (V2); the V1 default is lapse. | OQ-M02-01 | � |
-| D-27 | 2026-11-19 | Comp-off expiry counted from (OQ-M02-10) | **The worked date, in calendar days.** | OQ-M02-10 | � |
-| D-28 | 2026-11-19 | HW-01 "employee chooses" in V1 (OQ-M02-06/07) | **Refused until those questions are answered** (also "overtime", V3). The choice endpoint answers RULE_GROUP_DISABLED. | � (OQ-M02-06, OQ-M02-07 stay open) | � |
+| D-25 | 2026-11-19 | How is comp-off taken (OQ-M02-08)? | **As leave of the reserved leave type code `COMP_OFF`.** It follows that type's leave rules (half day, notice, approval); its balance is the comp-off ledger, used earliest-expiring first (OQ-M02-09), never negative. | OQ-M02-08, OQ-M02-09 (order only) | — |
+| D-26 | 2026-11-19 | Comp-off expiry outcome in V1 (OQ-M02-01) | **Lapse.** HW-06 = pay one extra day is refused until payroll (V2); the V1 default is lapse. | OQ-M02-01 | — |
+| D-27 | 2026-11-19 | Comp-off expiry counted from (OQ-M02-10) | **The worked date, in calendar days.** | OQ-M02-10 | — |
+| D-28 | 2026-11-19 | HW-01 "employee chooses" in V1 (OQ-M02-06/07) | **Refused until those questions are answered** (also "overtime", V3). The choice endpoint answers RULE_GROUP_DISABLED. | — (OQ-M02-06, OQ-M02-07 stay open) | — |
+| D-29 | 2026-11-20 | Penalty recovery (LA-12 / EC-11; OQ-C06-04, G-B) | **Leave type codes listed in the policy, in order; the first with enough balance is debited; else loss of pay** (or report only when "none"). With no list: loss of pay. Permission balance and fixed fines are refused until built. | OQ-C06-04 | — |
+| D-30 | 2026-11-20 | Count and minutes penalties both on (BR-04, K4) | **Only the larger applies**, compared in days (excess minutes ÷ the DS-02 full day, else 8 hours). | — | — |
+| D-31 | 2026-11-20 | When period penalties apply (BR-10) | **A provisional preview until the lock; recorded and recovered at the lock.** A re-lock after an unlock reverses the earlier leave recoveries and records anew. | — | — |
+| D-32 | 2026-11-20 | Counter reset (LA-18 / EC-17) | **Payroll (attendance) period only**; calendar month, quarter and year are refused until needed. | — | — |
+| D-33 | 2026-11-20 | Opening counters (OQ-C15-03, marks vs minutes) | **Late and early counters are whole numbers of marks; permission used is a whole number of permissions.** | OQ-C15-03 (unit only) | — |
 
 ## Answered but not yet closed (need a follow-up answer)
 

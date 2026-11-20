@@ -149,7 +149,7 @@ async fn attendance_groups_typed_with_warnings(pool: PgPool) {
     let v = new_set(&app, &s, "Factory", "2026-01-01").await["versions"][0]["id"].as_str().unwrap().to_string();
     assert_eq!(put_group(&app, &s, &v, "LA", json!({ "LA-03": 200 })).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(put_group(&app, &s, &v, "MP", json!({ "MP-03": "flag" })).await.0, StatusCode::UNPROCESSABLE_ENTITY);
-    let (st, b) = put_group(&app, &s, &v, "LA", json!({ "LA-03": 15, "LA-06": true })).await;
+    let (st, b) = put_group(&app, &s, &v, "LA", json!({ "LA-03": 15, "LA-06": true, "LA-19": true })).await;
     assert_eq!(st, StatusCode::OK, "{b}");
-    assert_eq!(b["warnings"], json!(["LA-06 is stored but not evaluated yet"]));
+    assert_eq!(b["warnings"], json!(["LA-19 is stored but not evaluated yet"]), "LA-06 is evaluated since slice 16");
 }

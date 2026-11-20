@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 pub mod approval;
 pub mod comp_off;
+pub mod counters;
 pub mod jobs;
 pub mod leave;
 pub mod onduty;
@@ -35,6 +36,13 @@ pub async fn load_settings(tx: &mut OrgTx<'_>, version: Uuid) -> Result<Attendan
             let mut typed = s.clone();
             if typed.apply(&group, &doc).is_ok() {
                 s = typed;
+            } else if let Some(o) = doc.as_object() {
+                // A penalty key refused since it was stored keeps the day settings; only that group's penalties stay off.
+                let day_only: serde_json::Map<String, Value> = o.iter().filter(|(k, _)| !engine::penalty::KEYS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+                let mut typed = s.clone();
+                if typed.apply(&group, &Value::Object(day_only)).is_ok() {
+                    s = typed;
+                }
             }
         } else {
             match group.as_str() {

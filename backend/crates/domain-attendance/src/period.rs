@@ -472,7 +472,9 @@ async fn pending_dates(tx: &mut OrgTx<'_>, from: NaiveDate, to: NaiveDate, items
 
 /// Totals per employee from the current day results and their effects (BR-08: lines carry the result ids).
 // shortcut: effects measured only in minutes (DS-05 "deduct actual minutes") are not totalled; add a minutes line when PayrollInput v1 carries one.
-async fn compute(tx: &mut OrgTx<'_>, period: Uuid, from: NaiveDate, to: NaiveDate, scope: &ScopeFilter, pending: Pending, items: &[Value]) -> Result<Vec<Value>, DomainError> {
+/// `record` = (run, actor) at lock: period penalties are recorded and recovered; otherwise they are a preview (D-31).
+#[allow(clippy::too_many_arguments)]
+async fn compute(tx: &mut OrgTx<'_>, period: Uuid, from: NaiveDate, to: NaiveDate, scope: &ScopeFilter, pending: Pending, items: &[Value], record: Option<(Uuid, Uuid)>) -> Result<Vec<Value>, DomainError> {
     let emps = employees(tx, from, to, scope).await?;
     let ids: Vec<Uuid> = emps.iter().map(|e| e.0).collect();
     type Row = (Uuid, NaiveDate, Uuid, i32, i32, Option<Uuid>, i64, Value);
@@ -493,6 +495,7 @@ async fn compute(tx: &mut OrgTx<'_>, period: Uuid, from: NaiveDate, to: NaiveDat
     let is_pending = |e: Uuid, d: NaiveDate| pending != Pending::Leave && pending_days.contains(&(e.to_string(), d.to_string()));
 
     let mut out = Vec::with_capacity(emps.len());
+    let mut cache = crate::counters::SettingsCache::new();
     for (emp, _code, start, end) in emps {
         let mut lines: BTreeMap<&str, (i64, Vec<String>)> = BTreeMap::new();
         let (mut late, mut early) = (0i64, 0i64);
@@ -532,6 +535,17 @@ async fn compute(tx: &mut OrgTx<'_>, period: Uuid, from: NaiveDate, to: NaiveDat
                 }
             }
         }
+        // BR-10: period-end penalties; only loss of pay is a deduction line (a leave recovery is a leave debit).
+        for p in crate::counters::penalties(tx, emp, Some(period), start, end, record, &mut cache).await? {
+            if p.lop {
+                let line = lines.entry("late_early_penalty").or_default();
+                line.0 += p.days_pct;
+                line.1.push(p.id.map_or(format!("{}:provisional", p.rule_ref), |id| format!("period_penalty:{id}")));
+            }
+        }
+        if let Some((_, actor)) = record {
+            crate::counters::keep_counter(tx, actor, emp, start, end).await?;
+        }
         let deduction: i64 = lines.values().map(|l| l.0).sum();
         let employed = (end - start).num_days() + 1;
         let payable = (employed * 100 - deduction).max(0);
@@ -566,7 +580,7 @@ pub async fn totals(tx: &mut OrgTx<'_>, period: Uuid, scope: &ScopeFilter, emplo
         .fetch_all(&mut ***tx)
         .await?
     } else {
-        compute(tx, period, from, to, scope, Pending::Leave, &[]).await?
+        compute(tx, period, from, to, scope, Pending::Leave, &[], None).await?
     };
     Ok(items.into_iter().filter(|t| employee.is_none_or(|e| t["employee_id"] == json!(e))).collect())
 }
@@ -602,7 +616,9 @@ pub async fn lock(tx: &mut OrgTx<'_>, actor: Uuid, period: Uuid, comment: Option
             ))
         }
     };
-    let totals = compute(tx, period, from, to, &everyone, pending, &items).await?;
+    crate::counters::before_lock(tx, actor, period).await?;
+    let run = Uuid::new_v4();
+    let totals = compute(tx, period, from, to, &everyone, pending, &items, Some((run, actor))).await?;
     for t in &totals {
         sqlx::query(
             "INSERT INTO period.period_totals (org_id, period_id, employee_id, payable_days, deduction_days, deduction_lines, late_minutes, early_minutes,
