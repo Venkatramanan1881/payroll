@@ -291,3 +291,27 @@ async fn one_person_cannot_approve_both_levels_and_over_limit_needs_att05(pool: 
     assert_eq!(post(&app, &checker.token, &format!("/v1/attendance/regularisation-requests/{oid}/approve"), None).await.0, StatusCode::NOT_FOUND, "over-limit is ATT-05's");
     assert_eq!(post(&app, &checker.token, &format!("/v1/attendance/regularisation-requests/{id}/approve"), None).await.0, StatusCode::OK, "a normal second level is ATT-04's");
 }
+
+/// NT-05 for regularisation (its steps live in the audit log): the manager hears of the request, the employee of
+/// the decision.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn regularisation_notifies(pool: PgPool) {
+    let (s, app, w, boss) = setup(&pool, None).await;
+    let d = yesterday();
+    let (st, r) = submit(&app, &w, json!({ "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at(d, "03:30"), "proposed_out_at": at(d, "12:30"), "reason": "card forgotten" })).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    let dispatch = || async {
+        let mut tx = db::begin_org(&pool, s.org_id).await.unwrap();
+        let r = domain_attendance::notify::dispatch(&mut tx, s.org_id).await.unwrap();
+        tx.commit().await.unwrap();
+        r
+    };
+    assert_eq!(dispatch().await["sent"], 1);
+    let (_, b) = common::as_user(&app, &boss.token, "GET", "/v1/notifications/inbox", None, &[]).await;
+    assert_eq!(b["items"][0]["link"]["kind"], "regularisation", "{b}");
+    let (st, _) = post(&app, &boss.token, &format!("/v1/attendance/regularisation-requests/{}/approve", r["id"].as_str().unwrap()), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(dispatch().await["sent"], 1);
+    let (_, mine) = common::as_user(&app, &w.token, "GET", "/v1/notifications/inbox", None, &[]).await;
+    assert!(mine["items"][0]["body"].as_str().unwrap().contains("regularisation request was approved"), "{mine}");
+}

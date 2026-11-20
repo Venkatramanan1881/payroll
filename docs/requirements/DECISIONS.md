@@ -43,6 +43,10 @@ Answers given by the project owner in session. Each decision closes the listed q
 | D-31 | 2026-11-20 | When period penalties apply (BR-10) | **A provisional preview until the lock; recorded and recovered at the lock.** A re-lock after an unlock reverses the earlier leave recoveries and records anew. | — | — |
 | D-32 | 2026-11-20 | Counter reset (LA-18 / EC-17) | **Payroll (attendance) period only**; calendar month, quarter and year are refused until needed. | — | — |
 | D-33 | 2026-11-20 | Opening counters (OQ-C15-03, marks vs minutes) | **Late and early counters are whole numbers of marks; permission used is a whole number of permissions.** | OQ-C15-03 (unit only) | — |
+| D-34 | 2026-11-20 | Notification defaults (OQ-C14-01) | **In-app on for every event this release sends, to its natural recipient; email, SMS, WhatsApp and push off.** | OQ-C14-01 | — |
+| D-35 | 2026-11-20 | Delivery channels in V1 (OQ-C14-02, OQ-C14-07) | **In-app only until a provider is chosen**; other channels cannot be switched on. Push device tokens are stored for later. | — (OQ-C14-02, OQ-C14-07 stay open) | — |
+| D-36 | 2026-11-20 | Which notification events first | **NT-05, NT-06, NT-07 and NT-10.** The others wait for their open questions (OQ-C14-03, -04, -05). | — | — |
+| D-37 | 2026-11-20 | Slice 17 scope | **Split:** slice 17 = notifications; slice 18 = reports, dashboards, audit views, jobs and upload links; slice 19 = remaining vendor views (usage, health, sector templates, announcements). | — | — |
 
 ## Answered but not yet closed (need a follow-up answer)
 

@@ -203,6 +203,7 @@ async fn regularisation_timeout(tx: &mut OrgTx<'_>, id: Uuid, listed: &str, time
             .execute(&mut ***tx)
             .await?;
             db::audit_system(tx, "regularisation.timeout", "regularisation_request", Some(id), Some(step(if approve { "auto_approved" } else { "auto_rejected" }))).await?;
+            crate::approval::announce(tx, "regularisation", id, level, if approve { "auto_approved" } else { "auto_rejected" }, None).await?;
             if approve {
                 // The employee's own request stands for the manual punch; the approval reference is the request (BR-01).
                 crate::regularisation::apply(tx, requester, id).await?;
@@ -227,6 +228,7 @@ async fn regularisation_timeout(tx: &mut OrgTx<'_>, id: Uuid, listed: &str, time
                 .execute(&mut ***tx)
                 .await?;
             db::audit_system(tx, "regularisation.escalate", "regularisation_request", Some(id), Some(step("escalated"))).await?;
+            crate::approval::announce(tx, "regularisation", id, level, "escalated", None).await?;
             event(tx, "RequestEscalated", "regularisation", id, employee).await?;
             Ok(Some(Outcome::Escalated))
         }
