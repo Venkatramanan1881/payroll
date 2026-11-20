@@ -12,7 +12,7 @@ pub struct Table {
 }
 
 // shortcut: a report holds at most this many rows (a year of a few hundred employees fits); page or stream past it.
-const MAX_ROWS: i64 = 200_000;
+pub const MAX_ROWS: i64 = 200_000;
 
 pub struct Filters {
     /// The employees the caller may see for this report (None = everyone).
@@ -75,7 +75,8 @@ fn sql(report: &str) -> Option<(Vec<&'static str>, &'static str)> {
             vec!["employee_code", "name", "late_marks", "late_minutes", "early_marks", "early_minutes", "penalties"],
             "SELECT ARRAY[e.employee_code, e.full_name, count(r.id) FILTER (WHERE r.late_mark)::text, coalesce(sum(r.late_minutes), 0)::text,
                           count(r.id) FILTER (WHERE r.early_mark)::text, coalesce(sum(r.early_minutes), 0)::text,
-                          (SELECT string_agg(p.rule_ref || ' ' || coalesce(to_char(p.days, 'FM990.00'), '') || ' ' || coalesce(p.recovered_as, ''), '; ' ORDER BY p.rule_ref)
+                          (SELECT string_agg(p.rule_ref || ' ' || coalesce(to_char(p.days, 'FM990.00') || ' days', '') || coalesce(' ' || p.minutes || ' min', '')
+                                             || ' ' || coalesce(p.recovered_as, ''), '; ' ORDER BY p.rule_ref)
                            FROM attendance.period_penalty p JOIN period.attendance_period ap ON ap.id = p.period_id
                            WHERE p.employee_id = e.id AND ap.period_start <= $3 AND ap.period_end >= $2 AND p.created_at >= ap.locked_at)]
              FROM workforce.employee e
@@ -93,9 +94,9 @@ fn sql(report: &str) -> Option<(Vec<&'static str>, &'static str)> {
         // R5 flagged punches (AC-C13-02.7; device status: no device registry rows yet).
         "R5" => (
             vec!["punch_at", "employee_code", "name", "source", "reason", "state"],
-            "SELECT ARRAY[p.event_at::text, e.employee_code, e.full_name, p.source, f.reason, f.state]
+            "SELECT ARRAY[to_char(p.event_at AT TIME ZONE p.captured_tz, 'YYYY-MM-DD HH24:MI:SS'), e.employee_code, e.full_name, p.source, f.reason, f.state]
              FROM timecap.punch_flag f JOIN timecap.raw_punch p ON p.id = f.punch_id JOIN workforce.employee e ON e.id = p.employee_id
-             WHERE p.employee_id = ANY($1) AND p.event_at >= $2::date AND p.event_at < $3::date + 1 ORDER BY p.event_at",
+             WHERE p.employee_id = ANY($1) AND (p.event_at AT TIME ZONE p.captured_tz)::date BETWEEN $2 AND $3 ORDER BY p.event_at",
         ),
         // R6 leave balance (as at `to`) and days taken in the range (AC-C13-03.1).
         "R6" => (
@@ -130,7 +131,7 @@ fn sql(report: &str) -> Option<(Vec<&'static str>, &'static str)> {
                UNION ALL
                SELECT ARRAY['on_duty', o.from_date::text, o.to_date::text, e.employee_code, e.full_name,
                             o.duration_kind || coalesce(' ' || to_char(o.from_time, 'HH24:MI') || '-' || to_char(o.to_time, 'HH24:MI'), ''), o.state,
-                            o.purpose || ' @ ' || o.place]
+                            o.purpose || coalesce(' @ ' || o.place, '')]
                FROM perm.on_duty_request o JOIN workforce.employee e ON e.id = o.employee_id
                WHERE o.employee_id = ANY($1) AND o.from_date <= $3 AND o.to_date >= $2) x
              ORDER BY row[2], row[4]",
@@ -173,18 +174,18 @@ fn sql(report: &str) -> Option<(Vec<&'static str>, &'static str)> {
         // R26 settings changes (G9): who, when, what, old and new values (AC-C13-07.2).
         "R26" => (
             vec!["occurred_at", "actor_kind", "actor_id", "action", "target_type", "target_id", "before", "after"],
-            "SELECT ARRAY[a.occurred_at::text, a.actor_kind, a.actor_id::text, a.action, a.target_type, a.target_id::text, a.before_value::text, a.after_value::text]
+            "SELECT ARRAY[to_char(a.occurred_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD HH24:MI:SS'), a.actor_kind, a.actor_id::text, a.action, a.target_type, a.target_id::text, a.before_value::text, a.after_value::text]
              FROM audit.audit_entry a
-             WHERE a.occurred_at >= $2::date AND a.occurred_at < $3::date + 1 AND cardinality($1) >= 0
+             WHERE (a.occurred_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3 AND cardinality($1) >= 0
                AND (a.action LIKE 'policy%' OR a.action LIKE '%settings%' OR a.action LIKE 'notification_rules%' OR a.target_type IN ('policy_version','policy_assignment','organisation_settings'))
              ORDER BY a.occurred_at",
         ),
         // R27 audit trail (AC-C13-07.3); vendor actions under a support grant included (AC-C13-07.4).
         "R27" => (
             vec!["occurred_at", "actor_kind", "actor_id", "support_grant_id", "action", "target_type", "target_id", "before", "after"],
-            "SELECT ARRAY[a.occurred_at::text, a.actor_kind, a.actor_id::text, a.support_grant_id::text, a.action, a.target_type, a.target_id::text,
-                          a.before_value::text, a.after_value::text]
-             FROM audit.audit_entry a WHERE a.occurred_at >= $2::date AND a.occurred_at < $3::date + 1 AND cardinality($1) >= 0 ORDER BY a.occurred_at",
+            "SELECT ARRAY[to_char(a.occurred_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD HH24:MI:SS'), a.actor_kind, a.actor_id::text, a.support_grant_id::text, a.action,
+                          a.target_type, a.target_id::text, a.before_value::text, a.after_value::text]
+             FROM audit.audit_entry a WHERE (a.occurred_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3 AND cardinality($1) >= 0 ORDER BY a.occurred_at",
         ),
         _ => return None,
     })
@@ -193,19 +194,22 @@ fn sql(report: &str) -> Option<(Vec<&'static str>, &'static str)> {
 /// The rows of a report over the employees and dates (R13 is read from the period's totals by the caller).
 pub async fn rows(tx: &mut OrgTx<'_>, report: &str, employees: &[Uuid], from: NaiveDate, to: NaiveDate) -> Result<Table, DomainError> {
     let (headers, query) = sql(report).ok_or(DomainError::NotFound)?;
-    let rows: Vec<Vec<Option<String>>> = sqlx::query_scalar(&format!("{query} LIMIT {MAX_ROWS}"))
+    let rows: Vec<Vec<Option<String>>> = sqlx::query_scalar(&format!("{query} LIMIT {}", MAX_ROWS + 1))
         .bind(employees)
         .bind(from)
         .bind(to)
         .fetch_all(&mut ***tx)
         .await?;
+    if rows.len() as i64 > MAX_ROWS {
+        return Err(DomainError::Validation(format!("the report has more than {MAX_ROWS} rows: narrow the range or the filters")));
+    }
     Ok(Table { headers, rows: rows.into_iter().map(|r| r.into_iter().map(Option::unwrap_or_default).collect()).collect() })
 }
 
 /// CSV with every cell quoted when it needs to be (RFC 4180), and a guard against spreadsheet formula injection.
 pub fn csv(t: &Table) -> Vec<u8> {
     let cell = |s: &str| {
-        let s = if s.starts_with(['=', '+', '-', '@']) && s.parse::<f64>().is_err() { format!("'{s}") } else { s.to_string() };
+        let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) && s.parse::<f64>().is_err() { format!("'{s}") } else { s.to_string() };
         if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s }
     };
     let mut out = String::new();
@@ -222,7 +226,7 @@ mod tests {
 
     #[test]
     fn csv_quotes_and_defuses_formulas() {
-        let t = Table { headers: vec!["a", "b"], rows: vec![vec!["x,y".into(), "=SUM(A1)".into()], vec!["say \"hi\"".into(), "-1.50".into()]] };
-        assert_eq!(String::from_utf8(csv(&t)).unwrap(), "a,b\r\n\"x,y\",'=SUM(A1)\r\n\"say \"\"hi\"\"\",-1.50\r\n");
+        let t = Table { headers: vec!["a", "b"], rows: vec![vec!["x,y".into(), "=SUM(A1)".into()], vec!["say \"hi\"".into(), "-1.50".into()], vec!["\t=1".into(), "-1+cmd|x".into()]] };
+        assert_eq!(String::from_utf8(csv(&t)).unwrap(), "a,b\r\n\"x,y\",'=SUM(A1)\r\n\"say \"\"hi\"\"\",-1.50\r\n'\t=1,'-1+cmd|x\r\n");
     }
 }

@@ -257,9 +257,14 @@ pub async fn dispatch(tx: &mut OrgTx<'_>, org: Uuid) -> Result<Value, DomainErro
         .into_iter()
         .flatten()
         .collect();
-    // Retention (migration 0010): dispatched events go after 30 days, events no consumer took after 90.
-    sqlx::query("DELETE FROM app.outbox WHERE org_id = $1 AND (dispatched_at < now() - interval '30 days' OR (dispatched_at IS NULL AND created_at < now() - interval '90 days'))")
-        .bind(org)
+    // Retention (migration 0010): dispatched events go after 30 days; this relay's own events that gave up go after 90.
+    // Undispatched events of other types wait for their consumers and are never deleted here.
+    sqlx::query(
+        "DELETE FROM app.outbox WHERE org_id = $1 AND (dispatched_at < now() - interval '30 days'
+           OR (dispatched_at IS NULL AND event_type = ANY($2) AND attempts >= 5 AND created_at < now() - interval '90 days'))",
+    )
+    .bind(org)
+    .bind(HANDLED.to_vec())
         .execute(&mut ***tx)
         .await?;
     sqlx::query("SET LOCAL ROLE app_api").execute(&mut ***tx).await?;

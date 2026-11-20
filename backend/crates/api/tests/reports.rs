@@ -119,6 +119,19 @@ async fn audit_views(pool: PgPool) {
     assert_eq!(common::as_user(&app, &s.hr_token, "GET", "/v1/audit/entries?sort=up", None, &[]).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     let w = common::seed_worker(&pool, &app, &s, "Asha").await;
     assert_eq!(common::as_user(&app, &w.token, "GET", "/v1/audit/entries", None, &[]).await.0, StatusCode::FORBIDDEN, "ADT-01");
+    // An Auditor scoped to one branch reads no audit trail: entries carry no branch (it would see every branch).
+    let role = Uuid::new_v4();
+    sqlx::query("INSERT INTO iam.role (org_id, id, name) VALUES ($1, $2, 'branch auditor')").bind(s.org_id).bind(role).execute(&pool).await.unwrap();
+    for op in ["ADT-01", "ADT-02", "RPT-06"] {
+        sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')").bind(s.org_id).bind(role).bind(op).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(s.org_id).bind(w.user_id).bind(role).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO iam.user_scope (org_id, user_id, scope_kind, branch_id) VALUES ($1, $2, 'branch', $3)").bind(s.org_id).bind(w.user_id).bind(s.branch_id).execute(&pool).await.unwrap();
+    assert_eq!(common::as_user(&app, &w.token, "GET", "/v1/audit/entries", None, &[]).await.0, StatusCode::FORBIDDEN, "branch-scoped");
+    assert_eq!(common::as_user(&app, &w.token, "GET", "/v1/audit/settings-changes", None, &[]).await.0, StatusCode::FORBIDDEN);
+    let today = (Utc::now() + Duration::minutes(330)).date_naive();
+    assert_eq!(common::as_user(&app, &w.token, "POST", "/v1/reports/audit-trail/runs", Some(json!({ "from": today, "to": today })), &key()).await.0, StatusCode::FORBIDDEN);
+
     let other = common::seed_org(&pool).await;
     let (_, theirs) = common::as_user(&app, &other.hr_token, "GET", "/v1/audit/entries?action=policy_rule_group.put", None, &[]).await;
     assert_eq!(theirs["items"].as_array().map(Vec::len), Some(0), "TB-01");

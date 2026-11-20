@@ -44,6 +44,17 @@
   - Vendor replays use the `change_ref` index.
 - **Build:** the `db` crate gets a build script, so a new migration always rebuilds the embedded set.
 
+## Review fixes
+- **Audit scope:** the audit trail (R27, `GET /v1/audit/entries`), the settings history (R26, `GET /v1/audit/settings-changes`) carry no branch or department, so only a holder of the grant for the whole organisation reads them; a branch-scoped Auditor gets 403 instead of every branch's entries.
+- **Indexes fitted to their queries (0010, not yet applied outside tests):** the vendor replay index leads with `change_ref` (the lookup has no organisation); retention gets `(org_id, dispatched_at)` for dispatched events.
+- **Retention reaches only this relay's events:** dispatched events after 30 days; its own given-up events after 90; undispatched events of other types are never deleted (they wait for their consumers).
+- **Organisation dates:** R5 uses each punch's own zone; R26, R27 and the audit-view date filters use the organisation's date (India, as `org_today`); timestamps print in that zone.
+- **No silent cuts:** a report over 200,000 rows is refused (422) instead of truncated; xlsx cells over Excel's limit are cut with a marker (the CSV keeps all).
+- **CSV guard:** cells starting with tab or carriage return are prefixed too.
+- **Links:** polling a report job re-checks the report's grant before issuing a link.
+- **Smaller:** R3 shows minute penalties; R8 survives an empty place; R13 joins totals by map; `actor_kind` validated; audit pages are 200 (the spec's maximum).
+- **Test:** the single-use code test reuses the exact code, so a 30-second boundary cannot make it flaky.
+
 ## Not in this slice
 - **Next slices:** dashboards and upload links (18b); vendor views (19).
 - **Report gaps:**
@@ -55,6 +66,7 @@
   - Paging of audit views.
   - Reports above 200,000 rows.
   - Queued jobs.
+- **Scope over time:** who the caller sees is decided by today's assignments, not those over the report's range (an employee who moved branch reports with the new one).
 - **Report rights for other roles (G-33, G-34):** test grants give HR everything; the default grants follow the permission matrix.
 
 ## Review focus

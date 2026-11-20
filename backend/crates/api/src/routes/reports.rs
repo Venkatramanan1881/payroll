@@ -11,7 +11,7 @@ use axum::response::Response;
 use axum::Json;
 use chrono::{Duration, NaiveDate, Utc};
 use domain_attendance::reports::{self, Filters, Table};
-use domain_iam::authz::require;
+use domain_iam::authz::{require, Principal, Scope};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -28,6 +28,15 @@ pub struct ReportFilters {
     department_ids: Option<Vec<Uuid>>,
     employee_ids: Option<Vec<Uuid>>,
     format: Option<String>,
+}
+
+/// The audit trail and settings history carry no branch or department: until entries do, only a holder of the
+/// grant for the whole organisation reads them (a branch-scoped Auditor would otherwise see every branch).
+async fn require_org_wide(tx: &mut db::OrgTx<'_>, p: &Principal, op: &str) -> Result<(), ApiError> {
+    match require(tx, p, op).await?.scope {
+        Scope::All => Ok(()),
+        _ => Err(ApiError::Forbidden),
+    }
 }
 
 /// The grant each report needs (PERMISSION_MATRIX RPT-01..06).
@@ -51,7 +60,9 @@ fn xlsx(t: &Table) -> Result<Vec<u8>, rust_xlsxwriter::XlsxError> {
     }
     for (r, row) in t.rows.iter().enumerate() {
         for (c, cell) in row.iter().enumerate() {
-            sheet.write_string(r as u32 + 1, c as u16, cell)?; // strings, never formulas
+            // Strings, never formulas; Excel holds at most 32,767 characters in a cell (long audit values are cut, marked).
+            let cell = if cell.chars().count() > 32_000 { format!("{}… [cut; the CSV has it all]", cell.chars().take(32_000).collect::<String>()) } else { cell.clone() };
+            sheet.write_string(r as u32 + 1, c as u16, &cell)?;
         }
     }
     book.save_to_buffer()
@@ -61,9 +72,10 @@ fn xlsx(t: &Table) -> Result<Vec<u8>, rust_xlsxwriter::XlsxError> {
 async fn payroll_summary(tx: &mut db::OrgTx<'_>, period: Uuid, employees: &[Uuid]) -> Result<Table, ApiError> {
     let totals = domain_attendance::period::totals(tx, period, &(None, None), None).await?;
     let codes: Vec<(Uuid, String, String)> = sqlx::query_as("SELECT id, employee_code, full_name FROM workforce.employee WHERE id = ANY($1)").bind(employees).fetch_all(&mut ***tx).await?;
+    let by_id: std::collections::HashMap<String, &Value> = totals.iter().filter_map(|t| Some((t["employee_id"].as_str()?.to_string(), t))).collect();
     let mut rows = vec![];
     for (id, code, name) in &codes {
-        let Some(t) = totals.iter().find(|t| t["employee_id"] == json!(id)) else { continue };
+        let Some(t) = by_id.get(&id.to_string()) else { continue };
         let text = |k: &str| match &t[k] {
             Value::String(s) => s.clone(),
             Value::Null => String::new(),
@@ -78,6 +90,11 @@ async fn payroll_summary(tx: &mut db::OrgTx<'_>, period: Uuid, employees: &[Uuid
 async fn run(state: AppState, auth: Auth, report: &str, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     let Auth(p, mut tx) = auth;
     let op = grant(report).ok_or(ApiError::NotFound)?;
+    if matches!(report, "R26" | "R27") {
+        require_org_wide(&mut tx, &p, op).await?;
+    }
+    // shortcut: who the caller sees is decided by today's assignments, not those over the report's range; an employee
+    // who moved branch since reports with the new branch. Use assignments overlapping [from, to] when scope matters there.
     let visible = visible_employees(&mut tx, &p, op).await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/reports/{report}/runs"), &raw).await?;
     if let Some(r) = replay {
@@ -176,6 +193,10 @@ pub async fn get_job(State(state): State<AppState>, Auth(p, mut tx): Auth, Path(
     .fetch_optional(&mut **tx)
     .await?;
     let (mut body, path) = row.ok_or(ApiError::NotFound)?;
+    // A link is a fresh read: the caller must still hold the report's grant.
+    if let Some(op) = body["kind"].as_str().and_then(|k| k.strip_prefix("report:")).and_then(grant) {
+        require(&mut tx, &p, op).await?;
+    }
     if let (Some(path), Some(store)) = (path, state.store.clone()) {
         body["download_url"] = json!(store.signed_url(&path, LINK_SECS as u64).await.map_err(ApiError::Internal)?);
         body["download_expires_at"] = json!(Utc::now() + Duration::seconds(LINK_SECS));
@@ -204,12 +225,15 @@ const ENTRY: &str = "jsonb_build_object('id', a.id, 'actor_kind', a.actor_kind, 
     'before_value', a.before_value, 'after_value', a.after_value, 'change_ref', a.change_ref, 'correlation_id', a.correlation_id,
     'occurred_at', a.occurred_at)";
 
-// shortcut: the newest 500 matching entries; add the cursor when someone pages past them.
-const AUDIT_LIMIT: i64 = 500;
+// shortcut: the newest 200 matching entries (the spec's page maximum); add the cursor when someone pages past them.
+const AUDIT_LIMIT: i64 = 200;
 
 /// GET /v1/audit/entries (ADT-01): read-only; viewing is itself audited (entries carry before / after values).
 pub async fn audit_entries(Auth(p, mut tx): Auth, Query(q): Query<AuditQuery>) -> Result<Json<Value>, ApiError> {
-    require(&mut tx, &p, "ADT-01").await?;
+    require_org_wide(&mut tx, &p, "ADT-01").await?;
+    if q.actor_kind.as_deref().is_some_and(|k| !matches!(k, "user" | "vendor_user" | "system_job" | "device")) {
+        return Err(ApiError::ValidationFailed("actor_kind is user, vendor_user, system_job or device".into()));
+    }
     let ascending = match q.sort.as_deref() {
         None | Some("-occurred_at") => false,
         Some("occurred_at") => true,
@@ -217,7 +241,7 @@ pub async fn audit_entries(Auth(p, mut tx): Auth, Query(q): Query<AuditQuery>) -
     };
     let items: Vec<Value> = sqlx::query_scalar(&format!(
         "SELECT {ENTRY} FROM audit.audit_entry a
-         WHERE ($1::date IS NULL OR a.occurred_at >= $1::date) AND ($2::date IS NULL OR a.occurred_at < $2::date + 1)
+         WHERE ($1::date IS NULL OR (a.occurred_at AT TIME ZONE 'Asia/Kolkata')::date >= $1) AND ($2::date IS NULL OR (a.occurred_at AT TIME ZONE 'Asia/Kolkata')::date <= $2)
            AND ($3::uuid IS NULL OR a.actor_id = $3) AND ($4::text IS NULL OR a.actor_kind = $4) AND ($5::text IS NULL OR a.target_type = $5)
            AND ($6::uuid IS NULL OR a.target_id = $6) AND ($7::text IS NULL OR a.action = $7) AND (NOT $8 OR a.support_grant_id IS NOT NULL)
          ORDER BY a.occurred_at {}, a.id LIMIT {AUDIT_LIMIT}",
@@ -240,12 +264,12 @@ pub async fn audit_entries(Auth(p, mut tx): Auth, Query(q): Query<AuditQuery>) -
 
 /// GET /v1/audit/settings-changes (ADT-02): the settings and policy changes (G9), optionally for one BRD setting.
 pub async fn settings_changes(Auth(p, mut tx): Auth, Query(q): Query<AuditQuery>) -> Result<Json<Value>, ApiError> {
-    require(&mut tx, &p, "ADT-02").await?;
+    require_org_wide(&mut tx, &p, "ADT-02").await?;
     let items: Vec<Value> = sqlx::query_scalar(&format!(
         "SELECT {ENTRY} FROM audit.audit_entry a
          WHERE (a.action LIKE 'policy%' OR a.action LIKE '%settings%' OR a.action LIKE 'notification_rules%'
                 OR a.target_type IN ('policy_version','policy_assignment','organisation_settings'))
-           AND ($1::date IS NULL OR a.occurred_at >= $1::date) AND ($2::date IS NULL OR a.occurred_at < $2::date + 1)
+           AND ($1::date IS NULL OR (a.occurred_at AT TIME ZONE 'Asia/Kolkata')::date >= $1) AND ($2::date IS NULL OR (a.occurred_at AT TIME ZONE 'Asia/Kolkata')::date <= $2)
            AND ($3::uuid IS NULL OR a.actor_id = $3)
            AND ($4::text IS NULL OR strpos(coalesce(a.before_value::text, '') || coalesce(a.after_value::text, ''), '\"' || $4 || '\"') > 0)
          ORDER BY a.occurred_at DESC, a.id LIMIT {AUDIT_LIMIT}"
