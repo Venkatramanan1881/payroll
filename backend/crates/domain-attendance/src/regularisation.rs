@@ -191,6 +191,7 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, r: NewRequest) -> Result<Uui
         let id = insert(tx, user, &r, "employee", "approved", None, Some("auto_on_submit")).await?;
         db::audit(tx, user, "regularisation.submit", "regularisation_request", Some(id), Some(audit_step("submitted", 1, None, None))).await?;
         db::audit(tx, user, "regularisation.auto_approve", "regularisation_request", Some(id), Some(audit_step("auto_approved", 1, None, None))).await?;
+        crate::approval::announce(tx, KIND, id, 1, "auto_approved", None).await?;
         apply(tx, user, id).await?;
         event(tx, "RequestApproved", id, r.employee).await?;
         id
@@ -200,6 +201,7 @@ pub async fn submit(tx: &mut OrgTx<'_>, user: Uuid, r: NewRequest) -> Result<Uui
         let approver = route(tx, r.employee, level, today).await?.filter(|a| *a != user);
         let id = insert(tx, user, &r, "employee", state, approver, None).await?;
         db::audit(tx, user, "regularisation.submit", "regularisation_request", Some(id), Some(json!({ "action": "submitted", "level": level, "over_limit": over }))).await?;
+        crate::approval::announce(tx, KIND, id, level, "submitted", Some(user)).await?;
         id
     };
     event(tx, "RequestSubmitted", id, r.employee).await?;
@@ -221,6 +223,7 @@ pub async fn hr_correct(tx: &mut OrgTx<'_>, p: &Principal, r: NewRequest) -> Res
     let locked = db::employee_locked(tx, r.employee, r.date, r.date.succ_opt()).await?;
     let id = insert(tx, p.user_id, &r, "hr_direct", "approved", None, Some("approver")).await?;
     db::audit(tx, p.user_id, "regularisation.hr_correct", "regularisation_request", Some(id), Some(audit_step("approved", 1, Some(r.reason.trim()), None))).await?;
+    crate::approval::announce(tx, KIND, id, 1, "approved", Some(p.user_id)).await?;
     apply(tx, p.user_id, id).await?;
     if locked {
         crate::period::post_adjustment(tx, Some(p.user_id), r.employee, r.date, "regularisation", Some(id)).await?;
@@ -371,6 +374,7 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
     let two_levels = settings_on(tx, r.employee, date, master).await?.two_levels;
     let action = if approve { "approved" } else { "rejected" };
     db::audit(tx, p.user_id, &format!("regularisation.{}", if approve { "approve" } else { "reject" }), "regularisation_request", Some(id), Some(audit_step(action, level, note, on_behalf_of))).await?;
+    crate::approval::announce(tx, KIND, id, level, action, Some(p.user_id)).await?;
     if approve && level == 1 && two_levels {
         // R4: manager approved; HR decides next (RG-05).
         let today = local_today(tx, master).await?;
@@ -418,6 +422,7 @@ pub async fn cancel(tx: &mut OrgTx<'_>, user: Uuid, id: Uuid, reason: Option<&st
         .await?;
     let level = if r.state == "pending_l2" { 2 } else { 1 };
     db::audit(tx, user, "regularisation.cancel", "regularisation_request", Some(id), Some(audit_step("cancelled", level, reason, None))).await?;
+    crate::approval::announce(tx, KIND, id, level, "cancelled", Some(user)).await?;
     event(tx, "RequestCancelled", id, r.employee).await?;
     Ok(())
 }
@@ -471,6 +476,7 @@ pub async fn bulk_outage(tx: &mut OrgTx<'_>, p: &Principal, employees: &[Uuid], 
         }
         let id = insert(tx, p.user_id, &r, "hr_direct", "approved", None, Some("approver")).await?;
         db::audit(tx, p.user_id, "regularisation.bulk_outage", "regularisation_request", Some(id), Some(audit_step("approved", 1, Some(reason), None))).await?;
+        crate::approval::announce(tx, KIND, id, 1, "approved", Some(p.user_id)).await?;
         apply(tx, p.user_id, id).await?;
         event(tx, "RequestApproved", id, *e).await?;
         corrected += 1;

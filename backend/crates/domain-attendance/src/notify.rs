@@ -19,6 +19,12 @@ fn invalid(m: impl Into<String>) -> DomainError {
 type RuleRow = (String, String, String, bool, DateTime<Utc>, Option<Uuid>);
 
 /// The rule set: every sendable (event, channel, recipient) with its switch; stored rows override the defaults.
+/// Serialises rule changes of one organisation, so an If-Match check and its write cannot interleave with another's.
+pub async fn lock_rules(tx: &mut OrgTx<'_>) -> Result<(), DomainError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('notification_rules:' || app.current_org()::text))").execute(&mut ***tx).await?;
+    Ok(())
+}
+
 pub async fn rules(tx: &mut OrgTx<'_>) -> Result<Value, DomainError> {
     let stored: Vec<RuleRow> =
         sqlx::query_as("SELECT event_code, channel, recipient_kind, enabled, updated_at, updated_by FROM notify.notification_rule").fetch_all(&mut ***tx).await?;
@@ -103,7 +109,7 @@ async fn send(tx: &mut OrgTx<'_>, event: &str, recipient_kind: &str, user: Uuid,
     Ok(r.rows_affected() == 1)
 }
 
-/// Request tables whose requests have a routed approver.
+/// Request tables whose requests have a routed approver and an employee.
 fn request_table(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "leave" => "leave.leave_request",
@@ -120,36 +126,48 @@ fn words(kind: &str) -> String {
     kind.replace('_', " ")
 }
 
-/// NT-05 from one approval step: the requester hears of every decision on their request; the approver it now waits
-/// on hears that it waits.
+/// The employee's active user account (the oldest when there are several).
+const EMPLOYEE_USER: &str = "(SELECT u.id FROM iam.user_account u WHERE u.employee_id = {} AND u.active ORDER BY u.created_at LIMIT 1)";
+
+/// NT-05 from one approval step: the employee whose request it is hears of every decision (not of their own action,
+/// nor of their submission); the approver it now waits on hears that it waits.
 async fn on_step(tx: &mut OrgTx<'_>, event: Uuid, p: &Value) -> Result<i64, DomainError> {
     let (Some(kind), Some(id), Some(action)) = (p["request_type"].as_str(), p["request_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()), p["action"].as_str()) else {
         return Ok(0);
     };
-    let requester = p["requester_user_id"].as_str().and_then(|s| s.parse::<Uuid>().ok());
+    let Some(table) = request_table(kind) else { return Ok(0) };
     let actor = p["actor_user_id"].as_str().and_then(|s| s.parse::<Uuid>().ok());
+    let level = p["level"].as_i64().unwrap_or(1);
+    // The request as it is now: whose it is, whom it waits on, and whether it reached a second level.
+    let employee_col = if kind == "period_unlock" { "requested_by".to_string() } else { EMPLOYEE_USER.replace("{}", "q.employee_id") };
+    let row: Option<(Option<Uuid>, Option<Uuid>, String, bool)> = sqlx::query_as(&format!(
+        "SELECT {employee_col}, q.current_approver_user_id, q.state,
+                q.state = 'pending_l2' OR EXISTS (SELECT 1 FROM app.approval_step s WHERE s.request_type = $2 AND s.request_id = q.id AND s.level = 2)
+         FROM {table} q WHERE q.id = $1"
+    ))
+    .bind(id)
+    .bind(kind)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let Some((owner, approver, state, two_levels)) = row else { return Ok(0) };
     let link = json!({ "kind": kind, "id": id });
     let mut sent = 0;
-    if let (Some(r), true) = (requester, action != "submitted") {
-        if actor != Some(r) {
-            let level = p["level"].as_i64().unwrap_or(1);
-            let text = format!("Your {} request was {}{}.", words(kind), action.replace('_', " "), if level == 2 { " at level 2" } else { "" });
-            sent += i64::from(send(tx, "NT-05", "employee", r, &format!("NT-05:{event}:employee"), &format!("Request {}", action.replace('_', " ")), &text, link.clone()).await?);
+    if let (Some(o), true) = (owner, action != "submitted") {
+        if actor != Some(o) {
+            let what = action.replace('_', " ");
+            let text = match (action, level, two_levels) {
+                ("approved", 1, true) => format!("Your {} request was approved at level 1 and now waits for level 2.", words(kind)),
+                (_, 2, _) => format!("Your {} request was {what} at level 2.", words(kind)),
+                _ => format!("Your {} request was {what}.", words(kind)),
+            };
+            sent += i64::from(send(tx, "NT-05", "employee", o, &format!("NT-05:{event}:employee"), &format!("Request {what}"), &text, link.clone()).await?);
         }
     }
-    if matches!(action, "submitted" | "approved" | "escalated") {
-        if let Some(table) = request_table(kind) {
-            let approver: Option<Uuid> = sqlx::query_scalar(&format!("SELECT current_approver_user_id FROM {table} WHERE id = $1 AND state LIKE 'pending%'"))
-                .bind(id)
-                .fetch_optional(&mut ***tx)
-                .await?
-                .flatten();
-            // shortcut: a request waiting on the HR pool (no named approver) notifies no one until pool recipients are defined (OQ-C14-01).
-            if let Some(a) = approver.filter(|a| Some(*a) != actor) {
-                let text = format!("A {} request is waiting for your decision.", words(kind));
-                sent += i64::from(send(tx, "NT-05", "approver", a, &format!("NT-05:{event}:approver"), "Approval needed", &text, link).await?);
-            }
-        }
+    // shortcut: a request waiting on the HR pool (no named approver) notifies no one until pool recipients are defined (OQ-C14-01).
+    if let (Some(a), true) = (approver.filter(|a| Some(*a) != actor), state.starts_with("pending") && matches!(action, "submitted" | "approved" | "escalated")) {
+        let text = format!("A {} request is waiting for your decision.", words(kind));
+        // One notice per approver and request state, however many events of one batch lead there.
+        sent += i64::from(send(tx, "NT-05", "approver", a, &format!("NT-05:{id}:{state}:{a}"), "Approval needed", &text, link).await?);
     }
     Ok(sent)
 }
@@ -161,7 +179,7 @@ type PenaltyRow = (Uuid, String, Option<String>, Option<String>, Option<Uuid>);
 async fn on_period_locked(tx: &mut OrgTx<'_>, period: Uuid) -> Result<i64, DomainError> {
     let rows: Vec<PenaltyRow> = sqlx::query_as(
         "SELECT x.id, x.rule_ref, to_char(x.days, 'FM990.00'), x.recovered_as,
-                (SELECT u.id FROM iam.user_account u WHERE u.employee_id = x.employee_id ORDER BY u.created_at LIMIT 1)
+                (SELECT u.id FROM iam.user_account u WHERE u.employee_id = x.employee_id AND u.active ORDER BY u.created_at LIMIT 1)
          FROM attendance.period_penalty x JOIN period.attendance_period p ON p.id = x.period_id
          WHERE x.period_id = $1 AND x.created_at >= p.locked_at",
     )
@@ -180,7 +198,7 @@ async fn on_period_locked(tx: &mut OrgTx<'_>, period: Uuid) -> Result<i64, Domai
 /// NT-10: a posted adjustment, to the employee it concerns.
 async fn on_adjustment(tx: &mut OrgTx<'_>, adjustment: Uuid) -> Result<i64, DomainError> {
     let row: Option<(Option<Uuid>, chrono::NaiveDate)> = sqlx::query_as(
-        "SELECT (SELECT u.id FROM iam.user_account u WHERE u.employee_id = a.employee_id ORDER BY u.created_at LIMIT 1), a.original_date
+        "SELECT (SELECT u.id FROM iam.user_account u WHERE u.employee_id = a.employee_id AND u.active ORDER BY u.created_at LIMIT 1), a.original_date
          FROM period.period_adjustment a WHERE a.id = $1",
     )
     .bind(adjustment)
@@ -199,26 +217,40 @@ pub async fn dispatch(tx: &mut OrgTx<'_>, org: Uuid) -> Result<Value, DomainErro
     sqlx::query("SET LOCAL ROLE app_relay").execute(&mut ***tx).await?;
     let events: Vec<(Uuid, String, Uuid, Value)> = sqlx::query_as(
         "SELECT event_id, event_type, aggregate_id, payload FROM app.outbox
-         WHERE org_id = $1 AND dispatched_at IS NULL AND event_type = ANY($2) ORDER BY created_at LIMIT 1000 FOR UPDATE SKIP LOCKED",
+         WHERE org_id = $1 AND dispatched_at IS NULL AND event_type = ANY($2) AND attempts < 5 ORDER BY created_at LIMIT 1000 FOR UPDATE SKIP LOCKED",
     )
     .bind(org)
     .bind(HANDLED.to_vec())
     .fetch_all(&mut ***tx)
     .await?;
     sqlx::query("SET LOCAL ROLE app_api").execute(&mut ***tx).await?;
-    let mut sent = 0;
+    let (mut sent, mut done, mut failed) = (0, vec![], vec![]);
     for (event, kind, aggregate, payload) in &events {
-        sent += match kind.as_str() {
-            "ApprovalStep" => on_step(tx, *event, payload).await?,
-            "PeriodLocked" => on_period_locked(tx, *aggregate).await?,
-            _ => on_adjustment(tx, *aggregate).await?,
+        // One bad event never stalls the rest: it is rolled back alone, counted, and retried up to five times.
+        sqlx::query("SAVEPOINT notify_event").execute(&mut ***tx).await?;
+        let r = match kind.as_str() {
+            "ApprovalStep" => on_step(tx, *event, payload).await,
+            "PeriodLocked" => on_period_locked(tx, *aggregate).await,
+            _ => on_adjustment(tx, *aggregate).await,
         };
+        match r {
+            Ok(n) => {
+                sqlx::query("RELEASE SAVEPOINT notify_event").execute(&mut ***tx).await?;
+                sent += n;
+                done.push(*event);
+            }
+            Err(e) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT notify_event").execute(&mut ***tx).await?;
+                eprintln!("notification event {event} failed: {e:?}");
+                failed.push(*event);
+            }
+        }
     }
     sqlx::query("SET LOCAL ROLE app_relay").execute(&mut ***tx).await?;
-    let ids: Vec<Uuid> = events.iter().map(|e| e.0).collect();
-    sqlx::query("UPDATE app.outbox SET dispatched_at = now(), attempts = attempts + 1 WHERE event_id = ANY($1)").bind(&ids).execute(&mut ***tx).await?;
+    sqlx::query("UPDATE app.outbox SET dispatched_at = now(), attempts = attempts + 1 WHERE event_id = ANY($1)").bind(&done).execute(&mut ***tx).await?;
+    sqlx::query("UPDATE app.outbox SET attempts = attempts + 1 WHERE event_id = ANY($1)").bind(&failed).execute(&mut ***tx).await?;
     sqlx::query("SET LOCAL ROLE app_api").execute(&mut ***tx).await?;
-    Ok(json!({ "events": events.len(), "sent": sent }))
+    Ok(json!({ "events": events.len(), "sent": sent, "failed": failed.len() }))
 }
 
 /// NT-06: one daily digest per approver with requests waiting on them.
@@ -282,6 +314,8 @@ pub async fn register_device(tx: &mut OrgTx<'_>, user: Uuid, token: &str, platfo
     if token.is_empty() || token.len() > 4096 || !matches!(platform, "android" | "ios") || app_version.is_some_and(|v| v.chars().count() > 40) {
         return Err(invalid("token (1-4096), platform android or ios, app_version up to 40 characters"));
     }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('push_token:' || $1))").bind(token).execute(&mut ***tx).await?;
+    // shortcut: a token stays live in another organisation the device signed into earlier (RLS hides it); revoke across organisations when push is delivered.
     sqlx::query("UPDATE notify.push_device SET revoked_at = now() WHERE token = $1 AND revoked_at IS NULL").bind(token).execute(&mut ***tx).await?;
     let device: Value = sqlx::query_scalar(
         "INSERT INTO notify.push_device (org_id, user_id, platform, token, app_version) VALUES (app.current_org(), $1, $2, $3, $4)

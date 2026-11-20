@@ -34,6 +34,18 @@
   - `jobs_login` becomes a member of `app_relay` (`supabase_roles.sql`, to be re-run).
   - Two scheduler entries are added (DEPLOYMENT.md §5).
 
+## Review fixes
+- **Regularisation:** it keeps its steps in the audit log, so it now announces each step (submit, decision, cancel, HR correction, bulk outage, J3 timeout and escalation) through the same `approval::announce` event.
+- **The right person:** NT-05 goes to the employee whose request it is (their active user), not to whoever filed it on their behalf; nobody hears of their own action.
+- **Wording:** a level-1 approval of a two-level request says it now waits for level 2.
+- **Approver notices:** one per approver and request state, however many events of one batch lead there.
+- **Relay resilience:** a savepoint per event; a failing event is rolled back alone, its attempts counted, and retried up to five times; the others are sent and marked.
+- **Concurrency:** rule changes are serialised per organisation before the If-Match check; registrations of one push token are serialised.
+- **Recipients:** only active user accounts receive NT-07 and NT-10.
+
+## Waiting on approval (Gate 3)
+- An index `app.outbox (org_id, event_type, created_at) WHERE dispatched_at IS NULL` and a retention rule for event types no consumer marks yet (`DayResultChanged`, `Request*`, `PunchRecorded`, ...). Until then the relay walks the shared pending index, which grows with those events.
+
 ## Not in this slice
 - **Waiting on open questions:**
   - NT-01, NT-02, NT-03, NT-04, NT-08, NT-09 and NT-11 (OQ-C14-03..05).
@@ -44,6 +56,9 @@
   - Translations.
   - AC-04 approval of notification settings (G-08).
   - Inbox paging.
+  - Rule lookups are one query per notification (cache per run if dispatch gets slow).
+  - A push token stays live in another organisation the device signed into earlier (revoke across organisations when push is delivered).
+  - A re-lock sends new penalty notices without a notice that the earlier ones were reversed.
 
 ## Review focus
 1. The relay: role switching inside one transaction, only handled events marked, idempotence (dedupe, SKIP LOCKED), and tenant isolation (`org_id = $1` plus RLS on the inserts).

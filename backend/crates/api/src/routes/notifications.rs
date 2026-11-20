@@ -39,6 +39,7 @@ pub struct RulesIn {
 // shortcut: saved at once; AC-04 "with OA approval" for notification settings waits on G-08 (OQ-C03-11).
 pub async fn change_rules(Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     require(&mut tx, &p, "NTF-01").await?;
+    notify::lock_rules(&mut tx).await?;
     if_match(&headers, &notify::rules(&mut tx).await?)?;
     let r: RulesIn = parse(&raw)?;
     let changes: Vec<Change> = r.changes.into_iter().map(|c| Change { event: c.event_code, channel: c.channel, recipient: c.recipient_kind, enabled: c.enabled }).collect();

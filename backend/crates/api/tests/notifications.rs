@@ -130,3 +130,27 @@ async fn push_devices_register_move_and_unregister(pool: PgPool) {
     let still: i64 = sqlx::query_scalar("SELECT count(*) FROM notify.push_device WHERE revoked_at IS NULL").fetch_one(&pool).await.unwrap();
     assert_eq!(still, 0);
 }
+
+/// A two-level request approved at level 1 is reported as waiting for level 2, not as approved.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn level_one_approval_is_not_reported_as_final(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    let (_, set, _) = common::call(&app, &s, "POST", "/v1/policy-sets", Some(json!({ "name": "Default", "effective_from": "2026-01-01" })), None).await;
+    let v = set["versions"][0]["id"].as_str().unwrap().to_string();
+    let (_, _, etag) = common::call(&app, &s, "GET", &format!("/v1/policy-versions/{v}"), None, None).await;
+    let doc = json!({ "schema_version": 1, "settings": { "OD-05": { "levels": "manager_then_hr" } } });
+    assert_eq!(common::call(&app, &s, "PUT", &format!("/v1/policy-versions/{v}/rule-groups/OD"), Some(doc), etag.as_deref()).await.0, StatusCode::OK);
+    common::call(&app, &s, "POST", &format!("/v1/policy-versions/{v}/publish"), None, None).await;
+    let body = json!({ "policy_set_id": set["id"], "level": "organisation", "valid_from": "2026-01-01", "reason": "setup" });
+    assert_eq!(common::call(&app, &s, "POST", "/v1/policy-assignments", Some(body), None).await.0, StatusCode::CREATED);
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let d = ((Utc::now() + Duration::minutes(330)).date_naive() + Duration::days(3)).to_string();
+    let (_, r) = common::as_user(&app, &w.token, "POST", "/v1/on-duty/requests", Some(json!({ "duration_kind": "full_day", "from_date": d, "to_date": d, "purpose": "audit", "place": "Madurai" })), &key()).await;
+    let (st, _) = common::as_user(&app, &s.hr_token, "POST", &format!("/v1/on-duty/requests/{}/approve", r["id"].as_str().unwrap()), None, &key()).await;
+    assert_eq!(st, StatusCode::OK);
+    dispatch(&pool, s.org_id).await;
+    let mine = inbox(&app, &w.token).await;
+    assert!(mine["items"][0]["body"].as_str().unwrap().contains("approved at level 1 and now waits for level 2"), "{mine}");
+}
