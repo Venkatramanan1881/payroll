@@ -340,3 +340,37 @@ async fn event(tx: &mut OrgTx<'_>, kind: &str, request_type: &str, id: Uuid, emp
         .await?;
     Ok(())
 }
+
+/// J10: the organisation's usage summary for the vendor console (VC-R3, VC-R8), counted as the organisation and written
+/// as the jobs role, whose row policy admits only this organisation's row; the vendor views never read client tables (P12).
+pub async fn refresh_usage(tx: &mut OrgTx<'_>) -> Result<Value, DomainError> {
+    let row: (i64, i64, i64, i64, Option<chrono::DateTime<Utc>>, i64) = sqlx::query_as(
+        // Active = not exited, as the VC-01 limit check counts them (future joiners included).
+        "SELECT (SELECT count(*) FROM workforce.employee WHERE employment_status <> 'exited'),
+                (SELECT count(*) FROM org.branch),
+                (SELECT count(*) FROM timecap.device WHERE retired_at IS NULL AND online_state = 'online'),
+                (SELECT count(*) FROM timecap.device WHERE retired_at IS NULL),
+                (SELECT max(created_at) FROM iam.session),
+                (SELECT count(*) FROM period.attendance_period WHERE state IN ('awaiting_lock','unlocked'))",
+    )
+    .fetch_one(&mut ***tx)
+    .await?;
+    // The row is the transaction's own organisation (RLS WITH CHECK on app_jobs), never a parameter.
+    sqlx::query("SET LOCAL ROLE app_jobs").execute(&mut ***tx).await?;
+    sqlx::query(
+        "INSERT INTO platform.organisation_usage (org_id, active_employees, branches, devices_online, devices_total, last_sign_in_at, periods_awaiting_lock, refreshed_at)
+         VALUES (app.current_org(), $1, $2, $3, $4, $5, $6, now())
+         ON CONFLICT (org_id) DO UPDATE SET active_employees = EXCLUDED.active_employees, branches = EXCLUDED.branches, devices_online = EXCLUDED.devices_online,
+           devices_total = EXCLUDED.devices_total, last_sign_in_at = EXCLUDED.last_sign_in_at, periods_awaiting_lock = EXCLUDED.periods_awaiting_lock, refreshed_at = now()",
+    )
+    .bind(row.0 as i32)
+    .bind(row.1 as i32)
+    .bind(row.2 as i32)
+    .bind(row.3 as i32)
+    .bind(row.4)
+    .bind(row.5 as i32)
+    .execute(&mut ***tx)
+    .await?;
+    sqlx::query("SET LOCAL ROLE app_api").execute(&mut ***tx).await?;
+    Ok(json!({ "active_employees": row.0, "devices_total": row.3 }))
+}
