@@ -33,7 +33,9 @@
     "PERIOD_LOCKED": "This date is in a locked period.",
     "OUTSIDE_REQUEST_WINDOW": "This date is outside the window for requests.",
     "LIMIT_EXCEEDED": "The limit for these requests has been reached.",
-    "ADJUSTMENT_WINDOW_EXCEEDED": "This date is too old to adjust."
+    "ADJUSTMENT_WINDOW_EXCEEDED": "This date is too old to adjust.",
+    "INSUFFICIENT_BALANCE": "There is not enough leave balance for this request.",
+    "OVERLAPPING_REQUEST": "This overlaps another leave request."
   },
   "signIn": {
     "title": "Sign in",
@@ -66,7 +68,8 @@
     "nothing": "Nothing is available to your role yet.",
     "attendance": "Attendance",
     "approvals": "Approvals",
-    "flags": "Punch flags"
+    "flags": "Punch flags",
+    "leave": "Leave"
   },
   "me": {
     "title": "My details",
@@ -289,5 +292,46 @@
     "confirmReject": "Confirm rejection",
     "done": "Decision recorded.",
     "back": "Back"
+  },
+  "leave": {
+    "title": "Leave",
+    "mine": "Waiting for me",
+    "all": "All requests",
+    "state": "State",
+    "type": "Leave type",
+    "employee": "Employee",
+    "dates": "Dates",
+    "days": "Days",
+    "submitted": "Submitted",
+    "empty": "No leave requests.",
+    "emptyMine": "Nothing is waiting for you.",
+    "apply": "Apply on behalf",
+    "applyTitle": "Apply for leave on an employee's behalf",
+    "applyHelp": "The request goes to the employee's approver, as if they had applied.",
+    "search": "Find employee",
+    "searchHelp": "Type a name, code or mobile number",
+    "pick": "Choose an employee",
+    "from": "From",
+    "to": "To",
+    "fromPart": "First day",
+    "toPart": "Last day",
+    "reason": "Reason",
+    "submit": "Submit request",
+    "balances": "Leave balances",
+    "balance": "Balance",
+    "pending": "Waiting for approval",
+    "noBalances": "No leave types yet.",
+    "detail": "Leave request",
+    "steps": "Approval history",
+    "dayList": "Days",
+    "cancel": "Cancel request",
+    "cancelReason": "Reason for cancelling",
+    "confirmCancel": "Confirm cancellation",
+    "cancelled": "Cancelled {at}",
+    "part": {
+      "full": "Full day",
+      "first_half": "First half",
+      "second_half": "Second half"
+    }
   }
 }

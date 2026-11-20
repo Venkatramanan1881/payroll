@@ -3,11 +3,6 @@ import { useTranslations } from "next-intl";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import type { Problem } from "@/lib/problem";
 
-const KNOWN = new Set([
-  "FORBIDDEN", "NOT_FOUND", "UNAUTHENTICATED", "VALIDATION_FAILED", "PRECONDITION_FAILED", "ORG_SUSPENDED",
-  "MODULE_DISABLED", "EMPLOYEE_LIMIT_REACHED", "TOO_MANY_REQUESTS", "ALREADY_EXISTS", "network",
-]);
-
 /** One way to show an API refusal: the known message, plus the API's own detail when it gives one. */
 export function ProblemAlert({ problem }: { problem: Problem | null }) {
   const t = useTranslations("problem");
@@ -16,7 +11,7 @@ export function ProblemAlert({ problem }: { problem: Problem | null }) {
   return (
     <Alert variant="destructive" role="alert">
       <AlertDescription>
-        {KNOWN.has(code) ? t(code) : t("other", { code })}
+        {t.has(code) ? t(code) : t("other", { code })}
         {problem.detail && code !== "network" ? <span className="block text-sm opacity-80">{problem.detail}</span> : null}
       </AlertDescription>
     </Alert>

@@ -713,6 +713,10 @@ pub async fn cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, reason: &str) -
 fn request_json() -> String {
     format!(
         "jsonb_build_object('id', q.id, 'employee_id', q.employee_id, 'leave_type_id', q.leave_type_id, 'from_date', q.from_date, 'to_date', q.to_date,
+           'employee_code', (SELECT e.employee_code FROM workforce.employee e WHERE e.id = q.employee_id),
+           'employee_name', (SELECT e.full_name FROM workforce.employee e WHERE e.id = q.employee_id),
+           'leave_type_name', (SELECT t.name FROM leave.leave_type t WHERE t.id = q.leave_type_id),
+           'total_days', (SELECT to_char(coalesce(sum(d.fraction), 0), 'FM990.00') FROM leave.leave_request_day d WHERE d.leave_request_id = q.id),
            'from_part', q.from_part, 'to_part', q.to_part, 'reason', q.reason, 'document_path', q.document_path, 'requested_by', q.requested_by,
            'state', q.state, 'escalated', q.escalated, 'decided_basis', q.decided_basis, 'current_approver_user_id', q.current_approver_user_id,
            'submitted_at', q.submitted_at, 'cancelled_at', q.cancelled_at, 'cancelled_by', q.cancelled_by,
@@ -741,10 +745,61 @@ pub async fn can_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<b
     }
     let op = if state == "pending_l1" { "LVE-04" } else { "LVE-05" };
     match approval::may_decide(tx, p, employee, op, approver).await {
+        Ok(_) => {}
+        Err(DomainError::NotFound | DomainError::Forbidden) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    if state == "pending_l2" {
+        // As decide(): the first-level approver never also decides the second level.
+        let twice: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM app.approval_step WHERE request_type = 'leave' AND request_id = $1 AND action = 'approved' AND actor_user_id = $2)")
+            .bind(id)
+            .bind(p.user_id)
+            .fetch_one(&mut ***tx)
+            .await?;
+        return Ok(!twice);
+    }
+    Ok(true)
+}
+
+/// Whether `cancel` would accept the caller for this request (requester, the employee, or LVE-06 in scope), ignoring
+/// the reason and locked periods, which only the attempt itself checks.
+pub async fn can_cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<bool, DomainError> {
+    let r: Option<(Uuid, String, Uuid)> = sqlx::query_as("SELECT employee_id, state, requested_by FROM leave.leave_request WHERE id = $1").bind(id).fetch_optional(&mut ***tx).await?;
+    let Some((employee, state, requester)) = r else { return Ok(false) };
+    if !["pending_l1", "pending_l2", "approved"].contains(&state.as_str()) {
+        return Ok(false);
+    }
+    if requester == p.user_id || p.employee_id == Some(employee) {
+        return Ok(true);
+    }
+    match approval::may_decide(tx, p, employee, "LVE-06", None).await {
         Ok(_) => Ok(true),
         Err(DomainError::NotFound | DomainError::Forbidden) => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// The requests waiting for the caller's decision: exactly those `can_decide` accepts (routed to them, through an allowed
+/// delegation, or unrouted within their LVE-04 / LVE-05 scope), newest first.
+// shortcut: checks up to 500 pending candidates one by one; move the predicate into SQL when queues grow.
+pub async fn awaiting(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Vec<Value>, DomainError> {
+    let candidates: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT q.id FROM leave.leave_request q
+         WHERE q.state IN ('pending_l1', 'pending_l2')
+           AND (q.current_approver_user_id IS NULL OR q.current_approver_user_id = $1
+                OR q.current_approver_user_id IN (SELECT approver_user_id FROM iam.delegation WHERE delegate_user_id = $1 AND valid @> now()))
+         ORDER BY q.submitted_at DESC, q.id LIMIT 500",
+    )
+    .bind(p.user_id)
+    .fetch_all(&mut ***tx)
+    .await?;
+    let mut out = Vec::new();
+    for id in candidates {
+        if can_decide(tx, p, id).await? {
+            out.push(get(tx, id).await?);
+        }
+    }
+    Ok(out)
 }
 
 pub struct Filter {
@@ -758,12 +813,13 @@ pub struct Filter {
 // shortcut: no cursor paging, newest 500.
 pub async fn list(tx: &mut OrgTx<'_>, p: &Principal, f: &Filter) -> Result<Vec<Value>, DomainError> {
     // Visible: employees in scope, plus requests routed to the caller (or someone who delegated to them).
-    let sql = format!(
-        "SELECT {} FROM leave.leave_request q
-         WHERE (($1::uuid[] IS NULL OR q.employee_id = ANY($1)) OR q.current_approver_user_id = $4
+    let routed = "(q.current_approver_user_id = $4
                 OR (q.current_approver_user_id IN (SELECT approver_user_id FROM iam.delegation WHERE delegate_user_id = $4 AND valid @> now())
                     AND coalesce((SELECT (settings->>'delegation_enabled')::boolean FROM org.organisation_settings_version WHERE effective_from <= current_date
-                                  ORDER BY effective_from DESC LIMIT 1), true)))
+                                  ORDER BY effective_from DESC LIMIT 1), true)))";
+    let sql = format!(
+        "SELECT {} FROM leave.leave_request q
+         WHERE (($1::uuid[] IS NULL OR q.employee_id = ANY($1)) OR {routed})
            AND ($2::text IS NULL OR q.state = $2) AND ($3::uuid IS NULL OR q.leave_type_id = $3) AND ($5::uuid IS NULL OR q.employee_id = $5)
          ORDER BY q.submitted_at DESC, q.id LIMIT 500",
         request_json()

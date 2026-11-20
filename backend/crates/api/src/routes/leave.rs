@@ -209,10 +209,14 @@ pub struct ListQuery {
     employee_id: Option<Uuid>,
     state: Option<String>,
     leave_type_id: Option<Uuid>,
+    awaiting_me: Option<bool>,
 }
 
 /// GET /v1/leave/requests: own requests, employees in LVE-08 scope, and requests routed to the caller.
 pub async fn list(Auth(p, mut tx): Auth, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
+    if q.awaiting_me == Some(true) {
+        return Ok(Json(json!({ "items": leave::awaiting(&mut tx, &p).await?, "next_cursor": null })));
+    }
     let mut employees: Option<Vec<Uuid>> = Some(p.employee_id.into_iter().collect());
     match visible_employees(&mut tx, &p, "LVE-08").await {
         Ok(None) => employees = None,
@@ -239,7 +243,12 @@ pub async fn get(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Val
         Err(ApiError::Forbidden) => false,
         Err(e) => return Err(e),
     };
-    if p.employee_id.is_some() && p.employee_id == employee || visible || leave::can_decide(&mut tx, &p, id).await? {
+    let can_decide = leave::can_decide(&mut tx, &p, id).await?;
+    if p.employee_id.is_some() && p.employee_id == employee || visible || can_decide {
+        let mut body = body;
+        // What this caller may do now, by the same checks approve/reject/cancel make (clients never rebuild them).
+        body["can_decide"] = json!(can_decide);
+        body["can_cancel"] = json!(leave::can_cancel(&mut tx, &p, id).await?);
         Ok(Json(body))
     } else {
         Err(ApiError::NotFound)

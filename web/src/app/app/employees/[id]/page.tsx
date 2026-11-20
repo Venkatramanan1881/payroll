@@ -1,6 +1,8 @@
 import { getTranslations } from "next-intl/server";
 import Link from "next/link";
 import { EmployeeDetails } from "@/components/employee-details";
+import { LeaveBalances } from "@/components/leave-balances";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageProblem } from "@/components/page-problem";
 import { Button } from "@/components/ui/button";
 import { can } from "@/lib/menu";
@@ -25,6 +27,12 @@ export default async function EmployeePage({ params }: { params: Promise<{ id: s
         ) : null}
       </div>
       <EmployeeDetails e={emp.data} lk={lk} />
+      {me.ok && can(me.data.grants, "LVE-08") ? (
+        <Card>
+          <CardHeader><CardTitle><h2>{t("leave.balances")}</h2></CardTitle></CardHeader>
+          <CardContent><LeaveBalances employeeId={emp.data.id} /></CardContent>
+        </Card>
+      ) : null}
     </section>
   );
 }
