@@ -58,7 +58,6 @@ async fn audit_keyed(tx: &mut OrgTx<'_>, vendor_user: Uuid, org: Option<Uuid>, a
 
 /// Vendor creates are idempotent by the client's key, kept on their audit entry (`change_ref`): the organisation-scoped
 /// idempotency table cannot hold a request that has no organisation yet. Returns what that key already created.
-// shortcut: no index on change_ref; add one (Gate 3 amendment) when the audit log grows large.
 pub async fn replay(tx: &mut OrgTx<'_>, vendor_user: Uuid, action: &str, key: Uuid) -> Result<Option<Uuid>, DomainError> {
     Ok(sqlx::query_scalar("SELECT target_id FROM audit.audit_entry WHERE actor_kind = 'vendor_user' AND actor_id = $3 AND action = $1 AND change_ref = $2")
         .bind(action)

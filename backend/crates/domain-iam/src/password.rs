@@ -35,6 +35,19 @@ pub async fn record_failed_code(pool: &PgPool, org: Uuid, user: Uuid) -> Result<
     Ok(())
 }
 
+/// Marks a code's step as used; false when that step (or a later one) was already used: the code is not accepted again.
+pub async fn claim_step(pool: &PgPool, org: Uuid, user: Uuid, step: i64) -> Result<bool, db::DomainError> {
+    let mut tx = db::begin_org(pool, org).await?;
+    let claimed = sqlx::query("UPDATE iam.user_account SET mfa_last_step = $2 WHERE id = $1 AND (mfa_last_step IS NULL OR mfa_last_step < $2)")
+        .bind(user)
+        .bind(step)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(claimed == 1)
+}
+
 /// Associated data binding an encrypted secret to its organisation and user (a copied ciphertext does not decrypt).
 pub fn secret_aad(org: Uuid, user: Uuid) -> Vec<u8> {
     format!("{org}:{user}").into_bytes()

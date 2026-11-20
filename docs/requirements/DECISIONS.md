@@ -47,6 +47,9 @@ Answers given by the project owner in session. Each decision closes the listed q
 | D-35 | 2026-11-20 | Delivery channels in V1 (OQ-C14-02, OQ-C14-07) | **In-app only until a provider is chosen**; other channels cannot be switched on. Push device tokens are stored for later. | — (OQ-C14-02, OQ-C14-07 stay open) | — |
 | D-36 | 2026-11-20 | Which notification events first | **NT-05, NT-06, NT-07 and NT-10.** The others wait for their open questions (OQ-C14-03, -04, -05). | — | — |
 | D-37 | 2026-11-20 | Slice 17 scope | **Split:** slice 17 = notifications; slice 18 = reports, dashboards, audit views, jobs and upload links; slice 19 = remaining vendor views (usage, health, sector templates, announcements). | — | — |
+| D-38 | 2026-11-20 | Gate 3 amendment: migration 0010 | **Approved:** `app.job`, `iam.dashboard_widget_choice`, `iam.dashboard_default_filter`; the outbox index and retention (DELETE for `app_relay`); an index on `audit_entry.change_ref`; `iam.user_account.mfa_last_step` (single-use authenticator codes). | — | MIGRATIONS.md 0010 |
+| D-39 | 2026-11-20 | Report file formats | **xlsx (default) and CSV**, xlsx through the `rust_xlsxwriter` library. | — | — |
+| D-40 | 2026-11-20 | Slice 18 scope | **Split:** 18 = report runs (R1–R10, R13, R25–R27), job polling and the audit views; 18b = dashboards and upload links; 19 = remaining vendor views. | — | — |
 
 ## Answered but not yet closed (need a follow-up answer)
 

@@ -19,6 +19,7 @@ pub mod openbal;
 pub mod period;
 pub mod permission;
 pub mod regularisation;
+pub mod reports;
 
 /// Settings of a policy version for the engine. A switched-off LA, EC or BK group evaluates nothing (G2, BR-14);
 /// the other groups cannot be "off" for a day, so their defaults apply.
