@@ -116,9 +116,14 @@ pub async fn step(tx: &mut OrgTx<'_>, s: Step<'_>) -> Result<(), DomainError> {
 
 /// NT-05: every step of every request type reaches the notification relay through one `ApprovalStep` event.
 pub async fn announce(tx: &mut OrgTx<'_>, kind: &str, request: Uuid, level: i16, action: &str, actor: Option<Uuid>) -> Result<(), DomainError> {
+    announce_level(tx, kind, request, level, action, actor, false).await
+}
+
+/// As `announce`; `to_level_2` = a level-1 approval that sends the request on to level 2 (known only at the step).
+pub async fn announce_level(tx: &mut OrgTx<'_>, kind: &str, request: Uuid, level: i16, action: &str, actor: Option<Uuid>, to_level_2: bool) -> Result<(), DomainError> {
     sqlx::query("INSERT INTO app.outbox (org_id, event_type, aggregate_id, payload) VALUES (app.current_org(), 'ApprovalStep', $1, $2)")
         .bind(request)
-        .bind(serde_json::json!({ "request_type": kind, "request_id": request, "level": level, "action": action, "actor_user_id": actor }))
+        .bind(serde_json::json!({ "request_type": kind, "request_id": request, "level": level, "action": action, "actor_user_id": actor, "to_level_2": to_level_2 }))
         .execute(&mut ***tx)
         .await?;
     Ok(())

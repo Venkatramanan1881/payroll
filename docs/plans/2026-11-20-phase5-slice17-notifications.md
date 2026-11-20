@@ -43,6 +43,12 @@
 - **Concurrency:** rule changes are serialised per organisation before the If-Match check; registrations of one push token are serialised.
 - **Recipients:** only active user accounts receive NT-07 and NT-10.
 
+## Second review fixes
+- **Late relay wording:** the step event now carries whether a level-1 approval sent the request on to level 2, so a regularisation decided at both levels before the relay runs is never reported as finally approved.
+- **Given-up events:** an event failing a fifth time is logged as an error and counted (`gave_up`) in the run summary.
+- **Tests added:** leave filed on an employee's behalf notifies the employee (not the filer); another organisation cannot mark a notification read; the late-relay wording.
+- **Still untested:** NT-07 and NT-10 end to end, the per-event savepoint path (no safe way to make one event fail), one approver notice per batch, and the real `jobs_login` → `app_relay` grant (tests run as the database superuser).
+
 ## Waiting on approval (Gate 3)
 - An index `app.outbox (org_id, event_type, created_at) WHERE dispatched_at IS NULL` and a retention rule for event types no consumer marks yet (`DayResultChanged`, `Request*`, `PunchRecorded`, ...). Until then the relay walks the shared pending index, which grows with those events.
 

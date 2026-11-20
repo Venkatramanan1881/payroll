@@ -374,7 +374,7 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
     let two_levels = settings_on(tx, r.employee, date, master).await?.two_levels;
     let action = if approve { "approved" } else { "rejected" };
     db::audit(tx, p.user_id, &format!("regularisation.{}", if approve { "approve" } else { "reject" }), "regularisation_request", Some(id), Some(audit_step(action, level, note, on_behalf_of))).await?;
-    crate::approval::announce(tx, KIND, id, level, action, Some(p.user_id)).await?;
+    crate::approval::announce_level(tx, KIND, id, level, action, Some(p.user_id), approve && level == 1 && two_levels).await?;
     if approve && level == 1 && two_levels {
         // R4: manager approved; HR decides next (RG-05).
         let today = local_today(tx, master).await?;

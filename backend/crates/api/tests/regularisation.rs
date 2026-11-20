@@ -315,3 +315,23 @@ async fn regularisation_notifies(pool: PgPool) {
     let (_, mine) = common::as_user(&app, &w.token, "GET", "/v1/notifications/inbox", None, &[]).await;
     assert!(mine["items"][0]["body"].as_str().unwrap().contains("regularisation request was approved"), "{mine}");
 }
+
+/// A level-1 approval of a two-level regularisation reads as waiting for level 2, even when level 2 has already
+/// decided before the relay runs.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn regularisation_level_one_wording_survives_a_late_relay(pool: PgPool) {
+    let (s, app, w, boss) = setup(&pool, Some(json!({ "RG-05": "two" }))).await;
+    let d = yesterday();
+    let (_, r) = submit(&app, &w, json!({ "attendance_date": d, "request_type": "whole_day", "proposed_in_at": at(d, "03:30"), "proposed_out_at": at(d, "12:30"), "reason": "card forgotten" })).await;
+    let id = r["id"].as_str().unwrap();
+    assert_eq!(post(&app, &boss.token, &format!("/v1/attendance/regularisation-requests/{id}/approve"), None).await.0, StatusCode::OK);
+    let (st, b) = post(&app, &s.hr_token, &format!("/v1/attendance/regularisation-requests/{id}/reject"), Some(json!({ "reason": "no evidence" }))).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let mut tx = db::begin_org(&pool, s.org_id).await.unwrap();
+    domain_attendance::notify::dispatch(&mut tx, s.org_id).await.unwrap();
+    tx.commit().await.unwrap();
+    let (_, mine) = common::as_user(&app, &w.token, "GET", "/v1/notifications/inbox", None, &[]).await;
+    let bodies: Vec<&str> = mine["items"].as_array().unwrap().iter().filter_map(|i| i["body"].as_str()).collect();
+    assert!(bodies.iter().any(|b| b.contains("approved at level 1 and now waits for level 2")), "{bodies:?}");
+    assert!(!bodies.iter().any(|b| b.ends_with("request was approved.")), "never reported as finally approved: {bodies:?}");
+}
