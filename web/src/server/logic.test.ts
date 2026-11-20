@@ -66,11 +66,14 @@ describe("menus", () => {
     expect(buildMenu([{ operation_code: "WRK-08", grant_kind: "self" }], mods)).toEqual([]);
     expect(buildMenu([{ operation_code: "WRK-08", grant_kind: "all" }], [{ module_code: "C02", enabled: false }])).toEqual([]);
   });
-  it("sends self-only users to self-service", () => {
+  it("sends self-only users to self-service and managers to their inbox", () => {
     expect(landing([{ operation_code: "WRK-08", grant_kind: "self" }])).toBe("/me");
     expect(landing([{ operation_code: "WRK-01", grant_kind: "scoped" }])).toBe("/app");
-    expect(landing([{ operation_code: "LVE-03", grant_kind: "approve" }])).toBe("/me");
+    expect(landing([{ operation_code: "ATT-03", grant_kind: "approve" }])).toBe("/app"); // a manager reaches the inbox
     expect(buildMenu([{ operation_code: "WRK-08", grant_kind: "approve" }], mods)).toEqual([]);
+    const c06 = [{ module_code: "C06", enabled: true }];
+    expect(buildMenu([{ operation_code: "ATT-03", grant_kind: "approve" }], c06).map((i) => i.key)).toEqual(["approvals"]);
+    expect(buildMenu([{ operation_code: "ATT-01", grant_kind: "self" }], c06)).toEqual([]);
   });
 });
 

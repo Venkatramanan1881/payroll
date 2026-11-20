@@ -1,8 +1,12 @@
 import { api } from "./api";
 import type { Branch, ListEntry, Page } from "@/types/api";
 
-export type Option = { id: string; name: string };
-const opt = (x: { id: string; name: string; code?: string | null }): Option => ({ id: x.id, name: x.code ? `${x.name} (${x.code})` : x.name });
+export type Option = { id: string; name: string; tz?: string };
+const opt = (x: { id: string; name: string; code?: string | null; tz?: string }): Option => ({
+  id: x.id,
+  name: x.code ? `${x.name} (${x.code})` : x.name,
+  ...(x.tz ? { tz: x.tz } : {}),
+});
 
 // shortcut: the first 200 of each list; add search-as-you-type pickers when an organisation outgrows that.
 export async function lookups() {

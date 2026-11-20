@@ -82,6 +82,8 @@ async fn e13_missed_check_out_approved_by_the_manager(pool: PgPool) {
     let (st, r) = submit(&app, &w, json!({ "attendance_date": d, "request_type": "missed_punch", "proposed_out_at": at(d, "12:35"), "reason": "forgot to punch out" })).await;
     assert_eq!((st, r["state"].as_str()), (StatusCode::CREATED, Some("pending_l1")), "{r}");
     assert_eq!(r["approval_steps"][0]["action"], "submitted");
+    assert_eq!((r["employee_name"].as_str(), r["employee_code"].is_string()), (Some("Asha"), true), "names come with the request");
+    assert_eq!(r["schedule_tz"], "Asia/Kolkata", "the day's zone, for reading proposed times");
     let id = r["id"].as_str().unwrap().to_string();
 
     let (_, queue) = common::as_user(&app, &boss.token, "GET", "/v1/attendance/regularisation-requests/pending-approval", None, &[]).await;

@@ -7,6 +7,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 const FLAG_JSON: &str = "jsonb_build_object('id', f.id, 'punch_id', f.punch_id, 'employee_id', p.employee_id, 'reason', f.reason, 'state', f.state,
+    'employee_code', (SELECT e.employee_code FROM workforce.employee e WHERE e.id = p.employee_id),
+    'employee_name', (SELECT e.full_name FROM workforce.employee e WHERE e.id = p.employee_id),
+    -- The day whose current result uses this punch (an overnight punch belongs to the shift's day); null until worked out.
+    'attendance_date', (SELECT d.attendance_date FROM attendance.day_result_punch u JOIN attendance.attendance_day d ON d.current_result_id = u.result_id
+                        WHERE u.raw_punch_id = p.id LIMIT 1),
     'counts_before_decision', f.counts_before_decision, 'evidence', f.evidence, 'created_at', f.created_at,
     'decision', (SELECT jsonb_build_object('decision', d.decision, 'decided_by', d.decided_by, 'on_behalf_of_user_id', NULL,
         'reason', d.reason, 'decided_at', d.decided_at) FROM timecap.punch_flag_decision d WHERE d.flag_id = f.id ORDER BY d.decided_at DESC LIMIT 1))";

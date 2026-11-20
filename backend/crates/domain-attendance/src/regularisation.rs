@@ -485,6 +485,11 @@ pub async fn bulk_outage(tx: &mut OrgTx<'_>, p: &Principal, employees: &[Uuid], 
 }
 
 const REQUEST_JSON: &str = "jsonb_build_object('id', q.id, 'employee_id', q.employee_id, 'attendance_date', q.attendance_date,
+    'employee_code', (SELECT e.employee_code FROM workforce.employee e WHERE e.id = q.employee_id),
+    'employee_name', (SELECT e.full_name FROM workforce.employee e WHERE e.id = q.employee_id),
+    -- The zone the day was worked out in, so proposed times read as entered; null before any result.
+    'schedule_tz', (SELECT r.schedule_tz FROM attendance.attendance_day d JOIN attendance.day_result r ON r.id = d.current_result_id
+                    WHERE d.employee_id = q.employee_id AND d.attendance_date = q.attendance_date),
     'request_type', q.request_type, 'origin', q.origin, 'state', q.state, 'escalated', q.escalated,
     'proposed_in_at', q.proposed_in_at, 'proposed_out_at', q.proposed_out_at, 'target_raw_punch_id', q.target_raw_punch_id,
     'reason', q.reason, 'attachment', CASE WHEN q.attachment_path IS NOT NULL THEN jsonb_build_object('path', q.attachment_path) END,
