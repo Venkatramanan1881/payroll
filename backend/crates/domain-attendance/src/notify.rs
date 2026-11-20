@@ -150,6 +150,8 @@ async fn on_step(tx: &mut OrgTx<'_>, event: Uuid, p: &Value) -> Result<i64, Doma
     .fetch_optional(&mut ***tx)
     .await?;
     let Some((owner, approver, state, two_levels)) = row else { return Ok(0) };
+    // Regularisation keeps no approval_step rows: its event says whether level 1 sent it on.
+    let two_levels = two_levels || p["to_level_2"] == true;
     let link = json!({ "kind": kind, "id": id });
     let mut sent = 0;
     if let (Some(o), true) = (owner, action != "submitted") {
@@ -248,9 +250,18 @@ pub async fn dispatch(tx: &mut OrgTx<'_>, org: Uuid) -> Result<Value, DomainErro
     }
     sqlx::query("SET LOCAL ROLE app_relay").execute(&mut ***tx).await?;
     sqlx::query("UPDATE app.outbox SET dispatched_at = now(), attempts = attempts + 1 WHERE event_id = ANY($1)").bind(&done).execute(&mut ***tx).await?;
-    sqlx::query("UPDATE app.outbox SET attempts = attempts + 1 WHERE event_id = ANY($1)").bind(&failed).execute(&mut ***tx).await?;
+    let gave_up: Vec<Uuid> = sqlx::query_scalar::<_, Option<Uuid>>("UPDATE app.outbox SET attempts = attempts + 1 WHERE event_id = ANY($1) RETURNING CASE WHEN attempts >= 5 THEN event_id END")
+        .bind(&failed)
+        .fetch_all(&mut ***tx)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
     sqlx::query("SET LOCAL ROLE app_api").execute(&mut ***tx).await?;
-    Ok(json!({ "events": events.len(), "sent": sent, "failed": failed.len() }))
+    for e in &gave_up {
+        eprintln!("ERROR notification event {e} gave up after 5 attempts; it stays undispatched for a person to look at");
+    }
+    Ok(json!({ "events": events.len(), "sent": sent, "failed": failed.len(), "gave_up": gave_up.len() }))
 }
 
 /// NT-06: one daily digest per approver with requests waiting on them.
