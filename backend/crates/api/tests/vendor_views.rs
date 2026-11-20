@@ -69,6 +69,7 @@ async fn announcements_usage_and_health(pool: PgPool) {
     let (st, a) = common::as_user(&app, &ops, "POST", "/v1/vendor/announcements", Some(ask(json!([s.org_id]))), &key()).await;
     assert_eq!((st, a["organisation_ids"].clone()), (StatusCode::CREATED, json!([s.org_id])), "{a}");
     assert_eq!(common::as_user(&app, &ops, "POST", "/v1/vendor/announcements", Some(ask(json!([Uuid::new_v4()]))), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(common::as_user(&app, &ops, "POST", "/v1/vendor/announcements", Some(ask(json!([s.org_id, s.org_id]))), &key()).await.0, StatusCode::UNPROCESSABLE_ENTITY, "each once");
     assert_eq!(common::as_user(&app, &viewer, "POST", "/v1/vendor/announcements", Some(ask(json!([s.org_id]))), &key()).await.0, StatusCode::FORBIDDEN, "AC-V01-12.3");
     let (_, list) = common::as_user(&app, &viewer, "GET", "/v1/vendor/announcements", None, &[]).await;
     assert_eq!(list["items"].as_array().map(Vec::len), Some(1));
@@ -88,6 +89,11 @@ async fn announcements_usage_and_health(pool: PgPool) {
     let mine = row(&u);
     assert_eq!((mine["active_employees"].as_i64(), mine["branches"].as_i64(), mine["last_pay_run"].clone()), (Some(1), Some(1), Value::Null), "{mine}");
     assert!(!u.to_string().contains("Asha"), "no employee data");
+    // At its limit (1 of 1) an organisation counts as over: under block it already refuses hires.
+    sqlx::query("INSERT INTO platform.employee_limit (org_id, max_active, on_reach, valid, set_by) SELECT $1, 1, 'block', daterange('2026-01-01', NULL), id FROM platform.vendor_user LIMIT 1")
+        .bind(s.org_id).execute(&pool).await.unwrap();
+    let (_, over) = common::as_user(&app, &viewer, "GET", "/v1/vendor/usage?over_limit=true", None, &[]).await;
+    assert!(over["items"].as_array().unwrap().iter().any(|i| i["organisation_id"] == json!(s.org_id) && i["max_active"] == 1), "{over}");
     let (_, h) = common::as_user(&app, &viewer, "GET", "/v1/vendor/health?only_with_issues=false", None, &[]).await;
     assert_eq!(row(&h)["devices_total"], 0, "{h}");
     assert_eq!(common::as_user(&app, &s.hr_token, "GET", "/v1/vendor/usage", None, &[]).await.0, StatusCode::UNAUTHORIZED);

@@ -37,7 +37,7 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>, header
                     "comp-off-expiry" => domain_attendance::comp_off::expire_due(&mut tx).await,
                     "notifications-dispatch" => domain_attendance::notify::dispatch(&mut tx, *org).await,
                     "approvals-digest" => domain_attendance::notify::digest(&mut tx).await,
-                    "usage-refresh" => jobs::refresh_usage(&mut tx, *org).await,
+                    "usage-refresh" => jobs::refresh_usage(&mut tx).await,
                     _ => jobs::approval_timeouts(&mut tx).await,
                 };
                 match r {

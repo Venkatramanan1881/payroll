@@ -777,7 +777,7 @@ pub async fn update_template(tx: &mut OrgTx<'_>, vendor_user: Uuid, id: Uuid, na
     let before = get_template(tx, id).await?;
     sqlx::query(
         "UPDATE platform.sector_template SET name = coalesce($2, name), content = coalesce($3, content), version = version + 1,
-                updated_at = now(), updated_by = $4 WHERE id = $1",
+                updated_at = clock_timestamp(), updated_by = $4 WHERE id = $1",
     )
     .bind(id)
     .bind(name.map(str::trim))
@@ -812,8 +812,12 @@ pub async fn send_announcement(tx: &mut OrgTx<'_>, vendor_user: Uuid, title: &st
         return Err(invalid("title is 1-200 and body 1-5000 characters"));
     }
     let mut orgs = orgs.to_vec();
+    let given = orgs.len();
     orgs.sort();
     orgs.dedup();
+    if orgs.len() != given {
+        return Err(invalid("organisation_ids lists each organisation once"));
+    }
     if orgs.is_empty() || orgs.len() > 10_000 {
         return Err(invalid("organisation_ids lists 1-10000 organisations"));
     }
@@ -829,7 +833,7 @@ pub async fn send_announcement(tx: &mut OrgTx<'_>, vendor_user: Uuid, title: &st
         .await?;
     sqlx::query("INSERT INTO platform.announcement_target (announcement_id, org_id) SELECT $1, unnest($2::uuid[])").bind(id).bind(&orgs).execute(&mut ***tx).await?;
     let a = get_announcement(tx, id).await?;
-    audit_keyed(tx, vendor_user, None, "vendor.announcement_sent", "announcement", Some(id), json!({ "title": a["title"], "organisations": orgs.len() }), Some(key)).await?;
+    audit_keyed(tx, vendor_user, None, "vendor.announcement_sent", "announcement", Some(id), json!({ "title": a["title"], "organisation_ids": orgs }), Some(key)).await?;
     Ok(a)
 }
 
@@ -845,8 +849,9 @@ pub async fn usage(tx: &mut OrgTx<'_>, over_limit: Option<bool>) -> Result<Vec<V
                  'refreshed_at', coalesce(u.refreshed_at, o.created_at))
          FROM platform.organisation o
          LEFT JOIN platform.organisation_usage u ON u.org_id = o.id
-         LEFT JOIN LATERAL (SELECT e.max_active FROM platform.employee_limit e WHERE e.org_id = o.id AND e.valid @> current_date LIMIT 1) l ON true
-         WHERE $1::boolean IS NULL OR (l.max_active IS NOT NULL AND coalesce(u.active_employees, 0) > l.max_active) = $1
+         LEFT JOIN LATERAL (SELECT e.max_active FROM platform.employee_limit e
+                            WHERE e.org_id = o.id AND e.valid @> (now() AT TIME ZONE 'Asia/Kolkata')::date LIMIT 1) l ON true
+         WHERE $1::boolean IS NULL OR (l.max_active IS NOT NULL AND coalesce(u.active_employees, 0) >= l.max_active) = $1
          ORDER BY o.display_name LIMIT 1000",
     )
     .bind(over_limit)

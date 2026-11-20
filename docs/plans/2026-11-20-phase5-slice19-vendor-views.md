@@ -28,6 +28,16 @@
   - List (PLT-10): newest 200.
 - **Access:** organisation tokens get 401 on every vendor route; read-only vendor staff can view but not change.
 
+## Review fixes
+- **One meaning of "active":** J10 counts employees not exited, as the VC-01 limit check does (future joiners included), so the vendor sees the same count that blocks hiring.
+- **Least privilege for J10:** the summary row is written as `app_jobs` under its row policy (only the transaction's own organisation), not as the all-tenant vendor role; `jobs_login` becomes a member of `app_jobs` (`supabase_roles.sql`, to be re-run).
+- **Limit date:** the employee limit in force is looked up on the India date, as limits are written.
+- **Over the limit includes at it:** under `block` an organisation at its limit already refuses hires.
+- **Announcements:** a repeated organisation id is refused (422, uniqueItems); the audit keeps the chosen organisation ids.
+- **Template ETag:** `updated_at` uses the clock at the write, so it only moves forward.
+- **Query parameters:** usage and health take only their own filter.
+- **Tests:** duplicate ids refused; an organisation at its limit appears under `over_limit=true`.
+
 ## Not in this slice
 - **Open questions:**
   - Delivery of announcements to organisation users (OQ-V01-16).

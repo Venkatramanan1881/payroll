@@ -457,15 +457,20 @@ pub async fn my_support_grants(mut vu: Vendor, Query(q): Query<SupportQuery>) ->
 #[derive(Deserialize)]
 pub struct UsageQuery {
     over_limit: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct HealthQuery {
     only_with_issues: Option<bool>,
 }
 
+/// "Over the limit" includes "at it": under `block` an organisation at its limit already refuses hires.
 pub async fn usage(mut vu: Vendor, Query(q): Query<UsageQuery>) -> Result<Json<Value>, ApiError> {
     need(&vu.role, "PLT-10")?;
     Ok(Json(json!({ "items": v::usage(&mut vu.tx, q.over_limit).await?, "next_cursor": null })))
 }
 
-pub async fn health(mut vu: Vendor, Query(q): Query<UsageQuery>) -> Result<Json<Value>, ApiError> {
+pub async fn health(mut vu: Vendor, Query(q): Query<HealthQuery>) -> Result<Json<Value>, ApiError> {
     need(&vu.role, "PLT-10")?;
     Ok(Json(json!({ "items": v::health(&mut vu.tx, q.only_with_issues.unwrap_or(true)).await?, "next_cursor": null })))
 }
