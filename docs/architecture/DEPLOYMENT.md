@@ -119,6 +119,7 @@ Until the OIDC upgrade (§5), the job secret is the only gate: Cloud Run IAM wou
 | J6 comp-off expiry | `15 0 * * *` | `POST /internal/jobs/comp-off-expiry` |
 | Notifications relay | `*/5 * * * *` | `POST /internal/jobs/notifications-dispatch` |
 | NT-06 approvals digest | `0 9 * * *` | `POST /internal/jobs/approvals-digest` |
+| J10 usage refresh (vendor console) | `0 * * * *` | `POST /internal/jobs/usage-refresh` |
 | J7 period housekeeping | `30 0 * * *` | `POST /internal/jobs/period-housekeeping` |
 
 - Requests go to the `payroll-jobs` service and carry the job secret as `Authorization: Bearer $JOB_SECRET`.
@@ -127,7 +128,7 @@ Until the OIDC upgrade (§5), the job secret is the only gate: Cloud Run IAM wou
 - Both jobs are idempotent, so a retried or doubled run changes nothing more:
   - J1 writes nothing when inputs are unchanged;
   - J3 escalates once per level.
-- The other jobs in TSD §10 (J2, J4, J5, J8–J12) arrive with their slices.
+- The other jobs in TSD §10 (J2, J4, J5, J8, J9, J11, J12) arrive with their slices.
 - Planned upgrade: replace the shared secret with Cloud Scheduler OIDC tokens checked for the service's audience.
 
 ## 6. Release checklist

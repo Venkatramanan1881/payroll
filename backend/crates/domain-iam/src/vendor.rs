@@ -718,6 +718,157 @@ pub async fn deactivate_vendor_user(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, r
     Ok(u)
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Sector templates (VC-R7, PLT-07 / PLT-10)
+
+const TEMPLATE_JSON: &str = "jsonb_build_object('id', t.id, 'code', t.code, 'name', t.name, 'version', t.version, 'updated_at', t.updated_at)";
+
+pub async fn list_templates(tx: &mut OrgTx<'_>) -> Result<Vec<Value>, DomainError> {
+    Ok(sqlx::query_scalar(&format!("SELECT {TEMPLATE_JSON} FROM platform.sector_template t ORDER BY t.code")).fetch_all(&mut ***tx).await?)
+}
+
+/// A template with its content and the organisations created from it (AC-V01-10.3).
+pub async fn get_template(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainError> {
+    sqlx::query_scalar(&format!(
+        "SELECT {TEMPLATE_JSON} || jsonb_build_object('content', t.content, 'organisations', coalesce((
+            SELECT jsonb_agg(jsonb_build_object('organisation_id', o.id, 'display_name', o.display_name) ORDER BY o.display_name)
+            FROM platform.organisation o WHERE o.sector_template_id = t.id), '[]'))
+         FROM platform.sector_template t WHERE t.id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut ***tx)
+    .await?
+    .ok_or(DomainError::NotFound)
+}
+
+fn check_template(code: Option<&str>, name: Option<&str>, content: Option<&Value>) -> Result<(), DomainError> {
+    if code.is_some_and(|c| c.trim().is_empty() || c.chars().count() > 40) || name.is_some_and(|n| n.trim().is_empty() || n.chars().count() > 120) {
+        return Err(invalid("code is 1-40 and name 1-120 characters"));
+    }
+    if content.is_some_and(|c| !c.is_object()) {
+        return Err(invalid("content is an object"));
+    }
+    Ok(())
+}
+
+/// VC-R7: a new template (version 1). Whether templates beyond G6's four may exist is OQ-V01-10; the route is open.
+pub async fn create_template(tx: &mut OrgTx<'_>, vendor_user: Uuid, code: &str, name: &str, content: &Value, key: Uuid) -> Result<Value, DomainError> {
+    check_template(Some(code), Some(name), Some(content))?;
+    let id: Uuid = sqlx::query_scalar("INSERT INTO platform.sector_template (code, name, content, created_by, updated_by) VALUES ($1, $2, $3, $4, $4) RETURNING id")
+        .bind(code.trim())
+        .bind(name.trim())
+        .bind(content)
+        .bind(vendor_user)
+        .fetch_one(&mut ***tx)
+        .await
+        .map_err(conflict("the template code"))?;
+    let t = get_template(tx, id).await?;
+    audit_keyed(tx, vendor_user, None, "vendor.sector_template_created", "sector_template", Some(id), t.clone(), Some(key)).await?;
+    Ok(t)
+}
+
+/// AC-V01-10.2: who, when, old and new values; `version` increments. Organisations made from it are not changed
+/// (OQ-V01-10).
+pub async fn update_template(tx: &mut OrgTx<'_>, vendor_user: Uuid, id: Uuid, name: Option<&str>, content: Option<&Value>) -> Result<Value, DomainError> {
+    if name.is_none() && content.is_none() {
+        return Err(invalid("give name or content"));
+    }
+    check_template(None, name, content)?;
+    let before = get_template(tx, id).await?;
+    sqlx::query(
+        "UPDATE platform.sector_template SET name = coalesce($2, name), content = coalesce($3, content), version = version + 1,
+                updated_at = now(), updated_by = $4 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(name.map(str::trim))
+    .bind(content)
+    .bind(vendor_user)
+    .execute(&mut ***tx)
+    .await?;
+    let after = get_template(tx, id).await?;
+    audit(tx, vendor_user, None, "vendor.sector_template_changed", "sector_template", Some(id), json!({ "before": before, "after": after })).await?;
+    Ok(after)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Announcements (VC-R9, PLT-11 / PLT-10)
+
+const ANNOUNCEMENT_JSON: &str = "jsonb_build_object('id', a.id, 'title', a.title, 'body', a.body, 'created_by', a.created_by, 'created_at', a.created_at,
+    'organisation_ids', coalesce((SELECT jsonb_agg(t.org_id ORDER BY t.org_id) FROM platform.announcement_target t WHERE t.announcement_id = a.id), '[]'))";
+
+// shortcut: the newest 200; add the cursor when the vendor sends more.
+pub async fn list_announcements(tx: &mut OrgTx<'_>) -> Result<Vec<Value>, DomainError> {
+    Ok(sqlx::query_scalar(&format!("SELECT {ANNOUNCEMENT_JSON} FROM platform.announcement a ORDER BY a.created_at DESC LIMIT 200")).fetch_all(&mut ***tx).await?)
+}
+
+pub async fn get_announcement(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainError> {
+    sqlx::query_scalar(&format!("SELECT {ANNOUNCEMENT_JSON} FROM platform.announcement a WHERE a.id = $1")).bind(id).fetch_optional(&mut ***tx).await?.ok_or(DomainError::NotFound)
+}
+
+/// VC-R9: stored for the chosen organisations only. Who receives it inside each and through which channel is
+/// OQ-V01-16, so no organisation user is notified yet.
+pub async fn send_announcement(tx: &mut OrgTx<'_>, vendor_user: Uuid, title: &str, body: &str, orgs: &[Uuid], key: Uuid) -> Result<Value, DomainError> {
+    if title.trim().is_empty() || title.chars().count() > 200 || body.trim().is_empty() || body.chars().count() > 5000 {
+        return Err(invalid("title is 1-200 and body 1-5000 characters"));
+    }
+    let mut orgs = orgs.to_vec();
+    orgs.sort();
+    orgs.dedup();
+    if orgs.is_empty() || orgs.len() > 10_000 {
+        return Err(invalid("organisation_ids lists 1-10000 organisations"));
+    }
+    let known: i64 = sqlx::query_scalar("SELECT count(*) FROM platform.organisation WHERE id = ANY($1)").bind(&orgs).fetch_one(&mut ***tx).await?;
+    if known != orgs.len() as i64 {
+        return Err(invalid("organisation_ids names an organisation that does not exist"));
+    }
+    let id: Uuid = sqlx::query_scalar("INSERT INTO platform.announcement (title, body, created_by) VALUES ($1, $2, $3) RETURNING id")
+        .bind(title.trim())
+        .bind(body.trim())
+        .bind(vendor_user)
+        .fetch_one(&mut ***tx)
+        .await?;
+    sqlx::query("INSERT INTO platform.announcement_target (announcement_id, org_id) SELECT $1, unnest($2::uuid[])").bind(id).bind(&orgs).execute(&mut ***tx).await?;
+    let a = get_announcement(tx, id).await?;
+    audit_keyed(tx, vendor_user, None, "vendor.announcement_sent", "announcement", Some(id), json!({ "title": a["title"], "organisations": orgs.len() }), Some(key)).await?;
+    Ok(a)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Usage and health (VC-R3, VC-R8) from the platform summary only, never client tables (P12, AC-V01-06.3)
+
+// shortcut: one page of up to 1000 organisations; add the cursor past that.
+pub async fn usage(tx: &mut OrgTx<'_>, over_limit: Option<bool>) -> Result<Vec<Value>, DomainError> {
+    Ok(sqlx::query_scalar(
+        "SELECT jsonb_build_object('organisation_id', o.id, 'display_name', o.display_name, 'active_employees', coalesce(u.active_employees, 0),
+                 'max_active', l.max_active, 'branches', coalesce(u.branches, 0), 'devices_online', coalesce(u.devices_online, 0),
+                 'devices_total', coalesce(u.devices_total, 0), 'last_sign_in_at', u.last_sign_in_at, 'last_pay_run', null,
+                 'refreshed_at', coalesce(u.refreshed_at, o.created_at))
+         FROM platform.organisation o
+         LEFT JOIN platform.organisation_usage u ON u.org_id = o.id
+         LEFT JOIN LATERAL (SELECT e.max_active FROM platform.employee_limit e WHERE e.org_id = o.id AND e.valid @> current_date LIMIT 1) l ON true
+         WHERE $1::boolean IS NULL OR (l.max_active IS NOT NULL AND coalesce(u.active_employees, 0) > l.max_active) = $1
+         ORDER BY o.display_name LIMIT 1000",
+    )
+    .bind(over_limit)
+    .fetch_all(&mut ***tx)
+    .await?)
+}
+
+/// VC-R8. Device sync failures and failed jobs have no platform summary source yet (OQ-V01-15, TB-03): empty lists.
+pub async fn health(tx: &mut OrgTx<'_>, only_with_issues: bool) -> Result<Vec<Value>, DomainError> {
+    Ok(sqlx::query_scalar(
+        "SELECT jsonb_build_object('organisation_id', o.id, 'display_name', o.display_name, 'devices_online', coalesce(u.devices_online, 0),
+                 'devices_total', coalesce(u.devices_total, 0), 'device_sync_failures', '[]'::jsonb, 'periods_awaiting_lock', coalesce(u.periods_awaiting_lock, 0),
+                 'failed_jobs', '[]'::jsonb, 'failed_pay_runs', null, 'refreshed_at', coalesce(u.refreshed_at, o.created_at))
+         FROM platform.organisation o LEFT JOIN platform.organisation_usage u ON u.org_id = o.id
+         WHERE NOT $1 OR coalesce(u.devices_online, 0) < coalesce(u.devices_total, 0) OR coalesce(u.periods_awaiting_lock, 0) > 0
+         ORDER BY o.display_name LIMIT 1000",
+    )
+    .bind(only_with_issues)
+    .fetch_all(&mut ***tx)
+    .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -450,3 +450,98 @@ pub async fn my_support_grants(mut vu: Vendor, Query(q): Query<SupportQuery>) ->
     need(&vu.role, "PLT-13")?;
     Ok(Json(json!({ "items": domain_iam::support::list_for_vendor(&mut vu.tx, vu.id, q.state.as_deref(), q.organisation_id).await?, "next_cursor": null })))
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Usage and health (PLT-10): the platform summary refreshed by J10, never client tables
+
+#[derive(Deserialize)]
+pub struct UsageQuery {
+    over_limit: Option<bool>,
+    only_with_issues: Option<bool>,
+}
+
+pub async fn usage(mut vu: Vendor, Query(q): Query<UsageQuery>) -> Result<Json<Value>, ApiError> {
+    need(&vu.role, "PLT-10")?;
+    Ok(Json(json!({ "items": v::usage(&mut vu.tx, q.over_limit).await?, "next_cursor": null })))
+}
+
+pub async fn health(mut vu: Vendor, Query(q): Query<UsageQuery>) -> Result<Json<Value>, ApiError> {
+    need(&vu.role, "PLT-10")?;
+    Ok(Json(json!({ "items": v::health(&mut vu.tx, q.only_with_issues.unwrap_or(true)).await?, "next_cursor": null })))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Sector templates (PLT-10 read, PLT-07 change)
+
+pub async fn list_templates(mut vu: Vendor) -> Result<Json<Value>, ApiError> {
+    need(&vu.role, "PLT-10")?;
+    Ok(Json(json!({ "items": v::list_templates(&mut vu.tx).await? })))
+}
+
+pub async fn get_template(mut vu: Vendor, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
+    need(&vu.role, "PLT-10")?;
+    Ok(reply(StatusCode::OK, v::get_template(&mut vu.tx, id).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateIn {
+    code: Option<String>,
+    name: Option<String>,
+    content: Option<Value>,
+}
+
+pub async fn create_template(mut vu: Vendor, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    need(&vu.role, "PLT-07")?;
+    let (key, replay) = keyed(&mut vu, &headers, "vendor.sector_template_created").await?;
+    if let Some(id) = replay {
+        let body = v::get_template(&mut vu.tx, id).await?;
+        return done(vu.tx, StatusCode::CREATED, body).await;
+    }
+    let t: TemplateIn = parse(&raw)?;
+    let (Some(code), Some(name), Some(content)) = (t.code, t.name, t.content) else {
+        return Err(ApiError::ValidationFailed("code, name and content are required".into()));
+    };
+    let body = v::create_template(&mut vu.tx, vu.id, &code, &name, &content, key).await?;
+    done(vu.tx, StatusCode::CREATED, body).await
+}
+
+pub async fn update_template(mut vu: Vendor, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    need(&vu.role, "PLT-07")?;
+    let t: TemplateIn = parse(&raw)?;
+    if t.code.is_some() {
+        return Err(ApiError::ValidationFailed("a template's code does not change".into()));
+    }
+    sqlx::query("SELECT 1 FROM platform.sector_template WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **vu.tx).await?;
+    if_match(&headers, &v::get_template(&mut vu.tx, id).await?)?;
+    let body = v::update_template(&mut vu.tx, vu.id, id, t.name.as_deref(), t.content.as_ref()).await?;
+    done(vu.tx, StatusCode::OK, body).await
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Announcements (PLT-10 read, PLT-11 send)
+
+pub async fn list_announcements(mut vu: Vendor) -> Result<Json<Value>, ApiError> {
+    need(&vu.role, "PLT-10")?;
+    Ok(Json(json!({ "items": v::list_announcements(&mut vu.tx).await?, "next_cursor": null })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnnouncementIn {
+    title: String,
+    body: String,
+    organisation_ids: Vec<Uuid>,
+}
+
+pub async fn send_announcement(mut vu: Vendor, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    need(&vu.role, "PLT-11")?;
+    let (key, replay) = keyed(&mut vu, &headers, "vendor.announcement_sent").await?;
+    if let Some(id) = replay {
+        let body = v::get_announcement(&mut vu.tx, id).await?;
+        return done(vu.tx, StatusCode::CREATED, body).await;
+    }
+    let a: AnnouncementIn = parse(&raw)?;
+    let body = v::send_announcement(&mut vu.tx, vu.id, &a.title, &a.body, &a.organisation_ids, key).await?;
+    done(vu.tx, StatusCode::CREATED, body).await
+}

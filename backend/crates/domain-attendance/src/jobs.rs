@@ -340,3 +340,38 @@ async fn event(tx: &mut OrgTx<'_>, kind: &str, request_type: &str, id: Uuid, emp
         .await?;
     Ok(())
 }
+
+/// J10: the organisation's usage summary for the vendor console (VC-R3, VC-R8), counted as the organisation and written
+/// as the vendor role, so the vendor views never read client tables (P12).
+pub async fn refresh_usage(tx: &mut OrgTx<'_>, org: Uuid) -> Result<Value, DomainError> {
+    let today = crate::period::org_today(tx).await?;
+    let row: (i64, i64, i64, i64, Option<chrono::DateTime<Utc>>, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM workforce.employee WHERE employment_status <> 'exited' AND joining_date <= $1),
+                (SELECT count(*) FROM org.branch),
+                (SELECT count(*) FROM timecap.device WHERE retired_at IS NULL AND online_state = 'online'),
+                (SELECT count(*) FROM timecap.device WHERE retired_at IS NULL),
+                (SELECT max(created_at) FROM iam.session),
+                (SELECT count(*) FROM period.attendance_period WHERE state IN ('awaiting_lock','unlocked'))",
+    )
+    .bind(today)
+    .fetch_one(&mut ***tx)
+    .await?;
+    sqlx::query("SET LOCAL ROLE app_vendor").execute(&mut ***tx).await?;
+    sqlx::query(
+        "INSERT INTO platform.organisation_usage (org_id, active_employees, branches, devices_online, devices_total, last_sign_in_at, periods_awaiting_lock, refreshed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+         ON CONFLICT (org_id) DO UPDATE SET active_employees = EXCLUDED.active_employees, branches = EXCLUDED.branches, devices_online = EXCLUDED.devices_online,
+           devices_total = EXCLUDED.devices_total, last_sign_in_at = EXCLUDED.last_sign_in_at, periods_awaiting_lock = EXCLUDED.periods_awaiting_lock, refreshed_at = now()",
+    )
+    .bind(org)
+    .bind(row.0 as i32)
+    .bind(row.1 as i32)
+    .bind(row.2 as i32)
+    .bind(row.3 as i32)
+    .bind(row.4)
+    .bind(row.5 as i32)
+    .execute(&mut ***tx)
+    .await?;
+    sqlx::query("SET LOCAL ROLE app_api").execute(&mut ***tx).await?;
+    Ok(json!({ "active_employees": row.0, "devices_total": row.3 }))
+}

@@ -13,7 +13,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// POST /internal/jobs/{name}: nightly-recalculation (J1), approval-timeouts (J3), comp-off-expiry (J6), period-housekeeping (J7), notifications-dispatch (relay) or approvals-digest (NT-06), for every active organisation.
+/// POST /internal/jobs/{name}: nightly-recalculation (J1), approval-timeouts (J3), comp-off-expiry (J6), period-housekeeping (J7), notifications-dispatch (relay), approvals-digest (NT-06) or usage-refresh (J10), for every active organisation.
 /// One organisation's failure is reported and the others still run.
 // shortcut: a shared secret from Secret Manager; switch to Cloud Scheduler OIDC tokens (audience check) when the deployment adds it.
 pub async fn run(State(state): State<AppState>, Path(name): Path<String>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
@@ -22,7 +22,7 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>, header
     if !same(sent.as_bytes(), secret) {
         return Err(ApiError::Unauthenticated);
     }
-    if !["nightly-recalculation", "approval-timeouts", "comp-off-expiry", "period-housekeeping", "notifications-dispatch", "approvals-digest"].contains(&name.as_str()) {
+    if !["nightly-recalculation", "approval-timeouts", "comp-off-expiry", "period-housekeeping", "notifications-dispatch", "approvals-digest", "usage-refresh"].contains(&name.as_str()) {
         return Err(ApiError::NotFound);
     }
     let orgs = jobs::active_organisations(&state.pool).await?;
@@ -37,6 +37,7 @@ pub async fn run(State(state): State<AppState>, Path(name): Path<String>, header
                     "comp-off-expiry" => domain_attendance::comp_off::expire_due(&mut tx).await,
                     "notifications-dispatch" => domain_attendance::notify::dispatch(&mut tx, *org).await,
                     "approvals-digest" => domain_attendance::notify::digest(&mut tx).await,
+                    "usage-refresh" => jobs::refresh_usage(&mut tx, *org).await,
                     _ => jobs::approval_timeouts(&mut tx).await,
                 };
                 match r {
