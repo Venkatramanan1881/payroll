@@ -51,6 +51,7 @@ impl ApiError {
             ApiError::IdempotencyConflict => (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT", "Idempotency-Key reused with a different body"),
             ApiError::EmployeeLimitReached => (StatusCode::CONFLICT, "EMPLOYEE_LIMIT_REACHED", "Employee limit reached"),
             ApiError::PunchRefused(..) => (StatusCode::UNPROCESSABLE_ENTITY, "PUNCH_REFUSED", "Punch refused"),
+            ApiError::Refused("FILE_TYPE_NOT_ALLOWED", _) => (StatusCode::UNPROCESSABLE_ENTITY, "FILE_TYPE_NOT_ALLOWED", "File type or size not allowed"),
             ApiError::Refused(code, _) | ApiError::RefusedWith(code, ..) => (StatusCode::CONFLICT, *code, "Not allowed by the organisation's rules"),
             ApiError::SelfApprovalForbidden => (StatusCode::FORBIDDEN, "SELF_APPROVAL_FORBIDDEN", "You cannot decide your own request"),
             ApiError::SecondFactorRequired(..) => (StatusCode::UNAUTHORIZED, "SECOND_FACTOR_REQUIRED", "Enter the code from your authenticator app"),
