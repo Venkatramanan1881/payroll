@@ -13,6 +13,7 @@ pub mod comp_off;
 pub mod counters;
 pub mod jobs;
 pub mod leave;
+pub mod notify;
 pub mod onduty;
 pub mod openbal;
 pub mod period;

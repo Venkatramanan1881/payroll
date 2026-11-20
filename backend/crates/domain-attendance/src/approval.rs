@@ -111,6 +111,13 @@ pub async fn step(tx: &mut OrgTx<'_>, s: Step<'_>) -> Result<(), DomainError> {
     .bind(s.comment)
     .execute(&mut ***tx)
     .await?;
+    // NT-05: every step of every request type reaches the notification relay through one event.
+    sqlx::query("INSERT INTO app.outbox (org_id, event_type, aggregate_id, payload) VALUES (app.current_org(), 'ApprovalStep', $1, $2)")
+        .bind(s.request_id)
+        .bind(serde_json::json!({ "request_type": s.kind, "request_id": s.request_id, "level": s.level, "action": s.action,
+                                  "requester_user_id": s.requester, "actor_user_id": s.actor }))
+        .execute(&mut ***tx)
+        .await?;
     Ok(())
 }
 

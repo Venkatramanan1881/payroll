@@ -9,7 +9,8 @@
 --   organisation) and app_api (it seeds a new organisation's roles and first admin under that organisation).
 -- jobs_login: what the timed-jobs service connects as. Also a member of app_vendor, which lists active
 --   organisations before the jobs work per organisation as app_api. app_vendor reads every tenant's platform rows,
---   so the internet-facing role is deliberately NOT a member of it.
+--   so the internet-facing role is deliberately NOT a member of it. Also a member of app_relay, the only role that
+--   reads and marks the outbox (notifications-dispatch, ADR-002).
 
 \set ON_ERROR_STOP 1
 BEGIN;
@@ -34,6 +35,7 @@ GRANT app_api    TO api_login  WITH INHERIT FALSE, SET TRUE;
 REVOKE app_vendor FROM api_login;  -- an earlier version of this script granted it
 GRANT app_api    TO jobs_login WITH INHERIT FALSE, SET TRUE;
 GRANT app_vendor TO jobs_login WITH INHERIT FALSE, SET TRUE;
+GRANT app_relay  TO jobs_login WITH INHERIT FALSE, SET TRUE;
 GRANT app_api    TO vendor_login WITH INHERIT FALSE, SET TRUE;
 GRANT app_vendor TO vendor_login WITH INHERIT FALSE, SET TRUE;
 

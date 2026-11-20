@@ -117,6 +117,8 @@ Until the OIDC upgrade (§5), the job secret is the only gate: Cloud Run IAM wou
 | J1 nightly recalculation | `0 3 * * *` | `POST /internal/jobs/nightly-recalculation` |
 | J3 approval timeouts | `0 * * * *` | `POST /internal/jobs/approval-timeouts` |
 | J6 comp-off expiry | `15 0 * * *` | `POST /internal/jobs/comp-off-expiry` |
+| Notifications relay | `*/5 * * * *` | `POST /internal/jobs/notifications-dispatch` |
+| NT-06 approvals digest | `0 9 * * *` | `POST /internal/jobs/approvals-digest` |
 | J7 period housekeeping | `30 0 * * *` | `POST /internal/jobs/period-housekeeping` |
 
 - Requests go to the `payroll-jobs` service and carry the job secret as `Authorization: Bearer $JOB_SECRET`.
