@@ -51,6 +51,7 @@ Answers given by the project owner in session. Each decision closes the listed q
 | D-39 | 2026-11-20 | Report file formats | **xlsx (default) and CSV**, xlsx through the `rust_xlsxwriter` library. | — | — |
 | D-40 | 2026-11-20 | Slice 18 scope | **Split:** 18 = report runs (R1–R10, R13, R25–R27), job polling and the audit views; 18b = dashboards and upload links; 19 = remaining vendor views. | — | — |
 | D-41 | 2026-11-20 | Dashboard defaults (OQ-C16-01, -02, -06) and spreadsheet upload size | **Assumed, open for the owner to change:** before a DB-01 choice a role sees every widget offered to it; a user with several roles lands on the broadest built-in one (`role` picks another); the Auditor and custom roles get an empty dashboard; spreadsheet uploads (opening balances, imports) up to 10 MB (DC-06 covers documents: PDF and images, 5 MB). | — (OQ-C16-01, -02, -06 stay open) | — |
+| D-42 | 2026-11-20 | Web app foundations (Phase 6) | **Tokens in httpOnly cookies behind thin Next.js route handlers (BFF, no business rules); shadcn/ui on Tailwind; English first with every string in translation files (Tamil, Hindi later); web slice 1 = shell, sign-in, menus, employees.** | — | docs/plans/2026-11-20-phase6-web-slice1-shell-signin-employees.md |
 
 ## Answered but not yet closed (need a follow-up answer)
 
