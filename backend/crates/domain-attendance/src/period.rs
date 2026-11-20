@@ -495,6 +495,7 @@ async fn compute(tx: &mut OrgTx<'_>, period: Uuid, from: NaiveDate, to: NaiveDat
     let is_pending = |e: Uuid, d: NaiveDate| pending != Pending::Leave && pending_days.contains(&(e.to_string(), d.to_string()));
 
     let mut out = Vec::with_capacity(emps.len());
+    let mut cache = crate::counters::SettingsCache::new();
     for (emp, _code, start, end) in emps {
         let mut lines: BTreeMap<&str, (i64, Vec<String>)> = BTreeMap::new();
         let (mut late, mut early) = (0i64, 0i64);
@@ -535,7 +536,7 @@ async fn compute(tx: &mut OrgTx<'_>, period: Uuid, from: NaiveDate, to: NaiveDat
             }
         }
         // BR-10: period-end penalties; only loss of pay is a deduction line (a leave recovery is a leave debit).
-        for p in crate::counters::penalties(tx, emp, start, end, record.map(|(run, actor)| (period, run, actor))).await? {
+        for p in crate::counters::penalties(tx, emp, Some(period), start, end, record, &mut cache).await? {
             if p.lop {
                 let line = lines.entry("late_early_penalty").or_default();
                 line.0 += p.days_pct;

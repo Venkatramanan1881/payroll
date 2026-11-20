@@ -24,6 +24,9 @@ impl Default for PenaltyRule {
     }
 }
 
+/// The LA / EC keys this module owns (a stored document refused here never costs the day settings).
+pub const KEYS: [&str; 16] = ["LA-06", "LA-07", "LA-08", "LA-09", "LA-10", "LA-11", "LA-12", "LA-18", "EC-05", "EC-06", "EC-07", "EC-08", "EC-09", "EC-10", "EC-11", "EC-17"];
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Penalties {
     pub late: PenaltyRule,
@@ -101,6 +104,7 @@ impl PenaltyRule {
         let counted = if self.count_on && marks > self.free { (marks - self.free) / self.every.max(1) } else { 0 };
         let count_days = counted * self.size_pct;
         let excess = if self.minutes_on { (minutes - self.threshold).max(0) } else { 0 };
+        // shortcut: excess minutes convert to days rounded down and part blocks count as nothing, until OQ-C06-25 says otherwise.
         let (minute_days, minute_mins) = match self.per_block {
             _ if excess == 0 => (0, None),
             None => (excess * 100 / day_min.max(1), Some(excess)),

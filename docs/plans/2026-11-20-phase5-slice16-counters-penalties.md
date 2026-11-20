@@ -44,6 +44,16 @@
   - Permission used: whole count with `permission_type_id`. It is posted as an `opening` usage entry in the limit period of its date, and a change reverses and reposts it.
   - Comp-off openings stay refused (OQ-C15-02).
 
+## Review fixes
+- **BR-04 across day and period:** late or early minutes of a day already cut by a slab or an hours shortfall never feed the period minutes penalty.
+- **Re-lock view:** GET counters shows only the penalties recorded by the latest lock (not an older run).
+- **Stored documents:** a penalty key refused since it was stored drops only that group's penalties, never the day settings (grace, slabs).
+- **Recovery balance:** read as at the period end; at lock the leave account is locked first; while a period is unlocked, the preview ignores its own earlier, not yet reversed penalty debits.
+- **Employed part:** GET counters uses the employee's employed part of the period, as the totals and the lock do.
+- **Bounds:** a penalty never exceeds the days employed in the period; opening counters and opening permission use are 0-366.
+- **Cost:** settings are loaded once per policy version per lock or preview.
+- **Rounding:** excess minutes convert to days rounded down and part blocks count as nothing (shortcut until OQ-C06-25).
+
 ## Not in this slice
 - **Recovery and reset options:** permission-balance recovery and fixed amounts or fines (money, V2); combined counters (EC-10); other reset periods.
 - **Not built yet:**
@@ -52,6 +62,8 @@
   - LA-19 escalation alerts (slice 17 notifications).
   - Absence cuts LM-25 / LM-26, and their order against penalties (OQ-X-05).
 - **Approximations:**
+  - An opening permission count uses only the count limit (not minutes).
+  - A few queries per employee remain at lock (policy, counters, recovery).
   - A penalty is taken whole from one leave type, never split across two.
   - The minutes-to-days conversion uses one day length, not each day's required minutes.
   - Preview penalties have no id (`provisional: true`).

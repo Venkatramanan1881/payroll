@@ -108,9 +108,11 @@ pub struct EntryIn {
     pub as_of: NaiveDate,
 }
 
-/// A whole, non-negative value such as "3" or "3.00".
+/// A whole value from 0 to 366, such as "3" or "3.00" (more marks or permissions than days in a year is a typo).
 fn whole(v: &str) -> bool {
-    !v.starts_with('-') && v.split_once('.').is_none_or(|(_, f)| f.chars().all(|c| c == '0'))
+    !v.starts_with('-')
+        && v.split_once('.').is_none_or(|(_, f)| f.chars().all(|c| c == '0'))
+        && v.split('.').next().and_then(|n| n.parse::<i64>().ok()).is_some_and(|n| n <= 366)
 }
 
 fn value_ok(v: &str) -> bool {
@@ -135,7 +137,7 @@ async fn check_entry(tx: &mut OrgTx<'_>, e: &EntryIn) -> Result<Option<String>, 
         }
         // D-33: counters and permission use are whole numbers (marks / permissions taken), never negative.
         ("late_counter" | "early_counter", None, None) | ("permission_used", None, Some(_)) if !whole(&e.value) => {
-            return Ok(Some(format!("{} is a whole number of 0 or more, e.g. 3.00", e.kind)))
+            return Ok(Some(format!("{} is a whole number from 0 to 366, e.g. 3.00", e.kind)))
         }
         ("late_counter" | "early_counter", None, None) => {}
         ("permission_used", None, Some(t)) => {

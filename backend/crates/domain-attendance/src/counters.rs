@@ -39,10 +39,13 @@ pub async fn period_of(tx: &mut OrgTx<'_>, date: NaiveDate) -> Result<(Option<Uu
 }
 
 /// Marks and minutes from the current day results in [from, to], plus confirmed opening counters dated in it
-/// (D-33: an opening counter is a number of marks).
+/// (D-33: an opening counter is a number of marks). Minutes of a day a slab or an hours shortfall already cut are left out (BR-04: one
+/// shortfall, one effect).
 pub async fn counter(tx: &mut OrgTx<'_>, employee: Uuid, from: NaiveDate, to: NaiveDate) -> Result<Counter, DomainError> {
     let (lm, em, lmin, emin): (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE r.late_mark), count(*) FILTER (WHERE r.early_mark), coalesce(sum(r.late_minutes), 0)::int8, coalesce(sum(r.early_minutes), 0)::int8
+        "SELECT count(*) FILTER (WHERE r.late_mark), count(*) FILTER (WHERE r.early_mark),
+                coalesce(sum(r.late_minutes) FILTER (WHERE NOT EXISTS (SELECT 1 FROM attendance.day_effect x WHERE x.result_id = r.id AND x.effect_kind IN ('late_slab', 'hours_shortfall'))), 0)::int8,
+                coalesce(sum(r.early_minutes) FILTER (WHERE NOT EXISTS (SELECT 1 FROM attendance.day_effect x WHERE x.result_id = r.id AND x.effect_kind IN ('early_slab', 'hours_shortfall'))), 0)::int8
          FROM attendance.attendance_day d JOIN attendance.day_result r ON r.id = d.current_result_id
          WHERE d.employee_id = $1 AND d.attendance_date BETWEEN $2 AND $3",
     )
@@ -83,19 +86,26 @@ impl Penalty {
     }
 }
 
-async fn leave_balance_pct(tx: &mut OrgTx<'_>, employee: Uuid, leave_type: Uuid) -> Result<i64, DomainError> {
+/// Balance on `on`, leaving out this period's own earlier penalty debits not yet reversed (they are reversed before
+/// a re-lock records anew).
+async fn leave_balance_pct(tx: &mut OrgTx<'_>, employee: Uuid, leave_type: Uuid, on: NaiveDate, period: Option<Uuid>) -> Result<i64, DomainError> {
     Ok(sqlx::query_scalar(
         "SELECT coalesce((sum(e.quantity) * 100)::int8, 0) FROM leave.leave_ledger_entry e JOIN leave.leave_account a ON a.id = e.account_id
-         WHERE a.employee_id = $1 AND a.leave_type_id = $2",
+         WHERE a.employee_id = $1 AND a.leave_type_id = $2 AND e.entry_date <= $3
+           AND NOT (e.entry_kind = 'penalty_debit' AND e.cause_id IN (SELECT id FROM attendance.period_penalty WHERE period_id = $4)
+                    AND NOT EXISTS (SELECT 1 FROM leave.leave_ledger_entry r WHERE r.reverses_entry_id = e.id))",
     )
     .bind(employee)
     .bind(leave_type)
+    .bind(on)
+    .bind(period)
     .fetch_one(&mut ***tx)
     .await?)
 }
 
 /// LA-12 / EC-11: the first listed leave type (paid, not comp-off) with enough balance, else loss of pay or report only.
-async fn recover(tx: &mut OrgTx<'_>, employee: Uuid, rule: &PenaltyRule, days: i64, on: NaiveDate, used: &mut HashMap<Uuid, i64>) -> Result<(String, Option<Uuid>, bool), DomainError> {
+#[allow(clippy::too_many_arguments)]
+async fn recover(tx: &mut OrgTx<'_>, employee: Uuid, rule: &PenaltyRule, days: i64, on: NaiveDate, period: Option<Uuid>, recording: bool, used: &mut HashMap<Uuid, i64>) -> Result<(String, Option<Uuid>, bool), DomainError> {
     for code in &rule.recovery {
         if code == crate::comp_off::LEAVE_CODE {
             continue;
@@ -104,7 +114,10 @@ async fn recover(tx: &mut OrgTx<'_>, employee: Uuid, rule: &PenaltyRule, days: i
         if !crate::leave::version_on(tx, t, on).await?.is_some_and(|v| v.paid) {
             continue;
         }
-        let left = leave_balance_pct(tx, employee, t).await? - used.get(&t).copied().unwrap_or(0);
+        if recording {
+            crate::leave::lock_account(tx, employee, t).await?; // no leave approval moves the balance under us
+        }
+        let left = leave_balance_pct(tx, employee, t, on, period).await? - used.get(&t).copied().unwrap_or(0);
         if left >= days {
             *used.entry(t).or_default() += days;
             return Ok((code.clone(), Some(t), false));
@@ -113,12 +126,19 @@ async fn recover(tx: &mut OrgTx<'_>, employee: Uuid, rule: &PenaltyRule, days: i
     Ok(if rule.then_lop { ("loss_of_pay".into(), None, true) } else { ("none".into(), None, false) })
 }
 
+/// Settings per policy version, loaded once per lock or preview (most employees share one).
+pub type SettingsCache = HashMap<Uuid, engine::settings::AttendanceSettings>;
+
 /// The penalties for one employee over [from, to] (their employed part of the period). With `record` =
-/// (period, run, actor) they are written and leave recoveries posted; otherwise a preview.
-pub async fn penalties(tx: &mut OrgTx<'_>, employee: Uuid, from: NaiveDate, to: NaiveDate, record: Option<(Uuid, Uuid, Uuid)>) -> Result<Vec<Penalty>, DomainError> {
+/// (run, actor) they are written and leave recoveries posted; otherwise a preview.
+// shortcut: a few queries per employee (policy, counters, recovery); batch them if a lock of thousands gets slow.
+pub async fn penalties(tx: &mut OrgTx<'_>, employee: Uuid, period: Option<Uuid>, from: NaiveDate, to: NaiveDate, record: Option<(Uuid, Uuid)>, cache: &mut SettingsCache) -> Result<Vec<Penalty>, DomainError> {
     let Some(master) = domain_timecap::punch::master_branch_on(tx, employee, to).await? else { return Ok(vec![]) };
     let Some(version) = domain_policy::assignment::resolve_policy(tx, employee, to, master).await?.and_then(|r| r.version_id) else { return Ok(vec![]) };
-    let s = crate::load_settings(tx, version).await?;
+    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(version) {
+        e.insert(crate::load_settings(tx, version).await?);
+    }
+    let s = cache[&version].clone();
     if !(s.penalties.late.count_on || s.penalties.late.minutes_on || s.penalties.early.count_on || s.penalties.early.minutes_on) {
         return Ok(vec![]);
     }
@@ -132,10 +152,11 @@ pub async fn penalties(tx: &mut OrgTx<'_>, employee: Uuid, from: NaiveDate, to: 
         (&s.penalties.early, "EC-05", "EC-09", c.early_marks, c.early_minutes),
     ] {
         let Some((rule_ref, days, mins, why)) = rule.apply(count_ref, minutes_ref, marks, minutes, day_min) else { continue };
-        let (recovered_as, leave_type, lop) = recover(tx, employee, rule, days, to, &mut used).await?;
+        let days = days.min(((to - from).num_days() + 1) * 100); // never more than the days employed in the period
+        let (recovered_as, leave_type, lop) = recover(tx, employee, rule, days, to, period, record.is_some(), &mut used).await?;
         let mut p = Penalty { id: None, rule_ref, days_pct: days, minutes: mins, recovered_as, lop, explanation: json!({ "step": 1, "rule_ref": rule_ref, "inputs": why, "outcome": "" }) };
         p.explanation["outcome"] = json!(format!("{}.{:02} day(s) recovered as {}", days / 100, days % 100, p.recovered_as));
-        if let Some((period, run, actor)) = record {
+        if let (Some((run, actor)), Some(period)) = (record, period) {
             let id: Uuid = sqlx::query_scalar(
                 "INSERT INTO attendance.period_penalty (org_id, run_id, employee_id, period_id, counter_period, rule_ref, days, minutes, recovered_as, explanation, created_by)
                  VALUES (app.current_org(), $1, $2, $3, daterange($4, $5, '[]'), $6, $7::numeric / 100, $8, $9, $10, $11) RETURNING id",
@@ -223,6 +244,13 @@ pub async fn view(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) -> Result
         return Err(DomainError::NotFound); // TB-01: another organisation's employee is not found, never an empty set
     }
     let (period, from, to) = period_of(tx, date).await?;
+    // The employee's employed part of the period, as the totals and the lock use it.
+    let (from, to): (NaiveDate, NaiveDate) = sqlx::query_as("SELECT greatest(joining_date, $2), least(coalesce(exit_date, $3), $3) FROM workforce.employee WHERE id = $1")
+        .bind(employee)
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut ***tx)
+        .await?;
     let c = counter(tx, employee, from, to).await?;
     let recorded: Vec<Value> = match period {
         Some(p) => sqlx::query_scalar(
@@ -230,7 +258,7 @@ pub async fn view(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) -> Result
                                        'recovered_as', x.recovered_as, 'provisional', false, 'explanation', x.explanation)
              FROM attendance.period_penalty x
              WHERE x.employee_id = $1 AND x.period_id = $2
-               AND x.run_id = (SELECT y.run_id FROM attendance.period_penalty y WHERE y.employee_id = $1 AND y.period_id = $2 ORDER BY y.created_at DESC LIMIT 1)
+               AND x.created_at >= (SELECT locked_at FROM period.attendance_period WHERE id = $2) -- recorded by the latest lock only
              ORDER BY x.rule_ref",
         )
         .bind(employee)
@@ -243,7 +271,7 @@ pub async fn view(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) -> Result
         Some(p) => sqlx::query_scalar("SELECT state = 'locked' FROM period.attendance_period WHERE id = $1").bind(p).fetch_one(&mut ***tx).await?,
         None => false,
     };
-    let penalties = if locked { recorded } else { penalties(tx, employee, from, to, None).await?.iter().map(|p| p.json(period)).collect() };
+    let penalties = if locked || from > to { recorded } else { penalties(tx, employee, period, from, to, None, &mut SettingsCache::new()).await?.iter().map(|p| p.json(period)).collect() };
     Ok(json!({
         "employee_id": employee, "counter_period_start": from, "counter_period_end": to,
         "late_marks": c.late_marks, "early_marks": c.early_marks, "late_minutes": c.late_minutes, "early_minutes": c.early_minutes,

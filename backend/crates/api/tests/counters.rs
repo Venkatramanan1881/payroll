@@ -110,6 +110,38 @@ async fn count_penalty_recovered_from_leave_at_lock(pool: PgPool) {
     assert!(!t.to_string().contains("late_early_penalty"), "a leave recovery is not a deduction line: {t}");
     let kept: i64 = sqlx::query_scalar("SELECT late_marks::int8 FROM attendance.period_counter WHERE employee_id = $1").bind(w.employee_id).fetch_one(&pool).await.unwrap();
     assert_eq!(kept, 4);
+
+    // Unlocked (as SM-PERIOD P7 leaves it) and locked again: the first recovery is reversed and recorded anew, once.
+    sqlx::query("DELETE FROM period.lock_coverage WHERE period_id = $1::uuid").bind(&period).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE period.attendance_period SET state = 'unlocked' WHERE id = $1::uuid").bind(&period).execute(&pool).await.unwrap();
+    let c = counters(&app, &s.hr_token, &w).await;
+    assert_eq!(c["penalties"][0]["recovered_as"], "CL", "while unlocked the preview does not see its own earlier debit: {c}");
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{period}/lock"), None, &key()).await.0, StatusCode::OK);
+    let bal: String = sqlx::query_scalar("SELECT to_char(sum(quantity), 'FM990.00') FROM leave.leave_ledger_entry").fetch_one(&pool).await.unwrap();
+    assert_eq!(bal, "0.50", "debit, reversal, debit");
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT entry_kind FROM leave.leave_ledger_entry WHERE cause_kind = 'period_penalty' ORDER BY created_at, entry_kind").fetch_all(&pool).await.unwrap();
+    assert_eq!(kinds.len(), 3, "{kinds:?}");
+    let c = counters(&app, &s.hr_token, &w).await;
+    assert_eq!(c["penalties"].as_array().map(Vec::len), Some(1), "only the latest lock's penalties: {c}");
+}
+
+/// BR-04: minutes of a day a slab already cut never feed the period minutes penalty.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn slab_cut_minutes_are_not_penalised_twice(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    policy(&app, &s, json!({ "LA-10": true, "LA-11": { "threshold_minutes": 0 } })).await;
+    setup(&pool, &app, &s).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let d = last_month_start() + Duration::days(1);
+    // In at 11:30 India: 150 minutes late, above the default 11-120 slab, so the day is cut to a half.
+    let entries = json!([{ "employee_id": w.employee_id, "event_at": d.and_hms_opt(6, 0, 0).unwrap().and_utc() },
+                         { "employee_id": w.employee_id, "event_at": d.and_hms_opt(12, 30, 0).unwrap().and_utc() }]);
+    let body = json!({ "branch_id": s.branch_id, "reason": "device down", "entries": entries });
+    assert_eq!(common::as_user(&app, &s.hr_token, "POST", "/v1/manual-attendance", Some(body), &key()).await.0, StatusCode::CREATED);
+    let c = counters(&app, &s.hr_token, &w).await;
+    assert_eq!((c["late_minutes"].as_i64(), c["penalties"].as_array().map(Vec::len)), (Some(0), Some(0)), "{c}");
 }
 
 /// With no leave listed the penalty is loss of pay, a deduction line in the totals; opening late marks count.
