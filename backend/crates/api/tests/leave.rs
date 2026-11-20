@@ -282,3 +282,58 @@ async fn locked_dates_refuse_approval(pool: PgPool) {
     assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("PERIOD_LOCKED")), "{b}");
     assert_eq!(balance(&app, &w, &cl).await, "3.00", "nothing debited");
 }
+
+/// `awaiting_me` lists only pending requests routed to the caller; names come with each request (web slice 3).
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn awaiting_me_lists_what_the_caller_decides(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, &[]).await;
+    let (w, boss) = people(&pool, &app, &s).await;
+    let cl = leave_type(&app, &s, "CL", json!({})).await;
+    credit(&app, &s, &w, &cl, "5.00").await;
+    let d = days_ago(1);
+    let (_, r) = post(&app, &w.token, "/v1/leave/requests", Some(json!({ "leave_type_id": cl, "from_date": d, "to_date": d, "reason": "fever" }))).await;
+    assert_eq!((r["employee_name"].as_str(), r["leave_type_name"].as_str(), r["employee_code"].is_string()), (Some("Asha"), Some("CL"), true), "{r}");
+    let id = r["id"].clone();
+    let waiting = |token: String| {
+        let app = app.clone();
+        async move {
+            let (st, b) = common::as_user(&app, &token, "GET", "/v1/leave/requests?awaiting_me=true", None, &[]).await;
+            assert_eq!(st, StatusCode::OK, "{b}");
+            b["items"].as_array().unwrap().iter().map(|i| i["id"].clone()).collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(waiting(boss.token.clone()).await, vec![id.clone()], "routed to the manager");
+    assert!(waiting(s.hr_token.clone()).await.is_empty(), "HR sees it in scope, but it is not waiting for HR");
+    let (_, all) = common::as_user(&app, &s.hr_token, "GET", "/v1/leave/requests", None, &[]).await;
+    assert_eq!(all["items"].as_array().unwrap().len(), 1);
+    post(&app, &boss.token, &format!("/v1/leave/requests/{}/approve", id.as_str().unwrap()), None).await;
+    assert!(waiting(boss.token.clone()).await.is_empty(), "decided requests leave the inbox");
+}
+
+/// A request nobody was routed to (the employee has no manager) waits for whoever holds LVE-04 in scope; the request
+/// says what the caller may do, by the same checks as the commands.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn unrouted_requests_wait_for_scoped_deciders(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, &[]).await;
+    let (_w, boss) = people(&pool, &app, &s).await;
+    let cl = leave_type(&app, &s, "CL", json!({})).await;
+    credit(&app, &s, &boss, &cl, "5.00").await;
+    let d = days_ago(1);
+    let (st, r) = post(&app, &boss.token, "/v1/leave/requests", Some(json!({ "leave_type_id": cl, "from_date": d, "to_date": d }))).await;
+    assert_eq!((st, r["current_approver_user_id"].clone(), r["total_days"].as_str()), (StatusCode::CREATED, Value::Null, Some("1.00")), "{r}");
+    let id = r["id"].as_str().unwrap().to_string();
+    let waiting = |token: String| {
+        let app = app.clone();
+        async move { common::as_user(&app, &token, "GET", "/v1/leave/requests?awaiting_me=true", None, &[]).await.1["items"].as_array().unwrap().len() }
+    };
+    assert_eq!(waiting(s.hr_token.clone()).await, 1, "HR holds LVE-04 for everyone");
+    assert_eq!(waiting(boss.token.clone()).await, 0, "never one's own request");
+    let (_, hr_view) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/leave/requests/{id}"), None, &[]).await;
+    assert_eq!((hr_view["can_decide"].as_bool(), hr_view["can_cancel"].as_bool()), (Some(true), Some(true)), "HR holds LVE-04 and LVE-06 in the test organisation");
+    let (_, own) = common::as_user(&app, &boss.token, "GET", &format!("/v1/leave/requests/{id}"), None, &[]).await;
+    assert_eq!((own["can_decide"].as_bool(), own["can_cancel"].as_bool()), (Some(false), Some(true)), "the requester may cancel");
+}

@@ -421,6 +421,10 @@ paths:
         - name: leave_type_id
           in: query
           schema: { $ref: 'common.yaml#/components/schemas/Id' }
+        - name: awaiting_me
+          in: query
+          description: 'Only the pending requests the caller may decide now: routed to them, through an allowed delegation, or unrouted within their LVE-04 / LVE-05 scope; the same check as approve / reject (web slice 3).'
+          schema: { type: boolean, default: false }
         - $ref: 'common.yaml#/components/parameters/From'
         - $ref: 'common.yaml#/components/parameters/To'
         - $ref: 'common.yaml#/components/parameters/BranchFilter'
@@ -925,7 +929,13 @@ components:
           properties:
             id: { $ref: 'common.yaml#/components/schemas/Id' }
             employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_code: { type: string, description: For display (web slice 3). }
+            employee_name: { type: string, description: For display (web slice 3). }
             leave_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            leave_type_name: { type: string, description: For display (web slice 3). }
+            total_days: { type: string, description: 'Sum of the request''s day fractions, e.g. "1.50" (web slice 3).' }
+            can_decide: { type: boolean, description: 'GET by id only: whether approve / reject would accept the caller now.' }
+            can_cancel: { type: boolean, description: 'GET by id only: whether cancel would accept the caller (requester, the employee, or LVE-06 in scope); locked periods are checked on the attempt.' }
             from_date: { $ref: 'common.yaml#/components/schemas/Date' }
             to_date: { $ref: 'common.yaml#/components/schemas/Date' }
             from_part: { $ref: '#/components/schemas/DayPart' }

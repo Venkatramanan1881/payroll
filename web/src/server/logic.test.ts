@@ -74,6 +74,9 @@ describe("menus", () => {
     const c06 = [{ module_code: "C06", enabled: true }];
     expect(buildMenu([{ operation_code: "ATT-03", grant_kind: "approve" }], c06).map((i) => i.key)).toEqual(["approvals"]);
     expect(buildMenu([{ operation_code: "ATT-01", grant_kind: "self" }], c06)).toEqual([]);
+    const c08 = [{ module_code: "C08", enabled: true }];
+    expect(buildMenu([{ operation_code: "LVE-04", grant_kind: "approve" }], c08).map((i) => i.key)).toEqual(["leave"]);
+    expect(buildMenu([{ operation_code: "LVE-08", grant_kind: "self" }], c08)).toEqual([]);
   });
 });
 

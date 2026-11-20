@@ -143,3 +143,31 @@ export type PunchFlag = {
   decision: { decision: string; reason: string | null; decided_at: string } | null;
   punch: Punch;
 };
+
+// leave.yaml
+export type LeavePart = "full" | "first_half" | "second_half";
+export type LeaveType = { id: string; code: string; name: string; retired_at: string | null; current_version: { half_day_allowed?: boolean } | null };
+export type LeaveBalance = { leave_type_id: string; leave_type_name: string; balance: string; pending_days: string };
+export type LeaveRequest = {
+  id: string;
+  employee_id: string;
+  employee_code: string;
+  employee_name: string;
+  leave_type_id: string;
+  leave_type_name: string;
+  total_days: string;
+  /** GET by id only: what the API would let this caller do now. */
+  can_decide?: boolean;
+  can_cancel?: boolean;
+  from_date: string;
+  to_date: string;
+  from_part: LeavePart;
+  to_part: LeavePart;
+  reason: string | null;
+  state: RequestState;
+  escalated: boolean;
+  submitted_at: string;
+  cancelled_at: string | null;
+  days: { leave_date: string; fraction: string; half: string | null }[];
+  steps: ApprovalStep[];
+};

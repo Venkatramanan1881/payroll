@@ -15,6 +15,7 @@ export const ORG_MENU: MenuItem[] = [
   { key: "attendance", href: "/app/attendance", module: "C06", ops: ["ATT-01"] },
   { key: "approvals", href: "/app/attendance/regularisations", module: "C06", ops: ["ATT-03", "ATT-04", "ATT-05"], kinds: DECIDE },
   { key: "flags", href: "/app/attendance/flags", module: "C04", ops: ["TCP-06"], kinds: DECIDE },
+  { key: "leave", href: "/app/leave", module: "C08", ops: ["LVE-08", "LVE-04", "LVE-05"], kinds: DECIDE },
 ];
 
 export function holds(grants: Grant[], ops: string[], kinds: GrantKind[] = WORK): boolean {

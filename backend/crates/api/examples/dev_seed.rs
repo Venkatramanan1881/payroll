@@ -4,7 +4,10 @@
 //!   employee Meena, the manager of employee Asha;
 //! - Asha (asha@dev.invalid), a password login for local trials only (employees sign in by phone in real use);
 //! - an organisation policy and a 09:00-18:00 shift;
-//! - yesterday's punches for Asha.
+//! - yesterday's punches for Asha;
+//! - leave types CL and SL with balances for Asha, and a pending CL request of hers;
+//! - a "Dev leave extras" role for HR (LVE-03 apply on behalf, LVE-06 cancel, LVE-07 adjust): no default role holds
+//!   these while G-24..G-26 are open, so they exist here only for local trials.
 //!
 //! Organisation rows go straight in as the superuser; everything else goes through the API in-process.
 //!
@@ -120,12 +123,32 @@ async fn main() -> anyhow::Result<()> {
     sqlx::query("UPDATE iam.user_account SET employee_id = $1 WHERE id = $2").bind(meena).bind(hr).execute(&pool).await?;
     sqlx::query("INSERT INTO workforce.employee_assignment (org_id, employee_id, kind, manager_employee_id, valid) VALUES ($1, $2, 'reporting_manager', $3, daterange('2026-01-01', NULL))")
         .bind(org).bind(asha).bind(meena).execute(&pool).await?;
-    user(&pool, org, "asha@dev.invalid", &hash, &[emp_role], Some(asha)).await?;
+    let asha_user = user(&pool, org, "asha@dev.invalid", &hash, &[emp_role], Some(asha)).await?;
+    let extras: Uuid = sqlx::query_scalar("INSERT INTO iam.role (org_id, name) VALUES ($1, 'Dev leave extras') RETURNING id").bind(org).fetch_one(&pool).await?;
+    for op in ["LVE-03", "LVE-06", "LVE-07"] {
+        sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')").bind(org).bind(extras).bind(op).execute(&pool).await?;
+    }
+    sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(org).bind(hr).bind(extras).execute(&pool).await?;
 
     // Yesterday in India: in late at 09:20, out at 17:30 (03:50Z and 12:00Z).
     let d = (chrono::Utc::now() + chrono::Duration::minutes(330)).date_naive() - chrono::Duration::days(1);
     let entries = [format!("{d}T03:50:00Z"), format!("{d}T12:00:00Z")].map(|at| json!({ "employee_id": asha, "event_at": at }));
     call(&app, t, "POST", "/v1/manual-attendance", Some(json!({ "branch_id": hq, "reason": "dev seed: device down", "entries": entries }))).await?;
+
+    // Leave: two types, balances for Asha, and a pending request of hers three days ahead.
+    let version = |name: &str| json!({ "effective_from": "2026-01-01", "reason": format!("dev seed: {name}"), "paid": true, "eligibility": {},
+        "credit_method": "annual_grant", "accrual_timing": "end", "proration": "none", "year_end": "lapse", "negative_allowed_days": "0.00",
+        "half_day_allowed": true, "min_notice_days": 0, "approval_levels": "manager", "timeout_action": "escalate", "during_notice": "allow", "combine_allowed": true });
+    let mut types = vec![];
+    for (code, name, days) in [("CL", "Casual leave", "6.00"), ("SL", "Sick leave", "4.00")] {
+        let ty = call(&app, t, "POST", "/v1/leave/types", Some(json!({ "code": code, "name": name, "version": version(name) }))).await?;
+        call(&app, t, "POST", &format!("/v1/leave/employees/{asha}/ledger-adjustments"),
+            Some(json!({ "leave_type_id": ty["id"], "quantity": days, "entry_date": "2026-01-01", "reason": "dev seed: opening balance" }))).await?;
+        types.push(ty["id"].clone());
+    }
+    let asha_token = domain_iam::tokens::issue_access(&secret, asha_user, org, None, now);
+    let ahead = d + chrono::Duration::days(4);
+    call(&app, &asha_token, "POST", "/v1/leave/requests", Some(json!({ "leave_type_id": types[0], "from_date": ahead, "to_date": ahead, "reason": "Family function" }))).await?;
 
     println!("seeded organisation {org}: sign in as hr@dev.invalid (HR, manager of Asha) or asha@dev.invalid; punches on {d}");
     Ok(())
