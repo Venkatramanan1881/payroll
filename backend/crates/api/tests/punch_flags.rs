@@ -37,6 +37,12 @@ async fn grant(pool: &PgPool, org: Uuid, user: Uuid, op: &str, kind: &str) {
     sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(org).bind(user).bind(role).execute(pool).await.unwrap();
 }
 
+/// The flagged employee's name, as stored.
+async fn w_name(pool: &PgPool, item: &serde_json::Value) -> String {
+    let id: Uuid = item["employee_id"].as_str().unwrap().parse().unwrap();
+    sqlx::query_scalar("SELECT full_name FROM workforce.employee WHERE id = $1").bind(id).fetch_one(pool).await.unwrap()
+}
+
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn hr_lists_and_accepts_once(pool: PgPool) {
     let (s, app, w) = setup(&pool).await;
@@ -45,6 +51,7 @@ async fn hr_lists_and_accepts_once(pool: PgPool) {
     assert_eq!(st, StatusCode::OK, "{list}");
     assert_eq!(list["items"].as_array().unwrap().len(), 1);
     assert_eq!(list["items"][0]["reason"], "outside_fence");
+    assert_eq!(list["items"][0]["employee_name"], w_name(&pool, &list["items"][0]).await, "names come with the flag");
     assert_eq!(list["items"][0]["punch"]["location"]["fence_distance_m"], 450, "HR holds TCP-08");
 
     let (st, r) = decide(&app, &s.hr_token, &flag, "accept", None).await;

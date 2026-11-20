@@ -1186,6 +1186,9 @@ components:
         id: { $ref: 'common.yaml#/components/schemas/Id' }
         punch_id: { $ref: 'common.yaml#/components/schemas/Id' }
         employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string, description: For display (web slice 2). }
+        employee_name: { type: string, description: For display (web slice 2). }
+        attendance_date: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Date' }, { type: 'null' } ], description: 'The day whose current result uses this punch; null until worked out.' }
         reason: { $ref: '#/components/schemas/FlagReason' }
         state: { type: string, enum: [raised, accepted, rejected] }
         counts_before_decision: { type: boolean, description: DP-05 (E18 - outside fence does not count). }

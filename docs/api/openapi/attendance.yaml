@@ -869,6 +869,9 @@ components:
           properties:
             id: { $ref: 'common.yaml#/components/schemas/Id' }
             employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_code: { type: string, description: For display (web slice 2). }
+            employee_name: { type: string, description: For display (web slice 2). }
+            schedule_tz: { type: [string, 'null'], description: 'Zone of the day''s current result, for reading proposed times; null before any result.' }
             attendance_date: { $ref: 'common.yaml#/components/schemas/Date' }
             request_type: { type: string, enum: [missed_punch, late_arrival, early_checkout, wrong_punch, whole_day] }
             origin: { type: string, enum: [employee, hr_direct], description: hr_direct = RG-10 correction (DP-08). }
