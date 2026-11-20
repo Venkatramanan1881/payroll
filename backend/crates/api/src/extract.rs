@@ -54,7 +54,9 @@ impl FromRequestParts<AppState> for Auth {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         // Report runs are exports, allowed while the organisation is suspended (VC-R4, AC-C13-01.8).
-        let is_write = !matches!(parts.method, Method::GET | Method::HEAD) && !parts.uri.path().starts_with("/v1/reports/");
+        let path = parts.uri.path();
+        let report_run = path.starts_with("/v1/reports/") && path.ends_with("/runs");
+        let is_write = !matches!(parts.method, Method::GET | Method::HEAD) && !report_run;
         let (p, tx) = authenticate(state, &parts.headers, is_write).await?;
         Ok(Auth(p, tx))
     }

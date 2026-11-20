@@ -43,6 +43,8 @@ async fn dashboards_choices_and_default_filters(pool: PgPool) {
     let uri = format!("/v1/dashboards/widget-choices/{hr_role}");
     assert_eq!(common::call(&app, &s, "PUT", &uri, Some(json!({ "widgets": ["pending_approvals"] })), None).await.0, StatusCode::PRECONDITION_REQUIRED);
     assert_eq!(common::call(&app, &s, "PUT", &uri, Some(json!({ "widgets": ["leave_balance"] })), etag.as_deref()).await.0, StatusCode::UNPROCESSABLE_ENTITY, "not offered to HR");
+    assert_eq!(common::call(&app, &s, "PUT", &uri, Some(json!({ "widgets": ["pending_approvals", "pending_approvals"] })), etag.as_deref()).await.0,
+               StatusCode::UNPROCESSABLE_ENTITY, "each widget once");
     let (st, b, _) = common::call(&app, &s, "PUT", &uri, Some(json!({ "widgets": ["pending_approvals", "joiners_leavers"] })), etag.as_deref()).await;
     assert_eq!((st, b["default_applied"].as_bool()), (StatusCode::OK, Some(false)), "{b}");
     assert_eq!(common::call(&app, &s, "PUT", &uri, Some(json!({ "widgets": ["pending_approvals"] })), etag.as_deref()).await.0, StatusCode::PRECONDITION_FAILED, "stale ETag");
@@ -65,6 +67,19 @@ async fn dashboards_choices_and_default_filters(pool: PgPool) {
     let (st, _, _) = common::call(&app, &s, "PUT", &hf, Some(json!({ "period": "next" })), None).await;
     assert_eq!(st, StatusCode::PRECONDITION_REQUIRED);
 
+    // Every role's widgets run (the HR user also holds the other built-in roles for this).
+    for (code, first) in [("payroll_officer", "periods_awaiting_lock"), ("manager", "team_attendance_today"), ("supervisor", "who_is_in_now")] {
+        let role = Uuid::new_v4();
+        sqlx::query("INSERT INTO iam.role (org_id, id, name, system_code) VALUES ($1, $2, $3, $3)").bind(s.org_id).bind(role).bind(code).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(s.org_id).bind(s.hr_user_id).bind(role).execute(&pool).await.unwrap();
+        let (st, d) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/dashboards/me?role={code}"), None, &[]).await;
+        assert_eq!((st, d["widgets"][0]["code"].as_str()), (StatusCode::OK, Some(first)), "{code}: {d}");
+        assert!(d["widgets"].as_array().unwrap().iter().all(|w| w["data"].is_object()), "{d}");
+    }
+    // A branch the caller has no employee in shows nothing, never more.
+    let (_, none) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/dashboards/me?role=manager&branch_id={}", Uuid::new_v4()), None, &[]).await;
+    assert_eq!(none["widgets"][0]["data"]["employees"], 0, "{none}");
+
     let other = common::seed_org(&pool).await;
     assert_eq!(common::as_user(&app, &other.hr_token, "GET", &wf, None, &[]).await.0, StatusCode::NOT_FOUND, "TB-01");
 }
@@ -76,11 +91,22 @@ async fn upload_links_and_suspension(pool: PgPool) {
     let s = common::seed_org(&pool).await;
     let app = common::app(pool.clone());
     let ask = |name: &str, ct: &str, size: i64| json!({ "purpose": "request_attachment", "file_name": name, "content_type": ct, "size_bytes": size });
-    let (st, b) = common::as_user(&app, &s.hr_token, "POST", "/v1/files/upload-links", Some(ask("../../../etc/passwd.pdf", "application/pdf", 1000)), &key()).await;
+    let k = key();
+    let (st, b) = common::as_user(&app, &s.hr_token, "POST", "/v1/files/upload-links", Some(ask("../../../etc/passwd.pdf", "application/pdf", 1000)), &k).await;
     assert_eq!((st, b["method"].as_str()), (StatusCode::CREATED, Some("PUT")), "{b}");
-    let path = b["file"]["path"].as_str().unwrap();
+    let path = b["file"]["path"].as_str().unwrap().to_string();
     assert!(path.starts_with(&format!("{}/uploads/request_attachment/", s.org_id)) && !path.contains(".."), "{path}");
-    assert!(b["upload_url"].as_str().unwrap().contains("method=PUT"));
+    // The link binds type, size and "not there yet": an uploaded file can never be replaced through a new link.
+    assert_eq!((b["headers"]["x-goog-if-generation-match"].as_str(), b["headers"]["x-goog-content-length-range"].as_str()), (Some("0"), Some("1,1000")), "{b}");
+    assert!(b["upload_url"].as_str().unwrap().contains("signed=content-type;x-goog-content-length-range;x-goog-if-generation-match"), "{b}");
+    // A retry replays the same path with a fresh link; the key with another body is a conflict.
+    let (st, again) = common::as_user(&app, &s.hr_token, "POST", "/v1/files/upload-links", Some(ask("../../../etc/passwd.pdf", "application/pdf", 1000)), &k).await;
+    assert_eq!((st, again["file"]["path"].as_str()), (StatusCode::CREATED, Some(path.as_str())), "{again}");
+    assert!(again["upload_url"].is_string());
+    let (st, b) = common::as_user(&app, &s.hr_token, "POST", "/v1/files/upload-links", Some(ask("other.pdf", "application/pdf", 1000)), &k).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::CONFLICT, Some("IDEMPOTENCY_CONFLICT")), "{b}");
+    let (_, fresh) = common::as_user(&app, &s.hr_token, "POST", "/v1/files/upload-links", Some(ask("../../../etc/passwd.pdf", "application/pdf", 1000)), &key()).await;
+    assert_ne!(fresh["file"]["path"], json!(path), "a new key never reaches an existing object");
     let (st, b) = common::as_user(&app, &s.hr_token, "POST", "/v1/files/upload-links", Some(ask("x.exe", "application/x-msdownload", 10)), &key()).await;
     assert_eq!((st, b["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("FILE_TYPE_NOT_ALLOWED")), "{b}");
     assert_eq!(common::as_user(&app, &s.hr_token, "POST", "/v1/files/upload-links", Some(ask("big.pdf", "application/pdf", 6 * 1024 * 1024)), &key()).await.0,

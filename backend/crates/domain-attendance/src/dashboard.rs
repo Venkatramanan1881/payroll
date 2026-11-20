@@ -68,7 +68,8 @@ async fn widget(tx: &mut OrgTx<'_>, code: &str, v: &View) -> Result<Value, Domai
                 "SELECT jsonb_build_object('branch_id', b.id, 'branch', b.name, 'employees', count(e.id),
                          'present', count(e.id) FILTER (WHERE r.day_status IN ('present','half_day','quarter_day','on_duty')),
                          'on_leave', count(e.id) FILTER (WHERE r.day_status IN ('leave','half_day_leave')),
-                         'absent', count(e.id) FILTER (WHERE r.day_status = 'absent'))
+                         'absent', count(e.id) FILTER (WHERE r.day_status = 'absent'), 'late', count(e.id) FILTER (WHERE r.late_mark),
+                         'not_yet_in', count(e.id) FILTER (WHERE r.id IS NULL))
                  FROM org.branch b
                  JOIN workforce.employee_assignment a ON a.branch_id = b.id AND a.kind = 'master_branch' AND a.valid @> $2::date
                  JOIN workforce.employee e ON e.id = a.employee_id AND e.joining_date <= $2 AND (e.exit_date IS NULL OR e.exit_date >= $2)
@@ -102,8 +103,12 @@ async fn widget(tx: &mut OrgTx<'_>, code: &str, v: &View) -> Result<Value, Domai
             .await?;
             json!({ "waiting_on_you": n })
         }
+        // Only devices of branches whose employees the caller sees (the branch filter already narrowed that set).
         "devices_offline" => json!({ "devices": sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM timecap.device WHERE online_state = 'offline' AND ($1::uuid IS NULL OR branch_id = $1)").bind(v.branch).fetch_one(&mut ***tx).await? }),
+            "SELECT count(*) FROM timecap.device d WHERE d.online_state = 'offline' AND d.retired_at IS NULL AND ($3::uuid IS NULL OR d.branch_id = $3)
+               AND ($1::uuid[] IS NULL OR d.branch_id IN (SELECT a.branch_id FROM workforce.employee_assignment a
+                                                          WHERE a.kind = 'master_branch' AND a.valid @> $2::date AND a.employee_id = ANY($1)))")
+            .bind(&v.scope).bind(v.today).bind(v.branch).fetch_one(&mut ***tx).await? }),
         "joiners_leavers" => {
             let first = v.today.with_day(1).expect("valid");
             let (joined, left): (i64, i64) = sqlx::query_as(
@@ -124,9 +129,12 @@ async fn widget(tx: &mut OrgTx<'_>, code: &str, v: &View) -> Result<Value, Domai
             // Pending requests and exception days inside periods waiting for their lock (the checklist's main items).
             let (requests, days): (i64, i64) = sqlx::query_as(
                 "WITH p AS (SELECT period_start s, period_end e FROM period.attendance_period WHERE state IN ('awaiting_lock','unlocked'))
-                 SELECT (SELECT count(*) FROM leave.leave_request q, p WHERE q.state LIKE 'pending%' AND q.from_date <= p.e AND q.to_date >= p.s AND ($1::uuid[] IS NULL OR q.employee_id = ANY($1)))
-                      + (SELECT count(*) FROM attendance.regularisation_request q, p WHERE q.state LIKE 'pending%' AND q.attendance_date BETWEEN p.s AND p.e AND ($1::uuid[] IS NULL OR q.employee_id = ANY($1))),
-                        (SELECT count(*) FROM attendance.attendance_day d, p WHERE d.processing_state = 'exception' AND d.attendance_date BETWEEN p.s AND p.e AND ($1::uuid[] IS NULL OR d.employee_id = ANY($1)))",
+                 SELECT (SELECT count(*) FROM leave.leave_request q WHERE q.state LIKE 'pending%' AND ($1::uuid[] IS NULL OR q.employee_id = ANY($1))
+                           AND EXISTS (SELECT 1 FROM p WHERE q.from_date <= p.e AND q.to_date >= p.s))
+                      + (SELECT count(*) FROM attendance.regularisation_request q WHERE q.state LIKE 'pending%' AND ($1::uuid[] IS NULL OR q.employee_id = ANY($1))
+                           AND EXISTS (SELECT 1 FROM p WHERE q.attendance_date BETWEEN p.s AND p.e)),
+                        (SELECT count(*) FROM attendance.attendance_day d WHERE d.processing_state = 'exception' AND ($1::uuid[] IS NULL OR d.employee_id = ANY($1))
+                           AND EXISTS (SELECT 1 FROM p WHERE d.attendance_date BETWEEN p.s AND p.e))",
             )
             .bind(&v.scope)
             .fetch_one(&mut ***tx)
@@ -151,9 +159,10 @@ async fn widget(tx: &mut OrgTx<'_>, code: &str, v: &View) -> Result<Value, Domai
             .await?;
             json!({ "since": v.today - Duration::days(30), "late_marks": late, "absences": absent })
         }
+        // shortcut: by local calendar date and raw punches (a night shift past midnight, or a rejected punch, can mislead).
         "who_is_in_now" => json!({ "in": count(tx,
             "SELECT count(*) FROM (SELECT p.employee_id FROM timecap.raw_punch p
-               WHERE (p.event_at AT TIME ZONE p.captured_tz)::date = $2 AND ($1::uuid[] IS NULL OR p.employee_id = ANY($1))
+               WHERE p.employee_id IS NOT NULL AND (p.event_at AT TIME ZONE p.captured_tz)::date = $2 AND ($1::uuid[] IS NULL OR p.employee_id = ANY($1))
                GROUP BY p.employee_id HAVING count(*) % 2 = 1) x", v).await? }),
         "roster_today_tomorrow" => json!({ "entries": sqlx::query_scalar::<_, Value>(
             "SELECT jsonb_build_object('date', r.roster_date, 'weekly_off', r.is_weekly_off, 'employees', count(*))
@@ -222,7 +231,7 @@ pub async fn dashboard(tx: &mut OrgTx<'_>, v: &View, role: Option<&str>, period:
         Some(r) => roles.iter().find(|x| x.2.as_deref() == Some(r) || x.1 == r).ok_or_else(|| DomainError::Validation(format!("{r} is not one of your roles")))?,
         None => match roles.first() {
             Some(r) => r,
-            None => return Ok(json!({ "role": null, "filters": { "branch_id": v.branch, "period_id": period }, "widgets": [] })),
+            None => return Ok(json!({ "role": "none", "filters": { "branch_id": v.branch, "period_id": period }, "widgets": [] })),
         },
     };
     let offered = offered(picked.2.as_deref());

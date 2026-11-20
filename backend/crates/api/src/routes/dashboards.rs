@@ -12,7 +12,7 @@ use chrono::{Duration, Utc};
 use domain_attendance::dashboard::{self, View};
 use domain_iam::authz::require;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -121,31 +121,48 @@ fn allowed(purpose: &str) -> Option<(&'static [&'static str], i64)> {
     })
 }
 
-/// POST /v1/files/upload-links: a short-lived signed PUT link under the organisation's own path (TB-02). The
-/// idempotency key names the object, so a retried request signs the same path again.
+/// POST /v1/files/upload-links: a short-lived signed PUT link under the organisation's own path (TB-02). The link
+/// binds the content type, the size range and "the object does not exist yet", so a file once uploaded can never be
+/// replaced and DC-06 is enforced by Cloud Storage itself. A retried key replays the same path with a fresh link; the
+/// same key with another body is IDEMPOTENCY_CONFLICT.
 pub async fn upload_link(State(state): State<AppState>, Auth(p, mut tx): Auth, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
     let key = crate::idempotency::key(&headers)?;
-    let u: UploadIn = parse(&raw)?;
-    let (types, max) = allowed(&u.purpose).ok_or_else(|| ApiError::ValidationFailed("purpose is opening_balances, employee_import, roster_import or request_attachment".into()))?;
-    if u.file_name.trim().is_empty() || u.file_name.chars().count() > 255 {
-        return Err(ApiError::ValidationFailed("file_name is 1-255 characters".into()));
-    }
-    if !types.contains(&u.content_type.as_str()) || u.size_bytes < 1 || u.size_bytes > max {
-        return Err(ApiError::Refused("FILE_TYPE_NOT_ALLOWED", format!("{} accepts {} up to {} MB", u.purpose, types.join(", "), max / MB)));
-    }
-    // The stored name keeps only safe characters: no path separators or traversal can reach the object path.
-    let safe: String = u.file_name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect();
-    let mut safe = safe.trim_start_matches('.').to_string();
-    while safe.contains("..") {
-        safe = safe.replace("..", ".");
-    }
-    let org: Uuid = sqlx::query_scalar("SELECT app.current_org()").fetch_one(&mut **tx).await?;
-    let path = format!("{org}/uploads/{}/{key}/{}", u.purpose, if safe.is_empty() { "file".into() } else { safe });
     let store = state.store.clone().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("EXPORT_BUCKET is not set")))?;
-    let url = store.signed_put(&path, LINK_SECS as u64).await.map_err(ApiError::Internal)?;
-    db::audit(&mut tx, p.user_id, "file.upload_link", "file", None, Some(json!({ "purpose": u.purpose, "path": path, "size_bytes": u.size_bytes }))).await?;
+    let replay = crate::idempotency::begin(&mut tx, key, "POST /v1/files/upload-links", &raw).await?;
+    let mut body = match replay {
+        Some((_, stored)) => stored,
+        None => {
+            let u: UploadIn = parse(&raw)?;
+            let (types, max) = allowed(&u.purpose).ok_or_else(|| ApiError::ValidationFailed("purpose is opening_balances, employee_import, roster_import or request_attachment".into()))?;
+            if u.file_name.trim().is_empty() || u.file_name.chars().count() > 255 {
+                return Err(ApiError::ValidationFailed("file_name is 1-255 characters".into()));
+            }
+            if !types.contains(&u.content_type.as_str()) || u.size_bytes < 1 || u.size_bytes > max {
+                return Err(ApiError::Refused("FILE_TYPE_NOT_ALLOWED", format!("{} accepts {} up to {} MB", u.purpose, types.join(", "), max / MB)));
+            }
+            // The stored name keeps only safe characters: no path separators or traversal can reach the object path.
+            let safe: String = u.file_name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect();
+            let mut safe = safe.trim_start_matches('.').to_string();
+            while safe.contains("..") {
+                safe = safe.replace("..", ".");
+            }
+            let org: Uuid = sqlx::query_scalar("SELECT app.current_org()").fetch_one(&mut **tx).await?;
+            // A server-made id names the object: nobody can aim a link at a path they did not create.
+            let path = format!("{org}/uploads/{}/{}/{}", u.purpose, Uuid::now_v7(), if safe.is_empty() { "file".into() } else { safe });
+            db::audit(&mut tx, p.user_id, "file.upload_link", "file", None, Some(json!({ "purpose": u.purpose, "path": path, "size_bytes": u.size_bytes }))).await?;
+            let body = json!({ "method": "PUT", "file": { "path": path },
+                               "headers": { "content-type": u.content_type, "x-goog-content-length-range": format!("1,{}", u.size_bytes),
+                                            "x-goog-if-generation-match": "0" } });
+            // The stored answer carries no link: links are bearer capabilities; a replay signs the same path afresh.
+            crate::idempotency::finish(&mut tx, key, StatusCode::CREATED, &body).await?;
+            body
+        }
+    };
     tx.commit().await?;
-    let body: Value = json!({ "upload_url": url, "method": "PUT", "headers": { "content-type": u.content_type },
-                              "expires_at": Utc::now() + Duration::seconds(LINK_SECS), "file": { "path": path } });
+    let path = body["file"]["path"].as_str().unwrap_or_default().to_string();
+    let signed: Vec<(&str, String)> = body["headers"].as_object().map(|h| h.iter().map(|(k, v)| (k.as_str(), v.as_str().unwrap_or_default().to_string())).collect()).unwrap_or_default();
+    let url = store.signed_put(&path, LINK_SECS as u64, &signed).await.map_err(ApiError::Internal)?;
+    body["upload_url"] = json!(url);
+    body["expires_at"] = json!(Utc::now() + Duration::seconds(LINK_SECS));
     Ok(reply(StatusCode::CREATED, body))
 }

@@ -53,8 +53,9 @@ impl api::storage::ObjectStore for MemoryStore {
     async fn signed_url(&self, path: &str, ttl_secs: u64) -> anyhow::Result<String> {
         Ok(format!("https://storage.test/{path}?expires={ttl_secs}"))
     }
-    async fn signed_put(&self, path: &str, ttl_secs: u64) -> anyhow::Result<String> {
-        Ok(format!("https://storage.test/{path}?method=PUT&expires={ttl_secs}"))
+    async fn signed_put(&self, path: &str, ttl_secs: u64, headers: &[(&str, String)]) -> anyhow::Result<String> {
+        let signed: Vec<&str> = headers.iter().map(|h| h.0).collect();
+        Ok(format!("https://storage.test/{path}?method=PUT&expires={ttl_secs}&signed={}", signed.join(";")))
     }
 }
 
