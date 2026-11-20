@@ -46,8 +46,16 @@ pub fn code_at(secret: &[u8], step: i64) -> String {
 
 /// Accepts the current step and one either side (clock drift), comparing in constant time.
 pub fn verify(secret: &[u8], code: &str, now_secs: i64) -> bool {
+    verify_step(secret, code, now_secs).is_some()
+}
+
+/// The 30-second step the code belongs to, so a used code can be refused (single use); every step is compared.
+pub fn verify_step(secret: &[u8], code: &str, now_secs: i64) -> Option<i64> {
     let step = now_secs.div_euclid(STEP_SECS);
-    code.len() == 6 && (-1..=1).fold(false, |ok, d| ok | same(code_at(secret, step + d).as_bytes(), code.as_bytes()))
+    if code.len() != 6 {
+        return None;
+    }
+    (-1..=1).fold(None, |found, d| if same(code_at(secret, step + d).as_bytes(), code.as_bytes()) { Some(step + d) } else { found })
 }
 
 fn same(a: &[u8], b: &[u8]) -> bool {

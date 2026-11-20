@@ -17,3 +17,4 @@ pub mod permissions;
 pub mod onduty;
 pub mod comp_off;
 pub mod notifications;
+pub mod reports;

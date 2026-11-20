@@ -24,6 +24,7 @@ sha2 = "0.10"
 async-trait = "0.1"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rust_xlsxwriter = { version = "0.103.0", default-features = false }
 
 [dev-dependencies]
 argon2 = "0.5"

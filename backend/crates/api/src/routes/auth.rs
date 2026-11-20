@@ -168,7 +168,12 @@ pub async fn verify_second_factor(State(state): State<AppState>, req: Result<Jso
         (None, None) => return Err(ApiError::Unauthenticated),
     };
     let secret = domain_iam::totp::decrypt(&key, &sealed, &domain_iam::password::secret_aad(org_id, user_id)).ok_or(ApiError::Unauthenticated)?;
-    if !domain_iam::totp::verify(&secret, &req.code, unix_now()) {
+    let Some(step) = domain_iam::totp::verify_step(&secret, &req.code, unix_now()) else {
+        domain_iam::password::record_failed_code(&state.pool, org_id, user_id).await?;
+        return Err(ApiError::OtpInvalid);
+    };
+    // Single use: a code (or an older one) already accepted is refused, so an overheard code cannot sign in again.
+    if !domain_iam::password::claim_step(&state.pool, org_id, user_id, step).await? {
         domain_iam::password::record_failed_code(&state.pool, org_id, user_id).await?;
         return Err(ApiError::OtpInvalid);
     }

@@ -77,8 +77,10 @@ async fn password_then_authenticator(pool: PgPool) {
     // Later sign-ins: a challenge only, checked against the stored secret; a fresh enrolment cannot replace it.
     let (_, second) = post(&app, "/v1/auth/password/sign-in", creds.clone()).await;
     assert!(second.get("otpauth_uri").is_none(), "{second}");
-    let (st, _) = post(&app, "/v1/auth/second-factor/verify", json!({ "challenge_token": second["challenge_token"], "code": domain_iam::totp::code_at(&secret, now() / 30) })).await;
-    assert_eq!(st, StatusCode::OK);
+    let (st, b) = post(&app, "/v1/auth/second-factor/verify", json!({ "challenge_token": second["challenge_token"], "code": domain_iam::totp::code_at(&secret, now() / 30) })).await;
+    assert_eq!((st, b["code"].as_str()), (StatusCode::BAD_REQUEST, Some("OTP_INVALID")), "a code already used is refused (single use)");
+    let (st, _) = post(&app, "/v1/auth/second-factor/verify", json!({ "challenge_token": second["challenge_token"], "code": domain_iam::totp::code_at(&secret, now() / 30 + 1) })).await;
+    assert_eq!(st, StatusCode::OK, "the next code is accepted");
     let other = domain_iam::totp::new_secret();
     use base64::Engine;
     let forged_pending = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(domain_iam::totp::encrypt(&common::MFA_KEY, &other, &aad));
