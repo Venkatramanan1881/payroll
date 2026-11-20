@@ -13,6 +13,8 @@ pub trait ObjectStore: Send + Sync {
     async fn put(&self, path: &str, body: Vec<u8>, content_type: &str) -> Result<()>;
     /// A GET link valid for `ttl_secs`.
     async fn signed_url(&self, path: &str, ttl_secs: u64) -> Result<String>;
+    /// A PUT link valid for `ttl_secs` that uploads one object at `path` (TB-02).
+    async fn signed_put(&self, path: &str, ttl_secs: u64) -> Result<String>;
 }
 
 const METADATA: &str = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default";
@@ -58,8 +60,18 @@ impl ObjectStore for Gcs {
     }
 
     async fn signed_url(&self, path: &str, ttl_secs: u64) -> Result<String> {
+        self.sign("GET", path, ttl_secs).await
+    }
+
+    async fn signed_put(&self, path: &str, ttl_secs: u64) -> Result<String> {
+        self.sign("PUT", path, ttl_secs).await
+    }
+}
+
+impl Gcs {
+    async fn sign(&self, method: &str, path: &str, ttl_secs: u64) -> Result<String> {
         let email = self.metadata("email").await?;
-        let (url, to_sign) = v4_request(&self.bucket, path, &email, Utc::now(), ttl_secs);
+        let (url, to_sign) = v4_request(method, &self.bucket, path, &email, Utc::now(), ttl_secs);
         let b64 = base64::engine::general_purpose::STANDARD;
         let v: Value = self
             .http
@@ -93,7 +105,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The unsigned V4 URL (without the signature) and the string to sign, per Google's V4 signing process.
-fn v4_request(bucket: &str, path: &str, email: &str, now: DateTime<Utc>, ttl_secs: u64) -> (String, String) {
+fn v4_request(method: &str, bucket: &str, path: &str, email: &str, now: DateTime<Utc>, ttl_secs: u64) -> (String, String) {
     let stamp = now.format("%Y%m%dT%H%M%SZ").to_string();
     let scope = format!("{}/auto/storage/goog4_request", now.format("%Y%m%d"));
     let resource = format!("/{bucket}/{}", encode(path, true));
@@ -108,7 +120,7 @@ fn v4_request(bucket: &str, path: &str, email: &str, now: DateTime<Utc>, ttl_sec
     .map(|(k, v)| format!("{k}={}", encode(v, false)))
     .collect::<Vec<_>>()
     .join("&");
-    let canonical = format!("GET\n{resource}\n{query}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD");
+    let canonical = format!("{method}\n{resource}\n{query}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD");
     let to_sign = format!("GOOG4-RSA-SHA256\n{stamp}\n{scope}\n{}", hex(&Sha256::digest(canonical.as_bytes())));
     (format!("https://storage.googleapis.com{resource}?{query}"), to_sign)
 }
@@ -120,7 +132,7 @@ mod tests {
     #[test]
     fn v4_url_and_string_to_sign_follow_the_spec() {
         let now = DateTime::parse_from_rfc3339("2026-11-19T10:00:00Z").unwrap().with_timezone(&Utc);
-        let (url, to_sign) = v4_request("payroll-exports", "org/payroll-input/p 1.json", "jobs@x.iam.gserviceaccount.com", now, 900);
+        let (url, to_sign) = v4_request("GET", "payroll-exports", "org/payroll-input/p 1.json", "jobs@x.iam.gserviceaccount.com", now, 900);
         assert!(url.starts_with("https://storage.googleapis.com/payroll-exports/org/payroll-input/p%201.json?X-Goog-Algorithm=GOOG4-RSA-SHA256&"), "{url}");
         assert!(url.contains("X-Goog-Credential=jobs%40x.iam.gserviceaccount.com%2F20261119%2Fauto%2Fstorage%2Fgoog4_request"), "{url}");
         assert!(url.ends_with("X-Goog-Date=20261119T100000Z&X-Goog-Expires=900&X-Goog-SignedHeaders=host"), "{url}");

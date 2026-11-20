@@ -50,6 +50,7 @@ Answers given by the project owner in session. Each decision closes the listed q
 | D-38 | 2026-11-20 | Gate 3 amendment: migration 0010 | **Approved:** `app.job`, `iam.dashboard_widget_choice`, `iam.dashboard_default_filter`; the outbox index and retention (DELETE for `app_relay`); an index on `audit_entry.change_ref`; `iam.user_account.mfa_last_step` (single-use authenticator codes). | — | MIGRATIONS.md 0010 |
 | D-39 | 2026-11-20 | Report file formats | **xlsx (default) and CSV**, xlsx through the `rust_xlsxwriter` library. | — | — |
 | D-40 | 2026-11-20 | Slice 18 scope | **Split:** 18 = report runs (R1–R10, R13, R25–R27), job polling and the audit views; 18b = dashboards and upload links; 19 = remaining vendor views. | — | — |
+| D-41 | 2026-11-20 | Dashboard defaults (OQ-C16-01, -02, -06) and spreadsheet upload size | **Assumed, open for the owner to change:** before a DB-01 choice a role sees every widget offered to it; a user with several roles lands on the broadest built-in one (`role` picks another); the Auditor and custom roles get an empty dashboard; spreadsheet uploads (opening balances, imports) up to 10 MB (DC-06 covers documents: PDF and images, 5 MB). | — (OQ-C16-01, -02, -06 stay open) | — |
 
 ## Answered but not yet closed (need a follow-up answer)
 

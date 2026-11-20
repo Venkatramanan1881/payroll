@@ -53,7 +53,8 @@ pub struct Auth(pub Principal, pub OrgTx<'static>);
 impl FromRequestParts<AppState> for Auth {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let is_write = !matches!(parts.method, Method::GET | Method::HEAD);
+        // Report runs are exports, allowed while the organisation is suspended (VC-R4, AC-C13-01.8).
+        let is_write = !matches!(parts.method, Method::GET | Method::HEAD) && !parts.uri.path().starts_with("/v1/reports/");
         let (p, tx) = authenticate(state, &parts.headers, is_write).await?;
         Ok(Auth(p, tx))
     }
