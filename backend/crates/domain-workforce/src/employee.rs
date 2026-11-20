@@ -266,6 +266,78 @@ pub async fn load_employee(tx: &mut OrgTx<'_>, id: Uuid, today: NaiveDate) -> Re
     Ok(row)
 }
 
+/// Who the caller may list: everyone, the employees whose current master branch or department is listed, or one employee.
+pub enum Visible<'a> {
+    All,
+    Branches(&'a [Uuid]),
+    Departments(&'a [Uuid]),
+    Only(Uuid),
+}
+
+#[derive(Default)]
+pub struct ListFilter {
+    pub q: Option<String>,
+    pub status: Option<String>,
+    pub branch: Option<Uuid>,
+    pub department: Option<Uuid>,
+    pub contractor: Option<Uuid>,
+}
+
+/// Sort keys offered by workforce.yaml; the id breaks ties so pages never overlap.
+pub fn order_by(sort: &str) -> Option<&'static str> {
+    Some(match sort {
+        "employee_code" => "e.employee_code, e.id",
+        "-employee_code" => "e.employee_code DESC, e.id DESC",
+        "full_name" => "e.full_name, e.id",
+        "-full_name" => "e.full_name DESC, e.id DESC",
+        "joining_date" => "e.joining_date, e.id",
+        "-joining_date" => "e.joining_date DESC, e.id DESC",
+        _ => return None,
+    })
+}
+
+/// workforce.yaml EmployeeSummary rows, using the assignments current today (or on the joining date for a future joiner,
+/// as `load_employee`). Returns up to `limit + 1` rows so the caller knows whether another page exists.
+// shortcut: offset paging; a row added or removed between pages can shift one row. Move to keyset if lists get busy.
+pub async fn list_employees(tx: &mut OrgTx<'_>, today: NaiveDate, visible: Visible<'_>, f: &ListFilter, order: &str, limit: i64, offset: i64) -> Result<Vec<Value>, WorkforceError> {
+    let (branches, departments, only) = match visible {
+        Visible::All => (None, None, None),
+        Visible::Branches(b) => (Some(b), None, None),
+        Visible::Departments(d) => (None, Some(d), None),
+        Visible::Only(id) => (None, None, Some(id)),
+    };
+    let like = f.q.as_deref().map(|q| format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT jsonb_build_object('id', e.id, 'employee_code', e.employee_code, 'full_name', e.full_name,
+                'employment_status', e.employment_status, 'master_branch_id', c.b, 'department_id', c.d, 'designation_id', c.g)
+         FROM workforce.employee e
+         CROSS JOIN LATERAL (
+           SELECT max(a.branch_id::text) FILTER (WHERE a.kind = 'master_branch')::uuid AS b,
+                  max(a.list_entry_id::text) FILTER (WHERE a.kind = 'department')::uuid AS d,
+                  max(a.list_entry_id::text) FILTER (WHERE a.kind = 'designation')::uuid AS g,
+                  max(a.contractor_id::text) FILTER (WHERE a.kind = 'contractor')::uuid AS k
+           FROM workforce.employee_assignment a WHERE a.employee_id = e.id AND a.valid @> greatest($1::date, e.joining_date)) c
+         WHERE c.b IS NOT NULL AND ($2::uuid[] IS NULL OR c.b = ANY($2)) AND ($3::uuid[] IS NULL OR c.d = ANY($3)) AND ($4::uuid IS NULL OR e.id = $4)
+           AND ($5::text IS NULL OR e.full_name ILIKE $5 OR e.employee_code ILIKE $5 OR e.mobile ILIKE $5)
+           AND ($6::text IS NULL OR e.employment_status = $6) AND ($7::uuid IS NULL OR c.b = $7)
+           AND ($8::uuid IS NULL OR c.d = $8) AND ($9::uuid IS NULL OR c.k = $9)
+         ORDER BY {order} LIMIT $10 OFFSET $11"
+    ))
+    .bind(today)
+    .bind(branches)
+    .bind(departments)
+    .bind(only)
+    .bind(like)
+    .bind(&f.status)
+    .bind(f.branch)
+    .bind(f.department)
+    .bind(f.contractor)
+    .bind(limit + 1)
+    .bind(offset)
+    .fetch_all(&mut ***tx)
+    .await?)
+}
+
 /// Weak ETag of an employee record (workforce.yaml): changes whenever the row or its assignments change.
 pub fn etag(employee: &Value) -> String {
     format!("W/\"{}\"", employee["updated_at"].as_str().unwrap_or_default())

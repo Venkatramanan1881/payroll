@@ -87,6 +87,61 @@ pub async fn patch(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderM
 }
 
 #[derive(serde::Deserialize)]
+pub struct ListQuery {
+    limit: Option<String>,
+    cursor: Option<String>,
+    branch_id: Option<String>,
+    department_id: Option<String>,
+    contractor_id: Option<String>,
+    employment_status: Option<String>,
+    q: Option<String>,
+    sort: Option<String>,
+}
+
+/// GET /v1/employees (WRK-08): the employees the caller's scope covers today; Self grants list only their own record.
+pub async fn list(Auth(p, mut tx): Auth, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
+    use domain_iam::authz::Scope;
+    use employee::Visible;
+    let bad = |m: &str| ApiError::ValidationFailed(m.to_string());
+    let grant = require(&mut tx, &p, "WRK-08").await?;
+    let id = |v: &Option<String>, name: &str| v.as_deref().map(Uuid::parse_str).transpose().map_err(|_| bad(&format!("{name} is not an id")));
+    let limit: i64 = match q.limit.as_deref() {
+        None => 50,
+        Some(s) => s.parse().ok().filter(|n| (1..=200).contains(n)).ok_or_else(|| bad("limit is 1-200"))?,
+    };
+    // The cursor is the offset of the next page, opaque to clients.
+    let offset: i64 = match q.cursor.as_deref() {
+        None => 0,
+        Some(c) => c.parse().ok().filter(|n| *n >= 0).ok_or_else(|| bad("cursor is not valid"))?,
+    };
+    let order = employee::order_by(q.sort.as_deref().unwrap_or("employee_code")).ok_or_else(|| bad("sort is not offered"))?;
+    if q.employment_status.as_deref().is_some_and(|s| !["on_probation", "active", "on_notice", "exited"].contains(&s)) {
+        return Err(bad("employment_status is not valid"));
+    }
+    if q.q.as_deref().is_some_and(|s| s.chars().count() > 100) {
+        return Err(bad("q is at most 100 characters"));
+    }
+    let filter = employee::ListFilter {
+        q: q.q.filter(|s| !s.trim().is_empty()),
+        status: q.employment_status,
+        branch: id(&q.branch_id, "branch_id")?,
+        department: id(&q.department_id, "department_id")?,
+        contractor: id(&q.contractor_id, "contractor_id")?,
+    };
+    let visible = match (&grant.kind, &grant.scope) {
+        (GrantKind::All | GrantKind::Scoped, Scope::All) => Visible::All,
+        (GrantKind::All | GrantKind::Scoped, Scope::Branches(b)) => Visible::Branches(b),
+        (GrantKind::All | GrantKind::Scoped, Scope::Departments(d)) => Visible::Departments(d),
+        (GrantKind::SelfOnly, _) if let Some(me) = p.employee_id => Visible::Only(me),
+        _ => return Ok(Json(serde_json::json!({ "items": [], "next_cursor": null }))),
+    };
+    let mut items = employee::list_employees(&mut tx, today(), visible, &filter, order, limit, offset).await?;
+    let more = items.len() as i64 > limit;
+    items.truncate(limit as usize);
+    Ok(Json(serde_json::json!({ "items": items, "next_cursor": more.then(|| (offset + limit).to_string()) })))
+}
+
+#[derive(serde::Deserialize)]
 pub struct AssignmentFilter {
     kind: Option<String>,
     on: Option<chrono::NaiveDate>,

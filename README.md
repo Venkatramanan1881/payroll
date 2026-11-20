@@ -6,6 +6,7 @@ Multi-tenant attendance, leave and payroll platform. Rust backend (Axum, SQLx, P
 |---|---|
 | `docs/` | Project documentation: requirements (BRD, TSD, decisions, open questions), product, domain, database, API contracts, plans |
 | `backend/` | Application code: Rust crates `db`, `domain-iam`, `domain-workforce`, `api` |
+| `web/` | Next.js web app (admin, self-service, vendor console); see `web/README.md` |
 | `.claude/skills/payroll-saas-engineering/` | The engineering skill (process and guardrails) used to build this project |
 
 The Cargo workspace is at the repository root (`Cargo.toml`); migrations live in `backend/crates/db/migrations/` and are embedded as `db::MIGRATOR`.

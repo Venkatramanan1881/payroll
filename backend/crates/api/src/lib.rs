@@ -220,7 +220,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/period/adjustments", get(routes::period::list_adjustments))
         .route("/v1/periods/{id}/payroll-input-exports", post(routes::period::produce_export).get(routes::period::list_exports))
         .route("/v1/period/payroll-input-exports/{id}/download-link", get(routes::period::download_link))
-        .route("/v1/employees", post(routes::employees::create))
+        .route("/v1/employees", get(routes::employees::list).post(routes::employees::create))
         .route("/v1/employees/{employee_id}", get(routes::employees::get).patch(routes::employees::patch))
         .route("/v1/employees/{employee_id}/assignments", get(routes::employees::list_assignments))
         .route("/v1/employees/{employee_id}/change-assignment", post(routes::employees::change_assignment))
