@@ -78,21 +78,23 @@ export type ExplanationStep = { step: number; rule_ref: string; outcome: string;
 export type DayResult = {
   id: string;
   is_current: boolean;
-  day_status: DayStatus | null;
-  day_fraction_present: string | null;
-  gross_minutes: number | null;
-  break_minutes: number | null;
-  net_minutes: number | null;
-  late_minutes: number | null;
-  early_minutes: number | null;
-  overtime_identified_minutes: number | null;
-  late_mark: boolean;
-  early_mark: boolean;
-  flags: string[] | null;
-  sessions: Session[] | null;
-  punches_used: PunchUsed[];
-  day_effects: DayEffect[];
-  explanation: ExplanationStep[] | null;
+  day_status?: DayStatus | null;
+  day_fraction_present?: string | null;
+  // Optional fields may be omitted for employees (AC-05), never nulled.
+  gross_minutes?: number | null;
+  break_minutes?: number | null;
+  net_minutes?: number | null;
+  late_minutes?: number | null;
+  early_minutes?: number | null;
+  overtime_identified_minutes?: number | null;
+  late_mark?: boolean;
+  early_mark?: boolean;
+  flags?: string[] | null;
+  sessions?: Session[] | null;
+  /** Omitted for employees when AC-05 hides them. */
+  punches_used?: PunchUsed[];
+  day_effects?: DayEffect[];
+  explanation?: ExplanationStep[] | null;
   schedule_tz: string | null;
   engine_version: string;
   trigger_kind: string;
@@ -126,6 +128,7 @@ export type Regularisation = {
   proposed_in_at: string | null;
   proposed_out_at: string | null;
   reason: string;
+  requested_by_user_id: string;
   submitted_at: string;
   decided_at: string | null;
   approval_steps: ApprovalStep[];
@@ -170,4 +173,16 @@ export type LeaveRequest = {
   cancelled_at: string | null;
   days: { leave_date: string; fraction: string; half: string | null }[];
   steps: ApprovalStep[];
+};
+
+export type CalendarDay = { attendance_date: string; processing_state?: ProcessingState; day_status?: DayStatus; late_mark?: boolean; early_mark?: boolean; has_exception?: boolean };
+export type InboxItem = {
+  id: string;
+  event_code: string;
+  title: string;
+  body: string;
+  link: { kind: string; id: string } | null;
+  created_at: string;
+  read_at: string | null;
+  recipient_kind: "employee" | "approver";
 };

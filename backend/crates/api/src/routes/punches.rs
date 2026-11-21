@@ -151,6 +151,21 @@ pub async fn record(Auth(p, mut tx): Auth, conn: Conn, headers: HeaderMap, raw: 
 // Scope
 
 /// Employees the caller may see for `op`: None = every employee. Scope is by today's assignment, as for employees.
+/// AC-05: what employees may see of their own records. Applies only when the caller reads through a Self grant of
+/// `op`; HR or a manager who is also an employee sees everything their other grants allow. None = no filtering.
+pub(crate) async fn self_visibility(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<Option<Value>, ApiError> {
+    let g = require(tx, p, op).await?;
+    if g.kind != GrantKind::SelfOnly {
+        return Ok(None);
+    }
+    Ok(Some(domain_iam::admin::access_settings(tx).await?["employee_visibility"].clone()))
+}
+
+/// Whether an AC-05 item is shown (missing settings mean shown, as the defaults).
+pub(crate) fn shown(vis: &Option<Value>, key: &str) -> bool {
+    vis.as_ref().is_none_or(|v| v[key].as_bool().unwrap_or(true))
+}
+
 pub(crate) async fn visible_employees(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<Option<Vec<Uuid>>, ApiError> {
     let g = require(tx, p, op).await?;
     let today = crate::routes::employees::today();
@@ -314,6 +329,9 @@ pub async fn get(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Val
     if !sees(&visible, employee) {
         return Err(ApiError::NotFound);
     }
+    if !shown(&self_visibility(&mut tx, &p, "TCP-07").await?, "own_punches") {
+        return Err(ApiError::Forbidden); // AC-05 "own punches" is off for employees
+    }
     redact(&mut body, &loc);
     Ok(Json(body))
 }
@@ -331,6 +349,9 @@ pub struct PunchQuery {
 /// GET /v1/punches (TCP-07).
 pub async fn list(Auth(p, mut tx): Auth, Query(q): Query<PunchQuery>) -> Result<Json<Value>, ApiError> {
     let visible = visible_employees(&mut tx, &p, "TCP-07").await?;
+    if !shown(&self_visibility(&mut tx, &p, "TCP-07").await?, "own_punches") {
+        return Err(ApiError::Forbidden); // AC-05 "own punches" is off for employees
+    }
     let loc = location_scope(&mut tx, &p).await?;
     let f = punch::PunchFilter { employees: narrow(visible, q.employee_id), from: q.from, to: q.to, source: q.source, has_open_flag: q.has_open_flag };
     let mut items = punch::list_punches(&mut tx, &f, true).await?;

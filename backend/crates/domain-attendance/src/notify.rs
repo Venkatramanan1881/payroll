@@ -102,7 +102,7 @@ async fn send(tx: &mut OrgTx<'_>, event: &str, recipient_kind: &str, user: Uuid,
     )
     .bind(event)
     .bind(user)
-    .bind(json!({ "title": title, "body": body, "link": link }))
+    .bind(json!({ "title": title, "body": body, "link": link, "recipient_kind": recipient_kind }))
     .bind(dedupe)
     .execute(&mut ***tx)
     .await?;
@@ -302,7 +302,8 @@ pub async fn digest(tx: &mut OrgTx<'_>) -> Result<Value, DomainError> {
 pub async fn inbox(tx: &mut OrgTx<'_>, user: Uuid, unread: Option<bool>, event: Option<&str>) -> Result<Value, DomainError> {
     let items: Vec<Value> = sqlx::query_scalar(
         "SELECT jsonb_build_object('id', id, 'event_code', event_code, 'title', payload->>'title', 'body', payload->>'body',
-                                   'link', CASE WHEN jsonb_typeof(payload->'link') = 'object' THEN payload->'link' END, 'created_at', created_at, 'read_at', read_at)
+                                   'link', CASE WHEN jsonb_typeof(payload->'link') = 'object' THEN payload->'link' END, 'created_at', created_at, 'read_at', read_at,
+                                   'recipient_kind', coalesce(payload->>'recipient_kind', 'employee'))
          FROM notify.notification WHERE recipient_user_id = $1 AND channel = 'in_app'
            AND ($2::boolean IS NULL OR (read_at IS NULL) = $2) AND ($3::text IS NULL OR event_code = $3)
          ORDER BY created_at DESC, id LIMIT 200",
