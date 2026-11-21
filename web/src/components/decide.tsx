@@ -12,7 +12,7 @@ import type { Problem } from "@/lib/problem";
  * Approve/accept with an optional comment, or reject with a reason, for one item at `base`
  * (`${base}/approve` or `/accept`, `${base}/reject`). One Idempotency-Key per decision, so a double click decides once.
  */
-export function Decide({ base, yes, onDone }: { base: string; yes: "approve" | "accept"; onDone: () => void }) {
+export function Decide({ base, yes, onDone }: { base: string; yes: "approve" | "accept" | "confirm"; onDone: () => void }) {
   const t = useTranslations("decide");
   const [rejecting, setRejecting] = useState(false);
   const [note, setNote] = useState("");

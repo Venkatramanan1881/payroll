@@ -26,6 +26,7 @@ export function useBff<T>(path: string) {
   return {
     loading: current === null,
     data: shown?.ok ? shown.data : null,
+    etag: shown?.ok ? shown.etag : null,
     problem: current && !current.ok ? current.problem : null,
     reload: () => setTick((n) => n + 1),
   };

@@ -26,6 +26,14 @@ async fn scope(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<Option<Vec
     visible_employees(tx, p, op).await
 }
 
+/// Reading batches and entries: OBL-04, or the OBL-02 decider (whoever confirms or rejects a batch may read it).
+async fn read_scope(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Option<Vec<Uuid>>, ApiError> {
+    match scope(tx, p, "OBL-04").await {
+        Err(ApiError::Forbidden) => scope(tx, p, "OBL-02").await,
+        other => other,
+    }
+}
+
 /// The grant kinds the caller holds for `op` across roles (approving and entering are different rights, OB-01).
 async fn kinds(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<Vec<String>, ApiError> {
     Ok(sqlx::query_scalar("SELECT g.grant_kind FROM iam.role_grant g JOIN iam.user_role r ON r.role_id = g.role_id WHERE r.user_id = $1 AND g.operation_code = $2")
@@ -95,13 +103,13 @@ pub struct BatchQuery {
 
 /// GET /v1/opening-balances/batches (OBL-04).
 pub async fn list_batches(Auth(p, mut tx): Auth, Query(q): Query<BatchQuery>) -> Result<Json<Value>, ApiError> {
-    let visible = scope(&mut tx, &p, "OBL-04").await?;
+    let visible = read_scope(&mut tx, &p).await?;
     Ok(Json(json!({ "items": ob::list_batches(&mut tx, q.state.as_deref(), visible.as_deref()).await?, "next_cursor": null })))
 }
 
 /// GET /v1/opening-balances/batches/{id} (OBL-04).
 pub async fn get_batch(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Response, ApiError> {
-    let visible = scope(&mut tx, &p, "OBL-04").await?;
+    let visible = read_scope(&mut tx, &p).await?;
     let batch = ob::get_batch(&mut tx, id).await?;
     if !ob::batch_visible(&mut tx, id, visible.as_deref()).await? {
         return Err(ApiError::NotFound);
@@ -142,12 +150,13 @@ pub struct EntryQuery {
 
 /// GET /v1/opening-balances/batches/{id}/entries (OBL-04), within scope.
 pub async fn list_entries(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, Query(q): Query<EntryQuery>) -> Result<Json<Value>, ApiError> {
-    let visible = scope(&mut tx, &p, "OBL-04").await?;
-    let items: Vec<Value> = ob::list_entries(&mut tx, id, q.employee_id, q.balance_kind.as_deref(), q.include_superseded.unwrap_or(false))
+    let visible = read_scope(&mut tx, &p).await?;
+    let mut items: Vec<Value> = ob::list_entries(&mut tx, id, q.employee_id, q.balance_kind.as_deref(), q.include_superseded.unwrap_or(false))
         .await?
         .into_iter()
         .filter(|e| sees(&visible, e["employee_id"].as_str().and_then(|s| s.parse().ok())))
         .collect();
+    crate::routes::with_names(&mut tx, &mut items).await?;
     Ok(Json(json!({ "items": items, "next_cursor": null })))
 }
 

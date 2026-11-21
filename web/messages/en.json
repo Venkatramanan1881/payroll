@@ -36,7 +36,10 @@
     "ADJUSTMENT_WINDOW_EXCEEDED": "This date is too old to adjust.",
     "INSUFFICIENT_BALANCE": "There is not enough leave balance for this request.",
     "OVERLAPPING_REQUEST": "This overlaps another leave request.",
-    "VERSION_FROZEN": "This version is published and can no longer change. Create a new version instead."
+    "VERSION_FROZEN": "This version is published and can no longer change. Create a new version instead.",
+    "PERIOD_NOT_READY": "This period cannot be locked yet.",
+    "PENDING_ITEMS": "Items are still pending for this period.",
+    "UNLOCK_NOT_ALLOWED": "The period settings do not allow unlocking a locked period."
   },
   "signIn": {
     "title": "Sign in",
@@ -74,7 +77,9 @@
     "shifts": "Shifts",
     "roster": "Roster",
     "holidays": "Holidays",
-    "requests": "Requests"
+    "requests": "Requests",
+    "periods": "Periods",
+    "openingBalances": "Opening balances"
   },
   "me": {
     "title": "My details",
@@ -337,7 +342,8 @@
     "reason": "Reason for rejecting",
     "confirmReject": "Confirm rejection",
     "done": "Decision recorded.",
-    "back": "Back"
+    "back": "Back",
+    "confirm": "Confirm"
   },
   "leave": {
     "title": "Leave",
@@ -597,5 +603,156 @@
     "credits": "Credits",
     "myPermissions": "My permissions",
     "myOnDuty": "My on-duty requests"
+  },
+  "per": {
+    "title": "Attendance periods",
+    "periods": "Periods",
+    "from": "From",
+    "to": "To",
+    "cutoff": "Cut-off",
+    "state": "State",
+    "st": {
+      "open": "Open",
+      "past_cut_off": "Past cut-off",
+      "awaiting_lock": "Awaiting lock",
+      "locked": "Locked",
+      "unlocked": "Unlocked"
+    },
+    "cycles": "Cycles",
+    "owner": "Applies to",
+    "frequency": "Frequency",
+    "start": "Starts",
+    "validFrom": "Valid from",
+    "pendingApproval": "Waiting for approval",
+    "ok": {
+      "organisation": "Organisation",
+      "branch": "Branch",
+      "policy_set": "Policy set"
+    },
+    "fq": {
+      "daily": "Daily",
+      "weekly": "Weekly",
+      "bi_weekly": "Every two weeks",
+      "monthly": "Monthly"
+    },
+    "sk": {
+      "calendar": "Calendar",
+      "custom": "Custom day"
+    },
+    "newCycle": "New cycle",
+    "addCycle": "Add cycle",
+    "customDay": "Start day",
+    "cutoffDay": "Cut-off day",
+    "reason": "Reason",
+    "branch": "Branch",
+    "settings": "Period settings",
+    "saveSettings": "Save settings",
+    "saved": "Saved.",
+    "s": {
+      "after_cutoff_days": "Days after the cut-off",
+      "lock_mode": "Lock",
+      "auto_lock_day": "Automatic lock day",
+      "pending_at_lock": "Pending items at lock",
+      "unlock": "Unlock",
+      "adjustment_past_periods": "Adjust up to this many past periods"
+    },
+    "sv": {
+      "assumed_present": "Assumed present",
+      "held_until_actuals": "Held until actuals",
+      "manual": "Manual",
+      "automatic": "Automatic",
+      "block": "Block the lock",
+      "allow_as_absent": "Allow, count as absent",
+      "allow_as_present": "Allow, count as present",
+      "never": "Never",
+      "with_org_admin_approval": "With the Organisation Admin's approval"
+    },
+    "history": "History",
+    "checklist": "Before locking",
+    "checklistEmpty": "Nothing is pending.",
+    "ck": {
+      "pending_request": "Pending requests",
+      "flagged_day": "Flagged days",
+      "unresolved_missed_punch": "Unresolved missed punches"
+    },
+    "lock": "Lock period",
+    "lockHelp": "Locking freezes the totals for payroll. Changes after this become adjustments in a later period.",
+    "comment": "Comment (optional)",
+    "confirmLock": "Lock it now? This freezes the period's totals.",
+    "locked": "Locked {at}",
+    "unlocks": "Unlock requests",
+    "requestUnlock": "Request unlock",
+    "unlockReason": "Why it must be unlocked",
+    "noUnlocks": "No unlock requests.",
+    "totals": "Totals",
+    "payable": "Payable days",
+    "deduction": "Deduction days",
+    "late": "Late (min)",
+    "early": "Early (min)",
+    "hold": "Pay hold",
+    "basis": {
+      "frozen": "Frozen at lock",
+      "provisional": "Provisional"
+    },
+    "noTotals": "No totals yet.",
+    "adjustments": "Adjustments into this period",
+    "noAdjustments": "No adjustments.",
+    "date": "Date",
+    "days": "Days",
+    "as": {
+      "posted": "Posted",
+      "frozen": "Frozen",
+      "exported": "Exported"
+    },
+    "exports": "Payroll input exports",
+    "produce": "Produce export",
+    "download": "Download",
+    "noExports": "No exports yet.",
+    "producedAt": "Produced",
+    "checksum": "Checksum",
+    "linkNote": "Download links last 15 minutes.",
+    "employee": "Employee"
+  },
+  "ob": {
+    "title": "Opening balances",
+    "batches": "Batches",
+    "newBatch": "New batch",
+    "state": "State",
+    "entries": "Entries",
+    "created": "Created",
+    "bs": {
+      "draft": "Draft",
+      "pending_approval": "Waiting for approval",
+      "confirmed": "Confirmed"
+    },
+    "bk": {
+      "leave": "Leave",
+      "comp_off": "Comp-off",
+      "permission_used": "Permissions used",
+      "late_counter": "Late counter",
+      "early_counter": "Early counter"
+    },
+    "batch": "Batch",
+    "employee": "Employee",
+    "kind": "Balance",
+    "type": "Type",
+    "value": "Value",
+    "asOf": "As of",
+    "reason": "Reason",
+    "add": "Add entry",
+    "addHelp": "Value with two decimals, e.g. 6.00 (days for leave and comp-off; a count for the others).",
+    "edit": "Save",
+    "remove": "Remove",
+    "change": "Change",
+    "changeHelp": "A confirmed balance changes by a reversal and a new entry, with a reason (OB-02).",
+    "submit": "Submit for approval",
+    "confirm": "Confirm",
+    "reject": "Reject",
+    "rejectReason": "Reason for rejecting",
+    "noEntries": "No entries yet.",
+    "pick": "Choose an employee",
+    "confirmRemove": "Remove this entry?",
+    "empty": "No batches yet.",
+    "superseded": "Superseded"
   }
 }

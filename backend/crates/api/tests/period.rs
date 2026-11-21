@@ -131,8 +131,10 @@ async fn lock_blocks_on_pending_then_freezes_days_and_totals(pool: PgPool) {
     let (_, provisional) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/periods/{last}/totals"), None, &[]).await;
     let t = &provisional["items"][0];
     assert_eq!((t["basis"].as_str(), t["deduction_days"].as_str()), (Some("provisional"), Some("3.00")), "{provisional}");
+    assert!(t["employee_name"].is_string() && t["employee_code"].is_string(), "totals name the employee: {t}");
     let (_, list) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/periods/{last}/checklist"), None, &[]).await;
     assert_eq!((list["counts"]["pending_request"].as_i64(), list["items"][0]["date"].as_str()), (Some(1), Some(&*pending_day.to_string())), "{list}");
+    assert!(list["items"][0]["employee_name"].is_string(), "checklist items name the employee");
 
     let (st, b) = common::as_user(&app, &s.hr_token, "POST", &format!("/v1/periods/{last}/lock"), None, &key()).await;
     assert_eq!((st, b["code"].as_str(), b["errors"].as_array().map(Vec::len)), (StatusCode::CONFLICT, Some("PENDING_ITEMS_BLOCK_LOCK"), Some(1)), "{b}");
@@ -285,10 +287,15 @@ async fn unlock_needs_someone_else_and_reopens_the_days(pool: PgPool) {
     let (admin, role) = (Uuid::new_v4(), Uuid::new_v4());
     sqlx::query("INSERT INTO iam.user_account (org_id, id, login_kind, email, password_hash) VALUES ($1, $2, 'password', 'oa@test.invalid', 'x')").bind(s.org_id).bind(admin).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO iam.role (org_id, id, name) VALUES ($1, $2, 'Org Admin')").bind(s.org_id).bind(role).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, 'PER-05', 'scoped')").bind(s.org_id).bind(role).execute(&pool).await.unwrap();
+    // The default grant: PER-05 `approve` (defaults.rs), with no PER-08.
+    sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, 'PER-05', 'approve')").bind(s.org_id).bind(role).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(s.org_id).bind(admin).bind(role).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO iam.user_scope (org_id, user_id, scope_kind) VALUES ($1, $2, 'all')").bind(s.org_id).bind(admin).execute(&pool).await.unwrap();
     let oa = common::token(admin, s.org_id);
+    for read in [format!("/v1/periods/{last}"), "/v1/periods".to_string(), uri.clone()] {
+        assert_eq!(common::as_user(&app, &oa, "GET", &read, None, &[]).await.0, StatusCode::OK, "the decider may read {read}");
+    }
+    assert_eq!(common::as_user(&app, &oa, "GET", &format!("/v1/periods/{last}/totals"), None, &[]).await.0, StatusCode::FORBIDDEN, "but not the totals (PER-08)");
     let (st, done) = common::as_user(&app, &oa, "POST", &approve, Some(json!({ "comment": "ok" })), &key()).await;
     assert_eq!((st, done["state"].as_str(), done["approval_steps"].as_array().map(Vec::len)), (StatusCode::OK, Some("approved"), Some(2)), "{done}");
     assert_eq!(common::as_user(&app, &oa, "POST", &approve, None, &key()).await.0, StatusCode::OK, "approve twice: same answer");

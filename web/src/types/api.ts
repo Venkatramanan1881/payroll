@@ -244,3 +244,39 @@ export type CompOffCredit = Decidable & {
 export type PermissionType = { id: string; code: string; name: string; retired_at: string | null };
 export type PermissionUsage = { permission_type_id: string; limit_basis: string; period_from: string; period_to: string; used_count: number; used_minutes: number; remaining_count: number | null; remaining_minutes: number | null };
 export type CompOffBalance = { balance: string; pending_approval_days: string; open_credits: CompOffCredit[] };
+
+// period.yaml / opening-balances.yaml
+export type PeriodState = "open" | "past_cut_off" | "awaiting_lock" | "locked" | "unlocked";
+export type AttendancePeriod = {
+  id: string;
+  cycle_id: string;
+  period_start: string;
+  period_end: string;
+  cutoff_date: string | null;
+  state: PeriodState;
+  locked_at: string | null;
+  state_history?: { from_state: string | null; to_state: string; reason: string | null; created_at: string }[];
+};
+export type AttendanceCycle = { id: string; owner_kind: string; owner_id: string; frequency: string; start_kind: string; custom_start_day: number | null; cutoff_day: number | null; valid_from: string; valid_to: string | null; pending_approval?: boolean };
+export type PeriodSettings = { after_cutoff_days: string; lock_mode: string; auto_lock_day: number | null; pending_at_lock: string; unlock: string; adjustment_past_periods: number; pending_approval?: boolean; updated_at?: string };
+export type ChecklistItem = { kind: "pending_request" | "flagged_day" | "unresolved_missed_punch"; employee_id: string; employee_code: string; employee_name?: string; date: string; request_type: string | null; request_id: string | null };
+export type Checklist = { counts: Record<string, number>; items: ChecklistItem[]; is_snapshot: boolean };
+export type UnlockRequest = { id: string; reason: string; state: RequestState; submitted_at: string; approval_steps: ApprovalStep[] };
+export type PeriodTotals = { employee_id: string; employee_code?: string; employee_name?: string; basis: "frozen" | "provisional"; payable_days: string; deduction_days: string; late_minutes: number; early_minutes: number; pay_hold: boolean };
+export type PeriodAdjustment = { id: string; employee_id: string; employee_code?: string; employee_name?: string; original_date: string; days: string; state: "posted" | "frozen" | "exported" };
+export type PayrollExport = { id: string; produced_at: string; checksum: string };
+export type ObBatch = { id: string; state: "draft" | "pending_approval" | "confirmed"; entry_count: number; created_at: string; updated_at: string; approval_steps: ApprovalStep[] };
+export type ObEntry = {
+  id: string;
+  employee_id: string;
+  employee_code?: string;
+  employee_name?: string;
+  balance_kind: "leave" | "comp_off" | "permission_used" | "late_counter" | "early_counter";
+  leave_type_id: string | null;
+  permission_type_id: string | null;
+  value: string;
+  as_of_date: string;
+  change_reason: string | null;
+  superseded_by_entry_id: string | null;
+  updated_at: string;
+};
