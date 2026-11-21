@@ -37,10 +37,14 @@ pub struct ListQuery {
     state: Option<String>,
     from: Option<NaiveDate>,
     to: Option<NaiveDate>,
+    awaiting_me: Option<bool>,
 }
 
-/// GET /v1/comp-off/credits.
+/// GET /v1/comp-off/credits; `awaiting_me` = the credits the caller may decide now.
 pub async fn list(Auth(p, mut tx): Auth, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
+    if q.awaiting_me == Some(true) {
+        return Ok(Json(json!({ "items": co::awaiting(&mut tx, &p).await?, "next_cursor": null })));
+    }
     let employees = readable(&mut tx, &p).await?;
     let f = co::Filter { employees, approver: p.user_id, employee: q.employee_id, state: q.state, from: q.from, to: q.to };
     Ok(Json(json!({ "items": co::list(&mut tx, &f).await?, "next_cursor": null })))
@@ -52,7 +56,14 @@ pub async fn get(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Val
     let employee = body["employee_id"].as_str().and_then(|s| s.parse().ok());
     let visible = sees(&readable(&mut tx, &p).await?, employee);
     let routed = body["current_approver_user_id"] == json!(p.user_id) || body["decided_by"] == json!(p.user_id);
-    if visible || routed { Ok(Json(body)) } else { Err(ApiError::NotFound) }
+    // A caller who may decide it (e.g. a delegate, or the approver pool) may also read it, as for leave.
+    let can_decide = co::can_decide(&mut tx, &p, id).await?;
+    if !(visible || routed || can_decide) {
+        return Err(ApiError::NotFound);
+    }
+    let mut body = body;
+    body["can_decide"] = json!(can_decide);
+    Ok(Json(body))
 }
 
 #[derive(Deserialize, Default)]

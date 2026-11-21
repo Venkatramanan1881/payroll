@@ -208,6 +208,8 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
 }
 
 const CREDIT_JSON: &str = "jsonb_build_object('id', c.id, 'employee_id', c.employee_id, 'worked_date', c.worked_date, 'fraction', to_char(c.fraction, 'FM0.00'),
+    'employee_code', (SELECT e.employee_code FROM workforce.employee e WHERE e.id = c.employee_id),
+    'employee_name', (SELECT e.full_name FROM workforce.employee e WHERE e.id = c.employee_id),
     'earned_basis', c.earned_basis, 'state', c.state, 'expires_on', c.expires_on, 'escalated', c.escalated,
     'current_approver_user_id', c.current_approver_user_id, 'decided_at', c.decided_at, 'decided_by', c.decided_by,
     'remaining', to_char(coalesce((SELECT sum(e.quantity) FROM leave.comp_off_ledger_entry e WHERE e.credit_id = c.id), 0), 'FM990.00'),
@@ -232,6 +234,32 @@ pub struct Filter {
     pub state: Option<String>,
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
+}
+
+/// Whether `decide` would accept the caller now: a pending credit, never one's own, CMP-05 with routing or scope.
+pub async fn can_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<bool, DomainError> {
+    let r: Option<(Uuid, Option<Uuid>)> =
+        sqlx::query_as("SELECT employee_id, current_approver_user_id FROM leave.comp_off_credit WHERE id = $1 AND state = 'pending_approval'").bind(id).fetch_optional(&mut ***tx).await?;
+    let Some((employee, approver)) = r else { return Ok(false) };
+    if p.employee_id == Some(employee) {
+        return Ok(false);
+    }
+    match approval::may_decide(tx, p, employee, "CMP-05", approver).await {
+        Ok(_) => Ok(true),
+        Err(DomainError::NotFound | DomainError::Forbidden) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The credits waiting for the caller's decision: exactly those `can_decide` accepts, newest first.
+pub async fn awaiting(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Vec<Value>, DomainError> {
+    let mut out = Vec::new();
+    for id in approval::awaiting_candidates(tx, p, "leave.comp_off_credit", "q.created_at", &["pending_approval"]).await? {
+        if can_decide(tx, p, id).await? {
+            out.push(get(tx, id).await?);
+        }
+    }
+    Ok(out)
 }
 
 pub async fn list(tx: &mut OrgTx<'_>, f: &Filter) -> Result<Vec<Value>, DomainError> {

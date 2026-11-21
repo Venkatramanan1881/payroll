@@ -73,7 +73,8 @@
     "leave": "Leave",
     "shifts": "Shifts",
     "roster": "Roster",
-    "holidays": "Holidays"
+    "holidays": "Holidays",
+    "requests": "Requests"
   },
   "me": {
     "title": "My details",
@@ -84,7 +85,8 @@
       "leave": "My leave",
       "notifications": "Notifications",
       "admin": "Admin",
-      "schedule": "My schedule"
+      "schedule": "My schedule",
+      "requests": "My requests"
     },
     "unread": "{count} unread",
     "month": "Month",
@@ -513,5 +515,87 @@
     "discard": "Discard changes",
     "confirmRemove": "Remove this holiday? This cannot be undone.",
     "confirmRetire": "Retire it? It stays in history but can no longer be chosen."
+  },
+  "req": {
+    "title": "Requests",
+    "kinds": {
+      "permission": "Permissions",
+      "on_duty": "On-duty",
+      "comp_off": "Comp-off"
+    },
+    "one": {
+      "permission": "Permission",
+      "on_duty": "On-duty",
+      "comp_off": "Comp-off credit"
+    },
+    "mine": "Waiting for me",
+    "all": "All",
+    "employee": "Employee",
+    "state": "State",
+    "date": "Date",
+    "type": "Type",
+    "time": "Time",
+    "dates": "Dates",
+    "place": "Place",
+    "purpose": "Purpose",
+    "reason": "Reason",
+    "minutes": "{count} min",
+    "kind": "Kind",
+    "worked": "Worked date",
+    "fraction": "Days",
+    "expires": "Expires",
+    "remaining": "Remaining",
+    "basis": "Basis",
+    "empty": "Nothing here.",
+    "emptyMine": "Nothing is waiting for you.",
+    "steps": "Approval history",
+    "origin": "Origin",
+    "cancel": "Cancel request",
+    "cancelReason": "Reason for cancelling",
+    "confirmCancel": "Confirm cancellation",
+    "dk": {
+      "hours": "Hours",
+      "half_day": "Half day",
+      "full_day": "Full day",
+      "several_days": "Several days"
+    },
+    "po": {
+      "applied": "Applied",
+      "converted_late": "Converted from a late arrival",
+      "converted_early": "Converted from an early leaving"
+    },
+    "cs": {
+      "pending_approval": "Waiting for approval",
+      "credited": "Credited",
+      "partially_used": "Partly used",
+      "used": "Used",
+      "expired_lapsed": "Expired",
+      "expired_paid": "Expired (paid)",
+      "not_credited": "Not credited"
+    },
+    "cb": {
+      "policy": "Policy",
+      "employee_choice": "Employee's choice",
+      "opening": "Opening balance"
+    },
+    "applyPermission": "Apply for a permission",
+    "applyOnDuty": "Apply for on-duty",
+    "submit": "Submit",
+    "sent": "Sent for approval.",
+    "from": "From",
+    "to": "To",
+    "fromTime": "From time",
+    "toTime": "To time",
+    "usage": "Permission use this period",
+    "used": "Used",
+    "left": "Left",
+    "times": "{count, plural, one {# time} other {# times}}",
+    "noUsage": "No permission types.",
+    "compOff": "Comp-off",
+    "balance": "Balance",
+    "pendingDays": "Waiting for approval",
+    "credits": "Credits",
+    "myPermissions": "My permissions",
+    "myOnDuty": "My on-duty requests"
   }
 }

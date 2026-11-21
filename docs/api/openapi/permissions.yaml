@@ -228,6 +228,10 @@ paths:
         - name: origin
           in: query
           schema: { $ref: '#/components/schemas/PermissionOrigin' }
+        - name: awaiting_me
+          in: query
+          description: 'Only what the caller may decide now (routed to them, through an allowed delegation, or unrouted within their grant''s scope); the same check as approve / reject (web slice 6).'
+          schema: { type: boolean, default: false }
         - $ref: 'common.yaml#/components/parameters/From'
         - $ref: 'common.yaml#/components/parameters/To'
         - $ref: 'common.yaml#/components/parameters/BranchFilter'
@@ -616,6 +620,10 @@ paths:
         - name: state
           in: query
           schema: { $ref: 'common.yaml#/components/schemas/RequestState' }
+        - name: awaiting_me
+          in: query
+          description: 'Only what the caller may decide now (routed to them, through an allowed delegation, or unrouted within their grant''s scope); the same check as approve / reject (web slice 6).'
+          schema: { type: boolean, default: false }
         - $ref: 'common.yaml#/components/parameters/From'
         - $ref: 'common.yaml#/components/parameters/To'
         - $ref: 'common.yaml#/components/parameters/BranchFilter'
@@ -783,6 +791,11 @@ components:
             id: { $ref: 'common.yaml#/components/schemas/Id' }
             employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
             permission_type_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_code: { type: string, description: For display (web slice 6). }
+            employee_name: { type: string, description: For display (web slice 6). }
+            can_decide: { type: boolean, description: 'GET by id only: whether approve / reject would accept the caller now.' }
+            can_cancel: { type: boolean, description: 'GET by id only: whether cancel would accept the caller; time limits are checked on the attempt.' }
+            permission_type_name: { type: string, description: For display (web slice 6). }
             permission_date: { $ref: 'common.yaml#/components/schemas/Date' }
             start_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
             end_time: { $ref: 'common.yaml#/components/schemas/TimeOfDay' }
@@ -802,6 +815,10 @@ components:
           properties:
             id: { $ref: 'common.yaml#/components/schemas/Id' }
             employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+            employee_code: { type: string, description: For display (web slice 6). }
+            employee_name: { type: string, description: For display (web slice 6). }
+            can_decide: { type: boolean, description: 'GET by id only: whether approve / reject would accept the caller now.' }
+            can_cancel: { type: boolean, description: 'GET by id only: whether cancel would accept the caller; time limits are checked on the attempt.' }
             duration_kind: { $ref: '#/components/schemas/OnDutyDurationKind' }
             from_date: { $ref: 'common.yaml#/components/schemas/Date' }
             to_date: { $ref: 'common.yaml#/components/schemas/Date' }

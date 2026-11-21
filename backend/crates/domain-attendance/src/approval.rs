@@ -83,6 +83,55 @@ pub async fn may_decide(tx: &mut OrgTx<'_>, p: &Principal, employee: Uuid, op: &
     }
 }
 
+/// Whether `decide` of a two-level request (leave, permission, on-duty) would accept the caller now: never one's own
+/// (BR-07), the level's grant with routing or scope (`may_decide`), and never the first-level approver at level 2.
+/// `table` is a fixed table name from the calling module, never input.
+pub async fn can_decide_two_level(tx: &mut OrgTx<'_>, p: &Principal, kind: &str, table: &str, id: Uuid, ops: (&str, &str)) -> Result<bool, DomainError> {
+    let r: Option<(Uuid, String, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(&format!(
+        "SELECT employee_id, state, requested_by, current_approver_user_id FROM {table} WHERE id = $1 AND state IN ('pending_l1','pending_l2')"
+    ))
+    .bind(id)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let Some((employee, state, requester, approver)) = r else { return Ok(false) };
+    if requester == Some(p.user_id) || p.employee_id == Some(employee) {
+        return Ok(false);
+    }
+    let op = if state == "pending_l1" { ops.0 } else { ops.1 };
+    match may_decide(tx, p, employee, op, approver).await {
+        Ok(_) => {}
+        Err(DomainError::NotFound | DomainError::Forbidden) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    if state == "pending_l2" {
+        let twice: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM app.approval_step WHERE request_type = $1 AND request_id = $2 AND action = 'approved' AND actor_user_id = $3)")
+            .bind(kind)
+            .bind(id)
+            .bind(p.user_id)
+            .fetch_one(&mut ***tx)
+            .await?;
+        return Ok(!twice);
+    }
+    Ok(true)
+}
+
+/// Pending requests that may be waiting for the caller: routed to them, to someone who delegated to them, or to nobody
+/// (the HR pool). Callers keep only those their `can_decide` accepts. Newest first.
+// shortcut: up to 500 candidates checked one by one; move the predicate into SQL when queues grow.
+pub async fn awaiting_candidates(tx: &mut OrgTx<'_>, p: &Principal, table: &str, order_by: &str, pending: &[&str]) -> Result<Vec<Uuid>, DomainError> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT q.id FROM {table} q
+         WHERE q.state = ANY($2)
+           AND (q.current_approver_user_id IS NULL OR q.current_approver_user_id = $1
+                OR q.current_approver_user_id IN (SELECT approver_user_id FROM iam.delegation WHERE delegate_user_id = $1 AND valid @> now()))
+         ORDER BY {order_by} DESC, q.id LIMIT 500"
+    ))
+    .bind(p.user_id)
+    .bind(pending.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    .fetch_all(&mut ***tx)
+    .await?)
+}
+
 pub struct Step<'a> {
     pub kind: &'a str,
     pub request_id: Uuid,

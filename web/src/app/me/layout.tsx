@@ -24,6 +24,7 @@ export default async function MeLayout({ children }: { children: React.ReactNode
             {link("/me/attendance", t("me.nav.attendance"))}
             {link("/me/schedule", t("me.nav.schedule"))}
             {link("/me/leave", t("me.nav.leave"))}
+            {link("/me/requests", t("me.nav.requests"))}
             {link("/me/notifications", (
               <>
                 {t("me.nav.notifications")}{" "}

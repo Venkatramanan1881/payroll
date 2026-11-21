@@ -215,3 +215,28 @@ async fn timeout_approval_debits_comp_off(pool: PgPool) {
     let states: Vec<String> = sqlx::query_scalar("SELECT state FROM leave.leave_request WHERE id = ANY($1) ORDER BY from_date").bind(&leaves).fetch_all(&pool).await.unwrap();
     assert_eq!(states, vec!["approved".to_string(), "pending_l1".to_string()]);
 }
+
+
+/// `awaiting_me` and `can_decide` follow decide() (web slice 6).
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn inbox_and_flags_follow_the_commands(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, None).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    work_off_day(&app, &s, &w, today() - Duration::days(3), 10).await;
+    let c = credits(&app, &w).await;
+    assert_eq!(c[0]["employee_name"], "Asha");
+    let id = c[0]["id"].as_str().unwrap().to_string();
+    let waiting = |tok: String| {
+        let app = app.clone();
+        async move { common::as_user(&app, &tok, "GET", "/v1/comp-off/credits?awaiting_me=true", None, &[]).await.1["items"].as_array().unwrap().len() }
+    };
+    assert_eq!((waiting(s.hr_token.clone()).await, waiting(w.token.clone()).await), (1, 0));
+    let (_, own) = common::as_user(&app, &w.token, "GET", &format!("/v1/comp-off/credits/{id}"), None, &[]).await;
+    let (_, hr) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/comp-off/credits/{id}"), None, &[]).await;
+    assert_eq!((own["can_decide"].as_bool(), hr["can_decide"].as_bool()), (Some(false), Some(true)));
+    common::as_user(&app, &s.hr_token, "POST", &format!("/v1/comp-off/credits/{id}/approve"), None, &key()).await;
+    assert_eq!(waiting(s.hr_token.clone()).await, 0);
+}

@@ -4,7 +4,7 @@ export type Grant = { operation_code: string; grant_kind: GrantKind };
 export type ModuleState = { module_code: string; enabled: boolean };
 
 /** Shown when the module is on and the user holds any of `ops` with one of `kinds` (default: all or scoped). */
-export type MenuItem = { key: string; href: string; module: string; ops: string[]; kinds?: GrantKind[] };
+export type MenuItem = { key: string; href: string; module: string | string[]; ops: string[]; kinds?: GrantKind[] };
 
 const WORK: GrantKind[] = ["all", "scoped"];
 const DECIDE: GrantKind[] = ["all", "scoped", "approve"];
@@ -19,6 +19,7 @@ export const ORG_MENU: MenuItem[] = [
   { key: "shifts", href: "/app/shifts", module: "C05", ops: ["SCH-03"] },
   { key: "roster", href: "/app/roster", module: "C05", ops: ["SCH-03"] },
   { key: "holidays", href: "/app/holidays", module: "C07", ops: ["SCH-05"] },
+  { key: "requests", href: "/app/requests", module: ["C09", "M02"], ops: ["PRM-03", "PRM-04", "PRM-07", "PRM-09", "PRM-10", "PRM-11", "PRM-13", "CMP-05", "CMP-07"], kinds: DECIDE },
 ];
 
 export function holds(grants: Grant[], ops: string[], kinds: GrantKind[] = WORK): boolean {
@@ -27,7 +28,7 @@ export function holds(grants: Grant[], ops: string[], kinds: GrantKind[] = WORK)
 
 export function buildMenu(grants: Grant[], modules: ModuleState[], items = ORG_MENU): MenuItem[] {
   const on = new Set(modules.filter((m) => m.enabled).map((m) => m.module_code));
-  return items.filter((i) => on.has(i.module) && holds(grants, i.ops, i.kinds));
+  return items.filter((i) => [i.module].flat().some((m) => on.has(m)) && holds(grants, i.ops, i.kinds));
 }
 
 /** Anyone who works on others' records or decides their requests uses /app; everyone else uses self-service. */

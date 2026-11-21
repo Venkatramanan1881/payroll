@@ -734,31 +734,7 @@ pub async fn get(tx: &mut OrgTx<'_>, id: Uuid) -> Result<Value, DomainError> {
 
 /// Whether the caller may decide this pending request now.
 pub async fn can_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<bool, DomainError> {
-    let r: Option<(Uuid, String, Uuid, Option<Uuid>)> =
-        sqlx::query_as("SELECT employee_id, state, requested_by, current_approver_user_id FROM leave.leave_request WHERE id = $1 AND state IN ('pending_l1','pending_l2')")
-            .bind(id)
-            .fetch_optional(&mut ***tx)
-            .await?;
-    let Some((employee, state, requester, approver)) = r else { return Ok(false) };
-    if requester == p.user_id || p.employee_id == Some(employee) {
-        return Ok(false);
-    }
-    let op = if state == "pending_l1" { "LVE-04" } else { "LVE-05" };
-    match approval::may_decide(tx, p, employee, op, approver).await {
-        Ok(_) => {}
-        Err(DomainError::NotFound | DomainError::Forbidden) => return Ok(false),
-        Err(e) => return Err(e),
-    }
-    if state == "pending_l2" {
-        // As decide(): the first-level approver never also decides the second level.
-        let twice: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM app.approval_step WHERE request_type = 'leave' AND request_id = $1 AND action = 'approved' AND actor_user_id = $2)")
-            .bind(id)
-            .bind(p.user_id)
-            .fetch_one(&mut ***tx)
-            .await?;
-        return Ok(!twice);
-    }
-    Ok(true)
+    approval::can_decide_two_level(tx, p, KIND, "leave.leave_request", id, ("LVE-04", "LVE-05")).await
 }
 
 /// Whether `cancel` would accept the caller for this request (requester, the employee, or LVE-06 in scope), ignoring
@@ -783,16 +759,7 @@ pub async fn can_cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<b
 /// delegation, or unrouted within their LVE-04 / LVE-05 scope), newest first.
 // shortcut: checks up to 500 pending candidates one by one; move the predicate into SQL when queues grow.
 pub async fn awaiting(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Vec<Value>, DomainError> {
-    let candidates: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT q.id FROM leave.leave_request q
-         WHERE q.state IN ('pending_l1', 'pending_l2')
-           AND (q.current_approver_user_id IS NULL OR q.current_approver_user_id = $1
-                OR q.current_approver_user_id IN (SELECT approver_user_id FROM iam.delegation WHERE delegate_user_id = $1 AND valid @> now()))
-         ORDER BY q.submitted_at DESC, q.id LIMIT 500",
-    )
-    .bind(p.user_id)
-    .fetch_all(&mut ***tx)
-    .await?;
+    let candidates = approval::awaiting_candidates(tx, p, "leave.leave_request", "q.submitted_at", &["pending_l1", "pending_l2"]).await?;
     let mut out = Vec::new();
     for id in candidates {
         if can_decide(tx, p, id).await? {

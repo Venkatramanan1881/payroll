@@ -186,3 +186,33 @@ async fn end_of_shift_and_no_double_credit(pool: PgPool) {
     assert_eq!(st, StatusCode::CREATED);
     assert_eq!(day(&app, &s, &w, &d2.to_string()).await["net_minutes"], before, "worked time inside the permission counts once");
 }
+
+
+/// `awaiting_me` and the request's own flags follow decide()/cancel() (web slice 6): an unrouted request (no
+/// manager) waits for HR's PRM-03 scope; the employee may cancel their own, never decide it.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn inbox_and_flags_follow_the_commands(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let (_, t, _) = common::call(&app, &s, "POST", "/v1/permissions/types", Some(json!({ "code": "PER", "name": "Personal", "version": version("manager") })), None).await;
+    let d = ((Utc::now() + Duration::minutes(330)).date_naive() - Duration::days(1)).to_string();
+    let body = json!({ "permission_type_id": t["id"], "permission_date": d, "start_time": "09:00", "end_time": "10:00", "reason": "bank" });
+    let (st, r) = common::as_user(&app, &w.token, "POST", "/v1/permissions/requests", Some(body), &key()).await;
+    assert_eq!(st, StatusCode::CREATED, "{r}");
+    assert_eq!((r["employee_name"].as_str(), r["permission_type_name"].as_str()), (Some("Asha"), Some("Personal")));
+    let id = r["id"].as_str().unwrap().to_string();
+    let waiting = |tok: String| {
+        let app = app.clone();
+        async move { common::as_user(&app, &tok, "GET", "/v1/permissions/requests?awaiting_me=true", None, &[]).await.1["items"].as_array().unwrap().len() }
+    };
+    assert_eq!((waiting(s.hr_token.clone()).await, waiting(w.token.clone()).await), (1, 0));
+    let (_, hr) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/permissions/requests/{id}"), None, &[]).await;
+    let (_, own) = common::as_user(&app, &w.token, "GET", &format!("/v1/permissions/requests/{id}"), None, &[]).await;
+    assert_eq!((hr["can_decide"].as_bool(), own["can_decide"].as_bool()), (Some(true), Some(false)), "{own}");
+    assert_eq!((own["can_cancel"].as_bool(), hr["can_cancel"].as_bool()), (Some(false), Some(true)), "yesterday is past the start: only HR may cancel (PM-29)");
+    common::as_user(&app, &s.hr_token, "POST", &format!("/v1/permissions/requests/{id}/approve"), None, &key()).await;
+    assert_eq!(waiting(s.hr_token.clone()).await, 0, "decided requests leave the inbox");
+}
