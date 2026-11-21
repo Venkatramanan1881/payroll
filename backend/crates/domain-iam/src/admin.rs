@@ -545,7 +545,11 @@ pub async fn change_grants(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, grants: &[
     if holds {
         return Err(DomainError::Forbidden); // nobody changes the grants of a role they hold (no self-promotion)
     }
-    sqlx::query("DELETE FROM iam.role_grant WHERE role_id = $1").bind(id).execute(&mut ***tx).await?;
+    // Grants of a switched-off module are not shown (AC-C03-01.5), so they are kept unless sent again.
+    let enabled = enabled_modules(tx).await?;
+    let held: Vec<String> = sqlx::query_scalar("SELECT operation_code FROM iam.role_grant WHERE role_id = $1").bind(id).fetch_all(&mut ***tx).await?;
+    let keep: Vec<String> = held.into_iter().filter(|c| !module_on(c, &enabled) && !seen.contains(c.as_str())).collect();
+    sqlx::query("DELETE FROM iam.role_grant WHERE role_id = $1 AND operation_code <> ALL($2)").bind(id).bind(&keep).execute(&mut ***tx).await?;
     for g in grants {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind, setting_ref, created_by) VALUES (app.current_org(), $1, $2, $3, $4, $5)")
             .bind(id)

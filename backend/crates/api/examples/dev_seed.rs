@@ -11,6 +11,8 @@
 //!   holds these while G-11, G-24..G-26, G-30 and G-31 are open, so they
 //!   exist here only for local trials;
 //! - a monthly attendance cycle for the organisation from January (periods to review and lock).
+//! - an Organisation Admin (admin@dev.invalid, password, no authenticator step) with dev-only IAM-06 / IAM-09 / PLT-15 /
+//!   ORG-07 (G-08, G-10, G-03, G-14 open), and one support-access request from the dev vendor to decide.
 //!
 //! Organisation rows go straight in as the superuser; everything else goes through the API in-process.
 //!
@@ -90,6 +92,18 @@ async fn main() -> anyhow::Result<()> {
     let hash = argon2::Argon2::default().hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng)).map_err(|e| anyhow::anyhow!("{e}"))?.to_string();
     let (hr_role, mgr_role, emp_role) = (role(&pool, org, "hr_manager", "HR Manager").await?, role(&pool, org, "manager", "Manager").await?, role(&pool, org, "employee", "Employee").await?);
     let hr = user(&pool, org, "hr@dev.invalid", &hash, &[hr_role, mgr_role], None).await?;
+    // An Organisation Admin, plus IAM-06 (access settings, G-08), IAM-09 (delegations, G-10), PLT-15 (end vendor access
+    // early, G-03) and ORG-07 (read the structure and settings, G-14), which the role lacks by default: dev-only.
+    // One support-access request from the dev vendor.
+    let admin_role = role(&pool, org, "org_admin", "Organisation Admin").await?;
+    let admin = user(&pool, org, "admin@dev.invalid", &hash, &[admin_role], None).await?;
+    let access_extras: Uuid = sqlx::query_scalar("INSERT INTO iam.role (org_id, name) VALUES ($1, 'Dev access extras') RETURNING id").bind(org).fetch_one(&pool).await?;
+    for op in ["IAM-06", "IAM-09", "PLT-15", "ORG-07"] {
+        sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'all')").bind(org).bind(access_extras).bind(op).execute(&pool).await?;
+    }
+    sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(org).bind(admin).bind(access_extras).execute(&pool).await?;
+    sqlx::query("INSERT INTO platform.support_access_grant (org_id, vendor_user_id, reason) VALUES ($1, $2, 'Dev seed: look into a payroll export question')")
+        .bind(org).bind(vendor).execute(&pool).await?;
 
     // Everything else through the API, as HR.
     let secret = Uuid::new_v4().to_string().into_bytes();
@@ -169,6 +183,6 @@ async fn main() -> anyhow::Result<()> {
     let ahead = d + chrono::Duration::days(4);
     call(&app, &asha_token, "POST", "/v1/leave/requests", Some(json!({ "leave_type_id": types[0], "from_date": ahead, "to_date": ahead, "reason": "Family function" }))).await?;
 
-    println!("seeded organisation {org}: sign in as hr@dev.invalid (HR, manager of Asha) or asha@dev.invalid; punches on {d}");
+    println!("seeded organisation {org}: sign in as hr@dev.invalid (HR, manager of Asha), admin@dev.invalid (Organisation Admin) or asha@dev.invalid; punches on {d}");
     Ok(())
 }

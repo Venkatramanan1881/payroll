@@ -141,6 +141,13 @@ async fn roles_and_grants(pool: PgPool) {
     let body = json!({ "grants": [{ "operation_code": "LVE-01", "grant_kind": "all" }, { "operation_code": "CMP-01", "grant_kind": "all" }], "reason": "store work" });
     let (st, g) = common::as_user(&app, &oa, "POST", &uri, Some(body), &h).await;
     assert_eq!((st, g["grants"].as_array().map(Vec::len)), (StatusCode::OK, Some(1)), "comp-off (M02) is off, so CMP-01 is not listed: {g}");
+    // Saving the grants the screen shows keeps the hidden ones: they come back when M02 is switched on.
+    let mut h = key();
+    h.push(("if-match", etag(&app, &oa, &format!("/v1/roles/{id}")).await));
+    let body = json!({ "grants": [{ "operation_code": "LVE-01", "grant_kind": "all" }], "reason": "comp-off left out" });
+    assert_eq!(common::as_user(&app, &oa, "POST", &uri, Some(body), &h).await.0, StatusCode::OK);
+    let kept: Vec<String> = sqlx::query_scalar("SELECT operation_code FROM iam.role_grant WHERE role_id = $1::uuid ORDER BY 1").bind(id).fetch_all(&pool).await.unwrap();
+    assert_eq!(kept, ["CMP-01", "LVE-01"], "the switched-off module's grant survives");
 
     // The role's grant applies to a user holding it on their next request.
     let body = json!({ "login_kind": "mobile_otp", "mobile": "+919876500009", "role_ids": [id], "scopes": [{ "scope_kind": "all" }] });

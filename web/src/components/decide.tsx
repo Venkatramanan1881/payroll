@@ -12,7 +12,7 @@ import type { Problem } from "@/lib/problem";
  * Approve/accept with an optional comment, or reject with a reason, for one item at `base`
  * (`${base}/approve` or `/accept`, `${base}/reject`). One Idempotency-Key per decision, so a double click decides once.
  */
-export function Decide({ base, yes, onDone }: { base: string; yes: "approve" | "accept" | "confirm"; onDone: () => void }) {
+export function Decide({ base, yes, onDone, label }: { base: string; yes: "approve" | "accept" | "confirm"; onDone: () => void; label?: string }) {
   const t = useTranslations("decide");
   const [rejecting, setRejecting] = useState(false);
   const [note, setNote] = useState("");
@@ -31,6 +31,7 @@ export function Decide({ base, yes, onDone }: { base: string; yes: "approve" | "
   }
 
   const id = base.replace(/[^a-z0-9]/gi, "");
+  const named = (text: string) => (label ? `${text}: ${label}` : undefined); // which item, when several are on screen
   return (
     <div className="grid gap-2">
       <div className="grid gap-1">
@@ -45,8 +46,8 @@ export function Decide({ base, yes, onDone }: { base: string; yes: "approve" | "
           </>
         ) : (
           <>
-            <Button disabled={busy} onClick={() => send(yes, note.trim() ? { comment: note.trim() } : {})}>{t(yes)}</Button>
-            <Button variant="outline" disabled={busy} onClick={() => { setRejecting(true); setNote(""); }}>{t("reject")}…</Button>
+            <Button disabled={busy} aria-label={named(t(yes))} onClick={() => send(yes, note.trim() ? { comment: note.trim() } : {})}>{t(yes)}</Button>
+            <Button variant="outline" disabled={busy} aria-label={named(t("reject"))} onClick={() => { setRejecting(true); setNote(""); }}>{t("reject")}…</Button>
           </>
         )}
       </div>
