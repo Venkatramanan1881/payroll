@@ -22,6 +22,7 @@ export default async function MeLayout({ children }: { children: React.ReactNode
           <nav aria-label="Self-service" className="flex flex-1 flex-wrap gap-3 text-sm">
             {link("/me", t("me.nav.details"))}
             {link("/me/attendance", t("me.nav.attendance"))}
+            {link("/me/schedule", t("me.nav.schedule"))}
             {link("/me/leave", t("me.nav.leave"))}
             {link("/me/notifications", (
               <>

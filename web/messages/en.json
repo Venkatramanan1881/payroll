@@ -35,7 +35,8 @@
     "LIMIT_EXCEEDED": "The limit for these requests has been reached.",
     "ADJUSTMENT_WINDOW_EXCEEDED": "This date is too old to adjust.",
     "INSUFFICIENT_BALANCE": "There is not enough leave balance for this request.",
-    "OVERLAPPING_REQUEST": "This overlaps another leave request."
+    "OVERLAPPING_REQUEST": "This overlaps another leave request.",
+    "VERSION_FROZEN": "This version is published and can no longer change. Create a new version instead."
   },
   "signIn": {
     "title": "Sign in",
@@ -69,7 +70,10 @@
     "attendance": "Attendance",
     "approvals": "Approvals",
     "flags": "Punch flags",
-    "leave": "Leave"
+    "leave": "Leave",
+    "shifts": "Shifts",
+    "roster": "Roster",
+    "holidays": "Holidays"
   },
   "me": {
     "title": "My details",
@@ -79,7 +83,8 @@
       "attendance": "My attendance",
       "leave": "My leave",
       "notifications": "Notifications",
-      "admin": "Admin"
+      "admin": "Admin",
+      "schedule": "My schedule"
     },
     "unread": "{count} unread",
     "month": "Month",
@@ -372,5 +377,141 @@
       "first_half": "First half",
       "second_half": "Second half"
     }
+  },
+  "sched": {
+    "shifts": "Shifts",
+    "newShift": "New shift",
+    "code": "Code",
+    "name": "Name",
+    "inForce": "In force",
+    "none": "—",
+    "type": "Shift type",
+    "times": "Times",
+    "effectiveFrom": "Effective from",
+    "state": "State",
+    "versions": "Versions",
+    "newVersion": "New version",
+    "newVersionHelp": "Starts a draft on a new date from the shift's latest version; edit it, then publish.",
+    "edit": "Edit draft",
+    "publish": "Publish",
+    "published": "Published.",
+    "saved": "Saved.",
+    "create": "Create shift",
+    "frozen": "Published versions cannot change (G5).",
+    "definition": "Definition",
+    "st": {
+      "draft": "Draft",
+      "pending_approval": "Waiting for approval",
+      "scheduled": "Scheduled",
+      "in_force": "In force",
+      "superseded": "Superseded"
+    },
+    "ty": {
+      "fixed": "Fixed",
+      "night": "Night",
+      "flexible": "Flexible",
+      "flexible_core": "Flexible with core hours",
+      "open": "Open",
+      "split": "Split"
+    },
+    "f": {
+      "start_time": "Start",
+      "end_time": "End",
+      "required_minutes": "Required minutes",
+      "required_per": "Required per",
+      "core_start": "Core hours start",
+      "core_end": "Core hours end",
+      "flex_earliest_in": "Earliest in",
+      "flex_latest_out": "Latest out",
+      "window_before_min": "Punch window before start (min)",
+      "window_after_min": "Punch window after end (min)",
+      "half_day_split": "Half-day split",
+      "half_day_split_time": "Half-day split time",
+      "missed_punch_cutoff": "Missed-punch cutoff"
+    },
+    "per": {
+      "day": "Day",
+      "week": "Week"
+    },
+    "split": {
+      "middle_of_shift": "Middle of the shift",
+      "fixed_time": "A fixed time"
+    },
+    "defaultsHelp": "Optional fields left empty are not used; the window, half-day split and cutoff keep their current value or the API's default.",
+    "nightNote": "Night shifts count on the date they start (SH-06).",
+    "patterns": "Weekly-off patterns",
+    "newPattern": "New pattern",
+    "kind": "Kind",
+    "days": "Days",
+    "retire": "Retire",
+    "retired": "Retired",
+    "pk": {
+      "fixed_days": "Fixed days",
+      "alternating": "Alternating",
+      "from_roster": "From the roster"
+    },
+    "altDay": "Alternating day",
+    "altWeeks": "Weeks of the month",
+    "addPattern": "Add pattern",
+    "weekday": [
+      "Mon",
+      "Tue",
+      "Wed",
+      "Thu",
+      "Fri",
+      "Sat",
+      "Sun"
+    ],
+    "schedule": "Schedule",
+    "noSchedule": "No schedule yet.",
+    "source": "Source",
+    "from": "From",
+    "to": "To",
+    "pattern": "Weekly offs",
+    "src": {
+      "fixed_shift": "Fixed shift",
+      "roster": "Roster"
+    },
+    "assign": "Assign schedule",
+    "shift": "Shift",
+    "reason": "Reason",
+    "roster": "Roster",
+    "week": "Week of",
+    "prevWeek": "Previous week",
+    "nextWeek": "Next week",
+    "employee": "Employee",
+    "off": "Weekly off",
+    "unset": "—",
+    "save": "Save changes",
+    "changes": "{count} changed",
+    "rosterReason": "Reason for the change",
+    "searchEmployees": "Find employees",
+    "rosterNote": "Shows the first 50 employees in your scope; search to find others.",
+    "holidays": "Holiday calendars",
+    "newCalendar": "New calendar",
+    "addCalendar": "Add calendar",
+    "rename": "Rename",
+    "calendar": "Calendar",
+    "branches": "Branches using it",
+    "noBranches": "No branch uses it yet (set it on the branch).",
+    "year": "Year",
+    "date": "Date",
+    "hk": {
+      "national": "National",
+      "festival": "Festival",
+      "optional": "Optional"
+    },
+    "addHoliday": "Add holiday",
+    "remove": "Remove",
+    "change": "Change",
+    "noHolidays": "No holidays this year.",
+    "mySchedule": "My schedule",
+    "next14": "The next 14 days.",
+    "holiday": "Holiday: {name}",
+    "saveFirst": "Save your changes before publishing.",
+    "pendingWeek": "Save or discard your changes before moving to another week or searching.",
+    "discard": "Discard changes",
+    "confirmRemove": "Remove this holiday? This cannot be undone.",
+    "confirmRetire": "Retire it? It stays in history but can no longer be chosen."
   }
 }
