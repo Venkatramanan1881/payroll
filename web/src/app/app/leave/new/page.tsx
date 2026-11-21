@@ -2,7 +2,7 @@ import { getTranslations } from "next-intl/server";
 import { can } from "@/lib/menu";
 import { api } from "@/server/api";
 import type { LeaveType, Me, Page } from "@/types/api";
-import { ApplyForm } from "./apply-form";
+import { ApplyForm } from "@/components/leave-apply-form";
 
 export default async function ApplyOnBehalfPage() {
   const t = await getTranslations("leave");
@@ -15,7 +15,7 @@ export default async function ApplyOnBehalfPage() {
     <section className="grid max-w-3xl gap-4">
       <h1 className="text-xl font-semibold">{t("applyTitle")}</h1>
       <p className="text-sm text-muted-foreground">{t("applyHelp")}</p>
-      <ApplyForm types={types.ok ? types.data.items.filter((x) => !x.retired_at) : []} />
+      <ApplyForm base="/app/leave" types={types.ok ? types.data.items.filter((x) => !x.retired_at) : []} />
     </section>
   );
 }

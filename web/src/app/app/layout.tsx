@@ -20,6 +20,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
               <Link key={i.key} href={i.href} className="hover:underline">{t(`nav.${i.key}`)}</Link>
             ))}
             {me.ok && me.data.employee_id ? <Link href="/me" className="hover:underline">{t("me.title")}</Link> : null}
+            <Link href="/me/notifications" className="hover:underline">{t("me.nav.notifications")}</Link>
           </nav>
           <span className="text-sm text-muted-foreground">{me.ok ? (me.data.email ?? me.data.mobile) : null}</span>
           <SignOutButton to="/sign-in" />

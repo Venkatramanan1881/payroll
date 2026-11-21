@@ -16,8 +16,11 @@ import type { EmployeeSummary, LeaveRequest, LeaveType, Page } from "@/types/api
 
 const PARTS = ["full", "first_half", "second_half"] as const;
 
-/** LVE-03: a leave request for an employee in scope. Balance, notice, overlap and the rest are the API's checks. */
-export function ApplyForm({ types }: { types: LeaveType[] }) {
+/**
+ * A leave request: for an employee in scope chosen here (LVE-03, `self` absent), or for the signed-in employee
+ * (LVE-02, `self` = their employee id). Balance, notice, overlap and the rest are the API's checks.
+ */
+export function ApplyForm({ types, self, base }: { types: LeaveType[]; self?: string; base: string }) {
   const t = useTranslations("leave");
   const c = useTranslations("common");
   const router = useRouter();
@@ -32,15 +35,15 @@ export function ApplyForm({ types }: { types: LeaveType[] }) {
     return () => clearTimeout(id);
   }, [q]);
   const search = term.length >= 2 ? `/employees?limit=20&q=${encodeURIComponent(term)}` : "/employees?limit=20";
-  const found = useBff<Page<EmployeeSummary>>(search);
+  const found = useBff<Page<EmployeeSummary>>(self ? "" : search);
   // Only a choice that is still listed counts: a later search can drop the person picked earlier.
-  const chosen = found.data?.items.some((x) => x.id === employee) ? employee : "";
+  const chosen = self ?? (found.data?.items.some((x) => x.id === employee) ? employee : "");
 
   async function submit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const f = new FormData(e.currentTarget);
     const body = {
-      employee_id: chosen,
+      employee_id: self ? undefined : chosen,
       leave_type_id: String(f.get("leave_type_id")),
       from_date: String(f.get("from_date")),
       to_date: String(f.get("to_date")),
@@ -50,14 +53,15 @@ export function ApplyForm({ types }: { types: LeaveType[] }) {
     };
     setBusy(true);
     setProblem(null);
-    const r = await bff<LeaveRequest>("/leave/requests/on-behalf", sendJson("POST", body, { "idempotency-key": key }));
+    const r = await bff<LeaveRequest>(self ? "/leave/requests" : "/leave/requests/on-behalf", sendJson("POST", body, { "idempotency-key": key }));
     setBusy(false);
     if (!r.ok) return setProblem(r.problem);
-    router.push(`/app/leave/${r.data.id}`);
+    router.push(`${base}/${r.data.id}`);
   }
 
   return (
     <form onSubmit={submit} className="grid gap-4">
+      {self ? null : (
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="grid gap-1">
           <Label htmlFor="q">{t("search")}</Label>
@@ -78,6 +82,7 @@ export function ApplyForm({ types }: { types: LeaveType[] }) {
           <ProblemAlert problem={found.problem} />
         </div>
       </div>
+      )}
       {chosen ? (
         <div className="grid gap-1">
           <h2 className="font-medium">{t("balances")}</h2>

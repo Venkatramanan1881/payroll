@@ -1,6 +1,6 @@
 //! attendance.yaml: attendance days, daily view, HR recalculation.
 
-use crate::routes::punches::{sees, visible_employees};
+use crate::routes::punches::{sees, self_visibility, shown, visible_employees};
 use crate::routes::sched::{done, parse, start};
 use crate::{ApiError, Auth};
 use axum::body::Bytes;
@@ -13,14 +13,73 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-// shortcut: an employee sees the whole day; AC-05 filtering (own punches / status / deduction reason) comes with org settings endpoints.
 /// GET /v1/attendance/employees/{employee_id}/days/{date} (ATT-01). Outside scope → 404.
 pub async fn get_day(Auth(p, mut tx): Auth, Path((employee, date)): Path<(Uuid, NaiveDate)>) -> Result<Json<Value>, ApiError> {
     let visible = visible_employees(&mut tx, &p, "ATT-01").await?;
     if !sees(&visible, Some(employee)) {
         return Err(ApiError::NotFound);
     }
-    Ok(Json(domain_attendance::get_day(&mut tx, employee, date).await?))
+    let mut day = domain_attendance::get_day(&mut tx, employee, date).await?;
+    let vis = self_visibility(&mut tx, &p, "ATT-01").await?;
+    if let Some(r) = day.get_mut("current_result") {
+        hide(r, &vis);
+    }
+    if let Some(Value::Array(h)) = day.get_mut("history") {
+        h.iter_mut().for_each(|r| hide(r, &vis));
+    }
+    Ok(Json(day))
+}
+
+/// AC-05: the DayResult fields each employee-visibility item covers. A field derived from hidden data is hidden with
+/// it (worked minutes and flags describe the punches; day effects reveal the status), so nothing gives it away.
+const AC05_FIELDS: [(&str, &[&str]); 4] = [
+    ("own_punches", &["sessions", "punches_used", "gross_minutes", "break_minutes", "net_minutes", "flags"]),
+    ("day_status", &["day_status", "day_fraction_present", "day_effects", "flags"]),
+    ("counters", &["late_mark", "early_mark", "late_minutes", "early_minutes", "early_arrival_minutes", "overtime_identified_minutes"]),
+    ("deduction_reason", &["explanation", "day_effects", "flags"]),
+];
+
+/// AC-05 for an employee's own day result: hidden parts are omitted, never nulled (attendance.yaml DayResult).
+fn hide(r: &mut Value, vis: &Option<Value>) {
+    let Some(o) = r.as_object_mut() else { return };
+    for (item, fields) in AC05_FIELDS {
+        if !shown(vis, item) {
+            fields.iter().for_each(|f| {
+                o.remove(*f);
+            });
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CalendarQuery {
+    month: String,
+}
+
+/// GET /v1/attendance/employees/{employee_id}/calendar?month=YYYY-MM (ATT-01): one entry per date of the calendar
+/// month (OQ-C16-05). Employees see it filtered by AC-05.
+pub async fn calendar(Auth(p, mut tx): Auth, Path(employee): Path<Uuid>, Query(q): Query<CalendarQuery>) -> Result<Json<Value>, ApiError> {
+    let first = NaiveDate::parse_from_str(&format!("{}-01", q.month), "%Y-%m-%d")
+        .ok()
+        .filter(|_| q.month.len() == 7)
+        .ok_or_else(|| ApiError::ValidationFailed("month is YYYY-MM".into()))?;
+    let visible = visible_employees(&mut tx, &p, "ATT-01").await?;
+    if !sees(&visible, Some(employee)) {
+        return Err(ApiError::NotFound);
+    }
+    let mut days = domain_attendance::calendar(&mut tx, employee, first).await?;
+    let vis = self_visibility(&mut tx, &p, "ATT-01").await?;
+    for d in days.iter_mut().filter_map(Value::as_object_mut) {
+        if !shown(&vis, "day_status") {
+            d.remove("day_status");
+            d.remove("has_exception");
+        }
+        if !shown(&vis, "counters") {
+            d.remove("late_mark");
+            d.remove("early_mark");
+        }
+    }
+    Ok(Json(json!({ "employee_id": employee, "month": q.month, "days": days })))
 }
 
 #[derive(Deserialize)]
@@ -136,6 +195,9 @@ pub async fn counters(Auth(p, mut tx): Auth, Path(employee): Path<Uuid>, Query(q
     let visible = visible_employees(&mut tx, &p, "ATT-13").await?;
     if !sees(&visible, Some(employee)) {
         return Err(ApiError::NotFound);
+    }
+    if !shown(&self_visibility(&mut tx, &p, "ATT-13").await?, "counters") {
+        return Err(ApiError::Forbidden); // AC-05 "counters" is off for employees
     }
     Ok(Json(domain_attendance::counters::view(&mut tx, employee, q.date).await?))
 }

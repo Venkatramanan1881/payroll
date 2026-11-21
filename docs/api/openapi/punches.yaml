@@ -91,6 +91,7 @@ paths:
       tags: [Punches]
       summary: List raw punches
       description: >-
+        An employee reading through the Self grant gets FORBIDDEN while AC-05 "own punches" is off (web slice 4).
         HR lists punches with source, device, event and receipt times, time zone, manual marker, flags (PC-R6, PC-R13, US-C04-18).
         Scope is applied first (AC-07, AT13); an Employee (Self cell, AC-05 own punches on) sees only own punches.
         Location fields (latitude, longitude, accuracy, fence distance) are returned only to callers who also hold TCP-08;

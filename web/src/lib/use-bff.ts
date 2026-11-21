@@ -11,6 +11,7 @@ export function useBff<T>(path: string) {
   const [res, setRes] = useState<{ key: string; path: string; r: BffResult<T> } | null>(null);
   const key = `${tick}:${path}`;
   useEffect(() => {
+    if (!path) return; // nothing to read
     let live = true;
     bff<T>(path).then((r) => {
       if (live) setRes({ key, path, r });

@@ -663,6 +663,23 @@ pub async fn get_day(tx: &mut OrgTx<'_>, employee: Uuid, date: NaiveDate) -> Res
     }))
 }
 
+/// One entry per date of the calendar month starting at `first` (attendance.yaml CalendarDay); dates with no attendance
+/// day carry only the date.
+pub async fn calendar(tx: &mut OrgTx<'_>, employee: Uuid, first: NaiveDate) -> Result<Vec<Value>, DomainError> {
+    Ok(sqlx::query_scalar(
+        "SELECT jsonb_strip_nulls(jsonb_build_object('attendance_date', g::date, 'processing_state', d.processing_state, 'day_status', r.day_status,
+                 'late_mark', r.late_mark, 'early_mark', r.early_mark, 'has_exception', CASE WHEN d.id IS NOT NULL THEN d.processing_state = 'exception' END))
+         FROM generate_series($2::date, ($2::date + interval '1 month' - interval '1 day')::date, interval '1 day') g
+         LEFT JOIN attendance.attendance_day d ON d.employee_id = $1 AND d.attendance_date = g::date
+         LEFT JOIN attendance.day_result r ON r.id = d.current_result_id
+         ORDER BY g",
+    )
+    .bind(employee)
+    .bind(first)
+    .fetch_all(&mut ***tx)
+    .await?)
+}
+
 pub struct DailyFilter {
     /// None = every employee.
     pub employees: Option<Vec<Uuid>>,

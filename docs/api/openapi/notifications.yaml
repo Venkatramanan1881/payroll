@@ -276,6 +276,7 @@ components:
             id: { $ref: 'common.yaml#/components/schemas/Id' }
         created_at: { $ref: 'common.yaml#/components/schemas/Instant' }
         read_at: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Instant' }, { type: 'null' } ] }
+        recipient_kind: { type: string, enum: [employee, approver], description: 'Whom it was for: the request''s owner or its approver, so clients open the right screen (web slice 4).' }
     PushDevice:
       type: object
       required: [id, platform, registered_at]

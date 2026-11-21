@@ -73,7 +73,46 @@
   },
   "me": {
     "title": "My details",
-    "noEmployee": "Your account is not linked to an employee record."
+    "noEmployee": "Your account is not linked to an employee record.",
+    "nav": {
+      "details": "My details",
+      "attendance": "My attendance",
+      "leave": "My leave",
+      "notifications": "Notifications",
+      "admin": "Admin"
+    },
+    "unread": "{count} unread",
+    "month": "Month",
+    "prev": "Previous month",
+    "next": "Next month",
+    "noEmployeeHere": "Your account is not linked to an employee record, so there is nothing to show here.",
+    "myRequests": "My correction requests",
+    "noRequests": "No correction requests.",
+    "cancel": "Cancel",
+    "cancelReason": "Reason (optional)",
+    "confirmCancel": "Confirm cancel",
+    "ask": "Ask for a correction",
+    "askHelp": "Your approver decides; the day is worked out again once it is approved.",
+    "sent": "Sent for approval.",
+    "myLeave": "My leave requests",
+    "noLeave": "No leave requests.",
+    "applyLeave": "Apply for leave",
+    "applyTitle": "Apply for leave",
+    "inboxEmpty": "No notifications.",
+    "onlyUnread": "Unread only",
+    "markRead": "Mark read",
+    "markAllRead": "Mark all read",
+    "open": "Open",
+    "week": [
+      "Mon",
+      "Tue",
+      "Wed",
+      "Thu",
+      "Fri",
+      "Sat",
+      "Sun"
+    ],
+    "legendLate": "L = late mark, E = early leaving mark, ! = needs attention"
   },
   "vendor": {
     "organisations": "Organisations",
