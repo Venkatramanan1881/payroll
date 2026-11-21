@@ -7,7 +7,8 @@
 //! - yesterday's punches for Asha;
 //! - leave types CL and SL with balances for Asha, and a pending CL request of hers;
 //! - a "Dev leave extras" role for HR (LVE-03 apply on behalf, LVE-06 cancel, LVE-07 adjust, PER-04 request an unlock,
-//!   PER-06 / PER-07 payroll export): no default role holds these while G-24..G-26, G-30 and G-31 are open, so they
+//!   PER-06 / PER-07 payroll export, ORG-01 / ORG-04 / ORG-05 branches, lists and contractors): no default role of HR
+//!   holds these while G-11, G-24..G-26, G-30 and G-31 are open, so they
 //!   exist here only for local trials;
 //! - a monthly attendance cycle for the organisation from January (periods to review and lock).
 //!
@@ -129,7 +130,8 @@ async fn main() -> anyhow::Result<()> {
     let asha_user = user(&pool, org, "asha@dev.invalid", &hash, &[emp_role], Some(asha)).await?;
     let extras: Uuid = sqlx::query_scalar("INSERT INTO iam.role (org_id, name) VALUES ($1, 'Dev leave extras') RETURNING id").bind(org).fetch_one(&pool).await?;
     // Also PER-04 (request an unlock), PER-06 / PER-07 (produce / download the payroll export): G-30, G-31 open.
-    for op in ["LVE-03", "LVE-06", "LVE-07", "PER-04", "PER-06", "PER-07"] {
+    // And ORG-01 / ORG-04 / ORG-05 (branches, lists, contractors): G-11 open (OA, HR or both).
+    for op in ["LVE-03", "LVE-06", "LVE-07", "PER-04", "PER-06", "PER-07", "ORG-01", "ORG-04", "ORG-05"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')").bind(org).bind(extras).bind(op).execute(&pool).await?;
     }
     sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(org).bind(hr).bind(extras).execute(&pool).await?;

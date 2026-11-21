@@ -74,19 +74,21 @@ pub async fn create_branch(tx: &mut OrgTx<'_>, actor: Uuid, code: &str, name: &s
     Ok(id)
 }
 
-pub async fn update_branch(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, code: Option<&str>, name: Option<&str>, address: Option<&str>) -> Result<(), DomainError> {
+/// `address`: None leaves it, Some(None) or blank clears it (null in the PATCH), Some(Some(a)) sets it.
+pub async fn update_branch(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, code: Option<&str>, name: Option<&str>, address: Option<Option<&str>>) -> Result<(), DomainError> {
     if code.is_none() && name.is_none() && address.is_none() {
         return Err(invalid("at least one field"));
     }
     let code = code.map(|c| text(c, "code", 20)).transpose()?;
     let name = name.map(|n| text(n, "name", 120)).transpose()?;
     let before = get_branch(tx, id).await?;
-    sqlx::query("UPDATE org.branch SET code = coalesce($2, code), name = coalesce($3, name), address = coalesce($4, address), updated_by = $5 WHERE id = $1")
+    sqlx::query("UPDATE org.branch SET code = coalesce($2, code), name = coalesce($3, name), address = CASE WHEN $6 THEN $4 ELSE address END, updated_by = $5 WHERE id = $1")
         .bind(id)
         .bind(&code)
         .bind(&name)
-        .bind(address.map(str::trim))
+        .bind(address.flatten().map(str::trim).filter(|a| !a.is_empty()))
         .bind(actor)
+        .bind(address.is_some())
         .execute(&mut ***tx)
         .await?;
     db::audit(tx, actor, "branch.update", "branch", Some(id), Some(json!({ "before": before }))).await?;
@@ -272,18 +274,20 @@ pub async fn create_entry(tx: &mut OrgTx<'_>, actor: Uuid, kind: &str, name: &st
     Ok(id)
 }
 
-pub async fn update_entry(tx: &mut OrgTx<'_>, actor: Uuid, kind: &str, id: Uuid, name: Option<&str>, code: Option<&str>) -> Result<(), DomainError> {
+/// `code`: None leaves it, Some(None) clears it, Some(Some(c)) sets it.
+pub async fn update_entry(tx: &mut OrgTx<'_>, actor: Uuid, kind: &str, id: Uuid, name: Option<&str>, code: Option<Option<&str>>) -> Result<(), DomainError> {
     let before = get_entry(tx, kind, id).await?;
     if name.is_none() && code.is_none() {
         return Err(invalid("at least one field"));
     }
     let name = name.map(|n| text(n, "name", 120)).transpose()?;
-    let code = code.map(|c| text(c, "code", 20)).transpose()?;
-    sqlx::query("UPDATE org.list_entry SET name = coalesce($2, name), code = coalesce($3, code), updated_by = $4 WHERE id = $1")
+    let new_code = code.flatten().map(|c| text(c, "code", 20)).transpose()?;
+    sqlx::query("UPDATE org.list_entry SET name = coalesce($2, name), code = CASE WHEN $5 THEN $3 ELSE code END, updated_by = $4 WHERE id = $1")
         .bind(id)
         .bind(&name)
-        .bind(&code)
+        .bind(&new_code)
         .bind(actor)
+        .bind(code.is_some())
         .execute(&mut ***tx)
         .await?;
     db::audit(tx, actor, "list_entry.update", "list_entry", Some(id), Some(json!({ "before": before }))).await?;
@@ -322,17 +326,19 @@ pub async fn create_contractor(tx: &mut OrgTx<'_>, actor: Uuid, name: &str, cont
     Ok(id)
 }
 
-pub async fn update_contractor(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, name: Option<&str>, contact: Option<&str>) -> Result<(), DomainError> {
+/// `contact`: None leaves it, Some(None) or blank clears it, Some(Some(c)) sets it.
+pub async fn update_contractor(tx: &mut OrgTx<'_>, actor: Uuid, id: Uuid, name: Option<&str>, contact: Option<Option<&str>>) -> Result<(), DomainError> {
     let before = get_contractor(tx, id).await?;
     if name.is_none() && contact.is_none() {
         return Err(invalid("at least one field"));
     }
     let name = name.map(|n| text(n, "name", 200)).transpose()?;
-    sqlx::query("UPDATE org.contractor SET name = coalesce($2, name), contact = coalesce($3, contact), updated_by = $4 WHERE id = $1")
+    sqlx::query("UPDATE org.contractor SET name = coalesce($2, name), contact = CASE WHEN $5 THEN $3 ELSE contact END, updated_by = $4 WHERE id = $1")
         .bind(id)
         .bind(&name)
-        .bind(contact.map(str::trim))
+        .bind(contact.flatten().map(str::trim).filter(|c| !c.is_empty()))
         .bind(actor)
+        .bind(contact.is_some())
         .execute(&mut ***tx)
         .await?;
     db::audit(tx, actor, "contractor.update", "contractor", Some(id), Some(json!({ "before": before }))).await?;

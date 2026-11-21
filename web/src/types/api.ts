@@ -48,7 +48,7 @@ export type Employee = {
   };
   updated_at: string;
 };
-export type Branch = { id: string; name: string; code: string; tz: string };
+export type Branch = { id: string; name: string; code: string; tz: string | null; address?: string | null; time_zones?: BranchTimeZone[]; updated_at?: string };
 export type ListEntry = { id: string; kind: string; name: string; code: string | null };
 export type VendorOrganisation = { id: string; display_name: string; legal_name: string; state: "active" | "suspended" };
 
@@ -279,4 +279,31 @@ export type ObEntry = {
   change_reason: string | null;
   superseded_by_entry_id: string | null;
   updated_at: string;
+};
+
+// Organisation structure and settings (organisation.yaml)
+export type BranchTimeZone = { tz: string; valid_from: string; valid_to: string | null };
+export type GeoFence = {
+  id: string;
+  branch_id: string;
+  name: string | null;
+  latitude: number;
+  longitude: number;
+  radius_m: number;
+  enabled: boolean;
+  tested_at: string | null;
+  updated_at: string;
+};
+export type FenceTest = { inside: boolean; distance_m: number; radius_m?: number; tested_at: string };
+export type IpAllowList = { branch_id: string; networks: string[] };
+/** A list entry (department, designation, category, employee type) or a contractor: a name plus a code or a contact. */
+export type NamedEntry = { id: string; name: string; code?: string | null; contact?: string | null; retired_at: string | null; updated_at: string };
+export type OrgSettings = Record<string, unknown>;
+export type OrgSettingsVersion = {
+  id: string;
+  effective_from: string;
+  schema_version: number;
+  settings: OrgSettings;
+  reason: string | null;
+  created_at: string;
 };
