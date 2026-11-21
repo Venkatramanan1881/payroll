@@ -42,6 +42,16 @@ pub(crate) async fn require_org_wide(tx: &mut OrgTx<'_>, p: &Principal, op: &str
     }
 }
 
+/// Organisation-wide decisions: like `require_org_wide`, but an approve-type grant over the whole organisation also
+/// counts (the Organisation Admin's PER-05 / OBL-02 are `approve` grants by default).
+pub(crate) async fn require_org_wide_decider(tx: &mut OrgTx<'_>, p: &Principal, op: &str) -> Result<(), ApiError> {
+    let g = require(tx, p, op).await?;
+    match (g.kind, g.scope) {
+        (GrantKind::All | GrantKind::Scoped | GrantKind::Approve, Scope::All) => Ok(()),
+        _ => Err(ApiError::Forbidden),
+    }
+}
+
 /// GET /v1/organisation (ORG-07).
 pub async fn organisation(Auth(p, mut tx): Auth) -> Result<Json<Value>, ApiError> {
     require(&mut tx, &p, "ORG-07").await?;

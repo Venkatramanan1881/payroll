@@ -23,7 +23,10 @@ test("HR sets up shifts, weekly offs, a schedule, the roster and holidays; the e
   await hr.getByRole("link", { name: "New shift" }).click();
   await hr.getByLabel("Code").fill("NT");
   await hr.getByLabel("Name").fill("Night 22-06");
-  await hr.getByLabel("Effective from").fill("2026-01-01");
+  // Next month: a version may not start inside a locked period (another test locks a past one).
+  const next = new Date(Date.now() + 330 * 60_000);
+  next.setUTCMonth(next.getUTCMonth() + 1, 1);
+  await hr.getByLabel("Effective from").fill(next.toISOString().slice(0, 10));
   await hr.getByLabel("Shift type").selectOption("night");
   await hr.getByLabel("Start", { exact: true }).fill("22:00");
   await hr.getByLabel("End", { exact: true }).fill("06:00");
@@ -34,7 +37,7 @@ test("HR sets up shifts, weekly offs, a schedule, the roster and holidays; the e
   await hr.getByRole("button", { name: "Save" }).click();
   await expect(hr.getByRole("status")).toContainText("Saved");
   await hr.getByRole("button", { name: "Publish" }).click();
-  await expect(hr.getByText("In force").first()).toBeVisible();
+  await expect(hr.getByText("Scheduled").first()).toBeVisible();
   await expect(hr.getByText("Published versions cannot change")).toBeVisible();
 
   // A weekly-off pattern: Sundays.
@@ -49,7 +52,7 @@ test("HR sets up shifts, weekly offs, a schedule, the roster and holidays; the e
   await hr.getByRole("link", { name: "Asha" }).click();
   await hr.getByLabel("Shift", { exact: true }).selectOption({ label: "NT · Night 22-06" });
   await hr.getByLabel("Weekly offs").selectOption({ label: "Sundays off" });
-  await hr.getByLabel("From", { exact: true }).fill(indiaDate(30));
+  await hr.getByLabel("From", { exact: true }).fill(indiaDate(40)); // after the shift starts next month
   await hr.getByLabel("Reason").fill("Moves to nights");
   await hr.getByRole("button", { name: "Assign schedule" }).click();
   await expect(hr.getByRole("cell", { name: "Moves to nights" })).toBeVisible();

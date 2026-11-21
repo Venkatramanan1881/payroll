@@ -69,6 +69,7 @@ async fn confirm_posts_once_and_changes_supersede(pool: PgPool) {
 
     let (_, entries, _) = common::call(&app, &s, "GET", &format!("/v1/opening-balances/batches/{id}/entries"), None, None).await;
     let entry = entries["items"][0].clone();
+    assert!(entry["employee_name"].is_string(), "entries name the employee: {entry}");
     let uri = format!("/v1/opening-balances/batches/{id}/entries/{}", entry["id"].as_str().unwrap());
     let tag = format!("W/\"{}\"", entry["updated_at"].as_str().unwrap());
     let (st, edited, _) = common::call(&app, &s, "PATCH", &uri, Some(json!({ "value": "6.50" })), Some(&tag)).await;
@@ -110,6 +111,8 @@ async fn approval_flow_br07_and_locks(pool: PgPool) {
         .execute(&pool).await.unwrap();
     let editor = user_with(&pool, s.org_id, &[("OBL-01", "scoped"), ("OBL-02", "approve"), ("OBL-04", "scoped")]).await;
     let oa = user_with(&pool, s.org_id, &[("OBL-02", "approve")]).await;
+    // The decider may read what they confirm or reject (OBL-02 approve, no OBL-04).
+    assert_eq!(common::as_user(&app, &oa, "GET", "/v1/opening-balances/batches", None, &[]).await.0, StatusCode::OK);
     let w = common::seed_worker(&pool, &app, &s, "Asha").await;
     let cl = leave_type(&app, &s, "CL").await;
     let leave = json!({ "employee_id": w.employee_id, "balance_kind": "leave", "leave_type_id": cl, "value": "3.00", "as_of_date": "2026-04-01" });

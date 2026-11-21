@@ -19,6 +19,8 @@ export const ORG_MENU: MenuItem[] = [
   { key: "shifts", href: "/app/shifts", module: "C05", ops: ["SCH-03"] },
   { key: "roster", href: "/app/roster", module: "C05", ops: ["SCH-03"] },
   { key: "holidays", href: "/app/holidays", module: "C07", ops: ["SCH-05"] },
+  { key: "periods", href: "/app/periods", module: "C12", ops: ["PER-01", "PER-02", "PER-03", "PER-05", "PER-08"], kinds: DECIDE },
+  { key: "openingBalances", href: "/app/opening-balances", module: "C15", ops: ["OBL-01", "OBL-02", "OBL-04"], kinds: DECIDE },
   { key: "requests", href: "/app/requests", module: ["C09", "M02"], ops: ["PRM-03", "PRM-04", "PRM-07", "PRM-09", "PRM-10", "PRM-11", "PRM-13", "CMP-05", "CMP-07"], kinds: DECIDE },
 ];
 

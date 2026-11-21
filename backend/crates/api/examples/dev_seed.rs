@@ -6,8 +6,10 @@
 //! - an organisation policy and a 09:00-18:00 shift;
 //! - yesterday's punches for Asha;
 //! - leave types CL and SL with balances for Asha, and a pending CL request of hers;
-//! - a "Dev leave extras" role for HR (LVE-03 apply on behalf, LVE-06 cancel, LVE-07 adjust): no default role holds
-//!   these while G-24..G-26 are open, so they exist here only for local trials.
+//! - a "Dev leave extras" role for HR (LVE-03 apply on behalf, LVE-06 cancel, LVE-07 adjust, PER-04 request an unlock,
+//!   PER-06 / PER-07 payroll export): no default role holds these while G-24..G-26, G-30 and G-31 are open, so they
+//!   exist here only for local trials;
+//! - a monthly attendance cycle for the organisation from January (periods to review and lock).
 //!
 //! Organisation rows go straight in as the superuser; everything else goes through the API in-process.
 //!
@@ -90,11 +92,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Everything else through the API, as HR.
     let secret = Uuid::new_v4().to_string().into_bytes();
+    let job_secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()); // in-process only
     let app = api::router(api::AppState {
         pool: pool.clone(),
         jwt_secret: secret.clone(),
         phone_verifier: std::sync::Arc::new(domain_iam::firebase::GoogleVerifier::new("dev-local")),
-        job_secret: None,
+        job_secret: Some(job_secret.clone().into_bytes()),
         store: None,
         vendor_verifier: None,
         mfa_key: None,
@@ -125,7 +128,8 @@ async fn main() -> anyhow::Result<()> {
         .bind(org).bind(asha).bind(meena).execute(&pool).await?;
     let asha_user = user(&pool, org, "asha@dev.invalid", &hash, &[emp_role], Some(asha)).await?;
     let extras: Uuid = sqlx::query_scalar("INSERT INTO iam.role (org_id, name) VALUES ($1, 'Dev leave extras') RETURNING id").bind(org).fetch_one(&pool).await?;
-    for op in ["LVE-03", "LVE-06", "LVE-07"] {
+    // Also PER-04 (request an unlock), PER-06 / PER-07 (produce / download the payroll export): G-30, G-31 open.
+    for op in ["LVE-03", "LVE-06", "LVE-07", "PER-04", "PER-06", "PER-07"] {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'scoped')").bind(org).bind(extras).bind(op).execute(&pool).await?;
     }
     sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(org).bind(hr).bind(extras).execute(&pool).await?;
@@ -154,6 +158,11 @@ async fn main() -> anyhow::Result<()> {
         "min_notice_minutes": 0, "approval": "manager", "timeout_action": "escalate", "over_limit": "block", "over_stay": "late_early_minutes",
         "same_day_half_leave_allowed": false, "adjacent_off_allowed": true, "mid_period_joiner": "full", "eligibility": {},
         "blackout_enabled": false, "blackout_dates": [], "punch_requirement": {}, "converted_uses_limit": true } }))).await?;
+    // A monthly attendance cycle for the whole organisation from January, so periods exist to review and lock.
+    call(&app, t, "POST", "/v1/period/cycles", Some(json!({ "owner_kind": "organisation", "owner_id": org, "frequency": "monthly",
+        "start_kind": "calendar", "valid_from": "2026-01-01", "reason": "dev seed" }))).await?;
+    // J7 period housekeeping, as Cloud Scheduler would run it: past periods move on to "awaiting lock".
+    call(&app, &job_secret, "POST", "/internal/jobs/period-housekeeping", None).await?;
     let asha_token = domain_iam::tokens::issue_access(&secret, asha_user, org, None, now);
     let ahead = d + chrono::Duration::days(4);
     call(&app, &asha_token, "POST", "/v1/leave/requests", Some(json!({ "leave_type_id": types[0], "from_date": ahead, "to_date": ahead, "reason": "Family function" }))).await?;

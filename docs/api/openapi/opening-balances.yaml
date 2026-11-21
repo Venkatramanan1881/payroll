@@ -69,7 +69,7 @@ paths:
     get:
       operationId: openingBalancesListBatches
       summary: List opening-balance batches
-      description: Batches with state (SM-OB). Filters after scope. OA / PO read is G-34.
+      description: 'Batches with state (SM-OB). Filters after scope. OA / PO read is G-34. The OBL-02 decider may also read batches (web slice 7).'
       tags: [Batches]
       parameters:
         - { name: state, in: query, schema: { $ref: '#/components/schemas/BatchState' } }
@@ -100,7 +100,7 @@ paths:
     get:
       operationId: openingBalancesGetBatch
       summary: Get a batch
-      description: Batch with state, submitter and confirmer (OB-R5, AC-C15-03.4).
+      description: 'Batch with state, submitter and confirmer (OB-R5, AC-C15-03.4). The OBL-02 decider may also read it (web slice 7).'
       tags: [Batches]
       responses:
         '200':
@@ -456,6 +456,8 @@ components:
         id: { $ref: 'common.yaml#/components/schemas/Id' }
         batch_id: { $ref: 'common.yaml#/components/schemas/Id' }
         employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string, description: For display (web slice 7). }
+        employee_name: { type: string, description: For display (web slice 7). }
         balance_kind: { $ref: '#/components/schemas/BalanceKind' }
         leave_type_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
         permission_type_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }

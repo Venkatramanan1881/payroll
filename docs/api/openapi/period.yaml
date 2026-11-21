@@ -179,6 +179,7 @@ paths:
       operationId: periodListPeriods
       summary: List attendance periods
       description: |
+        The PER-05 decider (the Organisation Admin's approve grant, organisation-wide) may also read it: whoever decides an unlock may read the periods it is about (web slice 7).
         Periods of the organisation with state (SM-PERIOD), newest first (AC-C12-01.4). Filters after scope.
         Read grant PER-08 (OA/PO/AUD reads: G-14).
       tags: [Periods]
@@ -215,7 +216,7 @@ paths:
     get:
       operationId: periodGetPeriod
       summary: Get a period with its state history
-      description: Period detail, state, lock record and state history (SM-PERIOD, §16).
+      description: 'Period detail, state, lock record and state history (SM-PERIOD, §16). The PER-05 decider may also read it (web slice 7).'
       tags: [Periods]
       responses:
         '200':
@@ -357,7 +358,7 @@ paths:
     get:
       operationId: periodListUnlockRequests
       summary: List unlock requests of a period
-      description: Unlock requests with their approval steps (§16).
+      description: 'Unlock requests with their approval steps (§16). The PER-05 decider may also read it (web slice 7).'
       tags: [Lock and unlock]
       responses:
         '200':
@@ -385,6 +386,7 @@ paths:
       operationId: periodApproveUnlock
       summary: Organisation Admin approves a period unlock
       description: |
+        An approve-type PER-05 grant over the whole organisation is enough (the default Organisation Admin grant; web slice 7).
         SM-PERIOD P7 (PL-06, AC-C12-05.3): request approved and period locked -> unlocked; days re-evaluated (SM-DAY
         A9). SELF_APPROVAL_FORBIDDEN when the approver raised the request (BR-07, AC-C12-05.4), including when acting
         as a delegate (AC-03). PL-06 changed to never meanwhile -> UNLOCK_NOT_ALLOWED. What happens to adjustments
@@ -418,6 +420,7 @@ paths:
       operationId: periodRejectUnlock
       summary: Organisation Admin rejects a period unlock
       description: |
+        An approve-type PER-05 grant over the whole organisation is enough (web slice 7).
         Rejection with reason; the period stays locked. SELF_APPROVAL_FORBIDDEN (BR-07) for the requester, also via
         delegation (AC-03). Reject on rejected -> 200; on approved -> ILLEGAL_TRANSITION.
       tags: [Lock and unlock]
@@ -668,6 +671,7 @@ components:
         kind: { $ref: '#/components/schemas/ChecklistKind' }
         employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
         employee_code: { type: string }
+        employee_name: { type: string, description: For display (web slice 7). }
         date: { $ref: 'common.yaml#/components/schemas/Date' }
         request_type: { type: [string, 'null'], enum: [leave, permission, on_duty, regularisation, comp_off, shift_change, punch_flag, null] }
         request_id: { oneOf: [ { $ref: 'common.yaml#/components/schemas/Id' }, { type: 'null' } ] }
@@ -704,6 +708,8 @@ components:
       required: [employee_id, period_id, basis, payable_days, deduction_days, deduction_lines, late_minutes, early_minutes, overtime_identified_minutes, pay_hold]
       properties:
         employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string, description: For display (web slice 7). }
+        employee_name: { type: string, description: For display (web slice 7). }
         period_id: { $ref: 'common.yaml#/components/schemas/Id' }
         basis: { type: string, enum: [frozen, provisional] }
         payable_days: { $ref: 'common.yaml#/components/schemas/DayQuantity' }
@@ -724,6 +730,8 @@ components:
       properties:
         id: { $ref: 'common.yaml#/components/schemas/Id' }
         employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string, description: For display (web slice 7). }
+        employee_name: { type: string, description: For display (web slice 7). }
         original_date: { $ref: 'common.yaml#/components/schemas/Date' }
         source_period_id: { $ref: 'common.yaml#/components/schemas/Id' }
         target_period_id: { $ref: 'common.yaml#/components/schemas/Id' }

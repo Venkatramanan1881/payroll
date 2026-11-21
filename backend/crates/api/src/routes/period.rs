@@ -1,6 +1,6 @@
 //! period.yaml: cycles, period settings, periods, pre-lock checklist, lock and unlock, period totals.
 
-use crate::routes::org::require_org_wide;
+use crate::routes::org::{require_org_wide, require_org_wide_decider};
 use crate::routes::sched::{done, if_match, parse, reply, start};
 use crate::{ApiError, AppState, Auth};
 use axum::body::Bytes;
@@ -103,16 +103,25 @@ pub struct PeriodQuery {
     to: Option<NaiveDate>,
 }
 
-/// GET /v1/periods (PER-08).
+/// PER-08, or the PER-05 decider: whoever decides an unlock may read the periods it is about (as for requests).
+async fn may_read_periods(tx: &mut OrgTx<'_>, p: &Principal, org_wide: bool) -> Result<(), ApiError> {
+    let read = if org_wide { require_org_wide(tx, p, "PER-08").await } else { require(tx, p, "PER-08").await.map(|_| ()).map_err(Into::into) };
+    match read {
+        Err(ApiError::Forbidden) => require_org_wide_decider(tx, p, "PER-05").await,
+        other => other,
+    }
+}
+
+/// GET /v1/periods (PER-08, or the PER-05 decider).
 pub async fn list_periods(Auth(p, mut tx): Auth, Query(q): Query<PeriodQuery>) -> Result<Json<Value>, ApiError> {
-    require(&mut tx, &p, "PER-08").await?;
+    may_read_periods(&mut tx, &p, false).await?;
     let f = PeriodFilter { cycle_id: q.cycle_id, state: q.state, contains_date: q.contains_date, from: q.from, to: q.to };
     Ok(Json(json!({ "items": period::list_periods(&mut tx, &f).await?, "next_cursor": null })))
 }
 
-/// GET /v1/periods/{id} (PER-08).
+/// GET /v1/periods/{id} (PER-08, or the PER-05 decider).
 pub async fn get_period(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
-    require(&mut tx, &p, "PER-08").await?;
+    may_read_periods(&mut tx, &p, false).await?;
     Ok(Json(period::get_period(&mut tx, id).await?))
 }
 
@@ -124,7 +133,11 @@ pub struct ChecklistQuery {
 /// GET /v1/periods/{id}/checklist (PER-02, D-10), within scope.
 pub async fn checklist(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, Query(q): Query<ChecklistQuery>) -> Result<Json<Value>, ApiError> {
     let s = scope(&mut tx, &p, "PER-02").await?;
-    Ok(Json(period::checklist(&mut tx, id, &s, q.kind.as_deref()).await?))
+    let mut body = period::checklist(&mut tx, id, &s, q.kind.as_deref()).await?;
+    if let Some(items) = body["items"].as_array_mut() {
+        crate::routes::with_names(&mut tx, items).await?;
+    }
+    Ok(Json(body))
 }
 
 #[derive(Deserialize, Default)]
@@ -167,15 +180,15 @@ pub async fn request_unlock(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers
     done(tx, key, StatusCode::CREATED, body).await
 }
 
-/// GET /v1/periods/{id}/unlock-requests (PER-08).
+/// GET /v1/periods/{id}/unlock-requests (PER-08 organisation-wide, or the PER-05 decider).
 pub async fn list_unlocks(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
-    require_org_wide(&mut tx, &p, "PER-08").await?; // x-scope: org
+    may_read_periods(&mut tx, &p, true).await?; // x-scope: org
     Ok(Json(json!({ "items": period::list_unlocks(&mut tx, id).await?, "next_cursor": null })))
 }
 
 /// POST /v1/period/unlock-requests/{id}/approve (PER-05, Organisation Admin).
 pub async fn approve_unlock(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require_org_wide(&mut tx, &p, "PER-05").await?;
+    require_org_wide_decider(&mut tx, &p, "PER-05").await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/period/unlock-requests/{id}/approve"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -187,7 +200,7 @@ pub async fn approve_unlock(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers
 
 /// POST /v1/period/unlock-requests/{id}/reject (PER-05).
 pub async fn reject_unlock(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
-    require_org_wide(&mut tx, &p, "PER-05").await?;
+    require_org_wide_decider(&mut tx, &p, "PER-05").await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/period/unlock-requests/{id}/reject"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
@@ -208,7 +221,9 @@ pub struct TotalsQuery {
 /// GET /v1/periods/{id}/totals (PER-08), within scope.
 pub async fn totals(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, Query(q): Query<TotalsQuery>) -> Result<Json<Value>, ApiError> {
     let s = scope(&mut tx, &p, "PER-08").await?;
-    Ok(Json(json!({ "items": period::totals(&mut tx, id, &s, q.employee_id).await?, "next_cursor": null })))
+    let mut items = period::totals(&mut tx, id, &s, q.employee_id).await?;
+    crate::routes::with_names(&mut tx, &mut items).await?;
+    Ok(Json(json!({ "items": items, "next_cursor": null })))
 }
 
 #[derive(Deserialize)]
@@ -223,7 +238,9 @@ pub struct AdjustmentQuery {
 pub async fn list_adjustments(Auth(p, mut tx): Auth, Query(q): Query<AdjustmentQuery>) -> Result<Json<Value>, ApiError> {
     let s = scope(&mut tx, &p, "PER-08").await?;
     let f = period::AdjustmentFilter { target_period_id: q.target_period_id, source_period_id: q.source_period_id, employee_id: q.employee_id, state: q.state };
-    Ok(Json(json!({ "items": period::list_adjustments(&mut tx, &f, &s).await?, "next_cursor": null })))
+    let mut items = period::list_adjustments(&mut tx, &f, &s).await?;
+    crate::routes::with_names(&mut tx, &mut items).await?;
+    Ok(Json(json!({ "items": items, "next_cursor": null })))
 }
 
 /// Signed links live this long (TB-02, AC-C12-07.5).
