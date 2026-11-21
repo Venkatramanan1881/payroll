@@ -1,5 +1,5 @@
 // Shapes from docs/api/openapi (identity.yaml, workforce.yaml, organisation.yaml, vendor.yaml). Fields this slice reads.
-import type { Grant, ModuleState } from "@/lib/menu";
+import type { Grant, GrantKind, ModuleState } from "@/lib/menu";
 
 export type Page<T> = { items: T[]; next_cursor: string | null };
 
@@ -307,3 +307,41 @@ export type OrgSettingsVersion = {
   reason: string | null;
   created_at: string;
 };
+
+// Users and access (identity.yaml)
+export type UserScope = { scope_kind: "all" | "branch" | "department"; branch_id?: string | null; department_id?: string | null };
+export type UserAccount = {
+  id: string;
+  login_kind: "mobile_otp" | "password";
+  mobile: string | null;
+  email: string | null;
+  employee_id: string | null;
+  active: boolean;
+  last_sign_in_at: string | null;
+  roles: { id: string; name: string; system_code: string | null }[];
+  scopes: UserScope[];
+  updated_at: string;
+};
+export type RoleGrant = { operation_code: string; grant_kind: GrantKind; setting_ref: string | null };
+export type Role = { id: string; name: string; system_code: string | null; grants?: RoleGrant[]; updated_at: string };
+export type ApproverSource = "reporting_manager" | "named_user" | "department_head" | "hr";
+export type ApproverRule = { request_type: string; level: 1 | 2; source: ApproverSource; named_user_id: string | null };
+export type Delegation = { id: string; approver_user_id: string; delegate_user_id: string; valid_from: string; valid_to: string };
+export type EmployeeVisibility = Record<"own_punches" | "day_status" | "counters" | "permission_balance" | "deduction_reason", boolean>;
+export type AccessSettings = {
+  delegation_enabled: boolean;
+  settings_change_mode: "hr_only" | "hr_with_org_admin_approval";
+  custom_roles_enabled: boolean;
+  admin_second_step: boolean;
+  employee_visibility: EmployeeVisibility;
+};
+export type SupportGrant = {
+  id: string;
+  state: "requested" | "active" | "rejected" | "expired" | "ended";
+  vendor_user_name?: string;
+  reason: string;
+  requested_at: string;
+  window_start: string | null;
+  window_end: string | null;
+};
+export type SupportAction = { occurred_at: string; vendor_user_name?: string; action: string; target: string | null };
