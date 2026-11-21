@@ -186,3 +186,24 @@ export type InboxItem = {
   read_at: string | null;
   recipient_kind: "employee" | "approver";
 };
+
+// scheduling.yaml
+export type VersionState = "draft" | "pending_approval" | "scheduled" | "in_force" | "superseded";
+export type ShiftVersion = {
+  id: string;
+  shift_id: string;
+  effective_from: string;
+  state: VersionState;
+  shift_type: string;
+  start_time: string | null;
+  end_time: string | null;
+  updated_at: string;
+  [field: string]: unknown;
+};
+export type Shift = { id: string; code: string; name: string; retired_at: string | null; current_version: ShiftVersion | null; versions: ShiftVersion[] };
+export type WeeklyOffPattern = { id: string; name: string; kind: "fixed_days" | "alternating" | "from_roster"; weekly_days: number[] | null; alt_day: number | null; alt_weeks: number[] | null; retired_at: string | null };
+export type EmployeeSchedule = { id: string; employee_id: string; source: "fixed_shift" | "roster"; shift_id: string | null; weekly_off_pattern_id: string | null; valid_from: string; valid_to: string | null; reason: string | null };
+export type RosterEntry = { id: string; employee_id: string; roster_date: string; is_weekly_off: boolean; shift_id: string | null; shift_code: string | null };
+export type HolidayCalendar = { id: string; name: string; retired_at: string | null; branch_ids: string[]; updated_at: string };
+export type Holiday = { id: string; calendar_id: string; holiday_date: string; name: string; kind: "national" | "festival" | "optional"; updated_at: string };
+export type ScheduleDay = { date: string; source: string; is_weekly_off: boolean; holiday_name: string | null; shift_code?: string; shift_name?: string; start_time?: string | null; end_time?: string | null };
