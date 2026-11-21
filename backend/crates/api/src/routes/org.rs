@@ -98,7 +98,13 @@ pub async fn get_branch(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<R
 pub struct BranchPatch {
     name: Option<String>,
     code: Option<String>,
-    address: Option<String>,
+    #[serde(default, deserialize_with = "sent")]
+    address: Option<Option<String>>,
+}
+
+/// A field that may be cleared: missing → None, null → Some(None), a value → Some(Some(v)).
+fn sent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 /// PATCH /v1/branches/{id} (ORG-01, If-Match).
@@ -107,7 +113,7 @@ pub async fn update_branch(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, headers:
     sqlx::query("SELECT 1 FROM org.branch WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **tx).await?;
     if_match(&headers, &org::get_branch(&mut tx, id).await?)?;
     let r: BranchPatch = parse(&raw)?;
-    org::update_branch(&mut tx, p.user_id, id, r.code.as_deref(), r.name.as_deref(), r.address.as_deref()).await?;
+    org::update_branch(&mut tx, p.user_id, id, r.code.as_deref(), r.name.as_deref(), r.address.as_ref().map(Option::as_deref)).await?;
     let body = org::get_branch(&mut tx, id).await?;
     tx.commit().await?;
     Ok(reply(StatusCode::OK, body))
@@ -237,8 +243,21 @@ pub struct Retired {
     include_retired: Option<bool>,
 }
 
+/// The contract's path names (departments, designations, categories, employee-types) or the stored kind itself.
+fn list_kind(kind: &str) -> String {
+    match kind {
+        "departments" => "department",
+        "designations" => "designation",
+        "categories" => "category",
+        "employee-types" => "employee_type",
+        k => k,
+    }
+    .to_string()
+}
+
 /// GET /v1/lists/{kind} (ORG-07).
 pub async fn list_entries(Auth(p, mut tx): Auth, Path(kind): Path<String>, Query(q): Query<Retired>) -> Result<Json<Value>, ApiError> {
+    let kind = list_kind(&kind);
     require(&mut tx, &p, "ORG-07").await?;
     Ok(Json(json!({ "items": org::list_entries(&mut tx, &kind, q.include_retired.unwrap_or(false)).await?, "next_cursor": null })))
 }
@@ -247,29 +266,32 @@ pub async fn list_entries(Auth(p, mut tx): Auth, Path(kind): Path<String>, Query
 #[serde(deny_unknown_fields)]
 pub struct EntryIn {
     name: Option<String>,
-    code: Option<String>,
+    #[serde(default, deserialize_with = "sent")]
+    code: Option<Option<String>>,
 }
 
 /// POST /v1/lists/{kind} (ORG-04).
 pub async fn create_entry(Auth(p, mut tx): Auth, Path(kind): Path<String>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    let kind = list_kind(&kind);
     require_org_wide(&mut tx, &p, "ORG-04").await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/lists/{kind}"), &raw).await?;
     if let Some(r) = replay {
         return Ok(r);
     }
     let r: EntryIn = parse(&raw)?;
-    let id = org::create_entry(&mut tx, p.user_id, &kind, r.name.as_deref().unwrap_or(""), r.code.as_deref()).await?;
+    let id = org::create_entry(&mut tx, p.user_id, &kind, r.name.as_deref().unwrap_or(""), r.code.as_ref().and_then(Option::as_deref)).await?;
     let body = org::get_entry(&mut tx, &kind, id).await?;
     done(tx, key, StatusCode::CREATED, body).await
 }
 
 /// PATCH /v1/lists/{kind}/{id} (ORG-04, If-Match).
 pub async fn update_entry(Auth(p, mut tx): Auth, Path((kind, id)): Path<(String, Uuid)>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    let kind = list_kind(&kind);
     require_org_wide(&mut tx, &p, "ORG-04").await?;
     sqlx::query("SELECT 1 FROM org.list_entry WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **tx).await?;
     if_match(&headers, &org::get_entry(&mut tx, &kind, id).await?)?;
     let r: EntryIn = parse(&raw)?;
-    org::update_entry(&mut tx, p.user_id, &kind, id, r.name.as_deref(), r.code.as_deref()).await?;
+    org::update_entry(&mut tx, p.user_id, &kind, id, r.name.as_deref(), r.code.as_ref().map(Option::as_deref)).await?;
     let body = org::get_entry(&mut tx, &kind, id).await?;
     tx.commit().await?;
     Ok(reply(StatusCode::OK, body))
@@ -277,6 +299,7 @@ pub async fn update_entry(Auth(p, mut tx): Auth, Path((kind, id)): Path<(String,
 
 /// POST /v1/lists/{kind}/{id}/retire (ORG-04).
 pub async fn retire_entry(Auth(p, mut tx): Auth, Path((kind, id)): Path<(String, Uuid)>, headers: HeaderMap, raw: Bytes) -> Result<Response, ApiError> {
+    let kind = list_kind(&kind);
     require_org_wide(&mut tx, &p, "ORG-04").await?;
     let (key, replay) = start(&mut tx, &headers, &format!("POST /v1/lists/{kind}/{id}/retire"), &raw).await?;
     if let Some(r) = replay {
@@ -303,7 +326,8 @@ pub async fn get_contractor(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Resu
 #[serde(deny_unknown_fields)]
 pub struct ContractorIn {
     name: Option<String>,
-    contact: Option<String>,
+    #[serde(default, deserialize_with = "sent")]
+    contact: Option<Option<String>>,
 }
 
 /// POST /v1/contractors (ORG-05).
@@ -314,7 +338,7 @@ pub async fn create_contractor(Auth(p, mut tx): Auth, headers: HeaderMap, raw: B
         return Ok(r);
     }
     let r: ContractorIn = parse(&raw)?;
-    let id = org::create_contractor(&mut tx, p.user_id, r.name.as_deref().unwrap_or(""), r.contact.as_deref()).await?;
+    let id = org::create_contractor(&mut tx, p.user_id, r.name.as_deref().unwrap_or(""), r.contact.as_ref().and_then(Option::as_deref)).await?;
     let body = org::get_contractor(&mut tx, id).await?;
     done(tx, key, StatusCode::CREATED, body).await
 }
@@ -325,7 +349,7 @@ pub async fn update_contractor(Auth(p, mut tx): Auth, Path(id): Path<Uuid>, head
     sqlx::query("SELECT 1 FROM org.contractor WHERE id = $1 FOR UPDATE").bind(id).execute(&mut **tx).await?;
     if_match(&headers, &org::get_contractor(&mut tx, id).await?)?;
     let r: ContractorIn = parse(&raw)?;
-    org::update_contractor(&mut tx, p.user_id, id, r.name.as_deref(), r.contact.as_deref()).await?;
+    org::update_contractor(&mut tx, p.user_id, id, r.name.as_deref(), r.contact.as_ref().map(Option::as_deref)).await?;
     let body = org::get_contractor(&mut tx, id).await?;
     tx.commit().await?;
     Ok(reply(StatusCode::OK, body))

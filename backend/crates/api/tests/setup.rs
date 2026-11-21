@@ -66,6 +66,10 @@ async fn branches_scope_and_isolation(pool: PgPool) {
     let (_, _, etag) = common::call(&app, &s, "GET", &format!("/v1/branches/{chn}"), None, None).await;
     let (st, b, _) = common::call(&app, &s, "PATCH", &format!("/v1/branches/{chn}"), Some(json!({ "name": "Chennai Central" })), etag.as_deref()).await;
     assert_eq!((st, b["name"].as_str()), (StatusCode::OK, Some("Chennai Central")), "{b}");
+    // null clears an optional field (organisation.yaml: address is string or null); a missing field is left alone.
+    let (_, _, etag) = common::call(&app, &s, "PATCH", &format!("/v1/branches/{chn}"), Some(json!({ "address": "1 Mount Road" })), b["updated_at"].as_str().map(|u| format!("W/\"{u}\"")).as_deref()).await;
+    let (st, b, _) = common::call(&app, &s, "PATCH", &format!("/v1/branches/{chn}"), Some(json!({ "address": null })), etag.as_deref()).await;
+    assert_eq!((st, &b["address"], b["name"].as_str()), (StatusCode::OK, &Value::Null, Some("Chennai Central")), "{b}");
 
     // An HR user scoped to HQ only.
     let user = Uuid::new_v4();
@@ -136,9 +140,20 @@ async fn ip_allow_list_lists_and_contractors(pool: PgPool) {
     assert!(st == StatusCode::OK && r["retired_at"].is_string(), "{r}");
     let (_, active) = common::as_user(&app, &s.hr_token, "GET", "/v1/lists/department", None, &[]).await;
     assert_eq!(active["items"], json!([]));
+    // The contract's plural path names (organisation.yaml ListKind) reach the same lists.
+    let (st, p) = post(&app, &s, "/v1/lists/employee-types", json!({ "name": "Apprentice", "code": "AP" })).await;
+    assert!(st == StatusCode::CREATED && p["kind"] == "employee_type", "{p}");
+    let tag = format!("W/\"{}\"", p["updated_at"].as_str().unwrap());
+    let (st, e, _) = common::call(&app, &s, "PATCH", &format!("/v1/lists/employee-types/{}", p["id"].as_str().unwrap()), Some(json!({ "code": null })), Some(&tag)).await;
+    assert_eq!((st, &e["code"], e["name"].as_str()), (StatusCode::OK, &Value::Null, Some("Apprentice")), "{e}");
+    let (_, all) = common::as_user(&app, &s.hr_token, "GET", "/v1/lists/departments?include_retired=true", None, &[]).await;
+    assert_eq!(all["items"][0]["name"], "Stores", "{all}");
 
     let (st, c) = post(&app, &s, "/v1/contractors", json!({ "name": "Acme Labour", "contact": "9876543210" })).await;
     assert_eq!(st, StatusCode::CREATED, "{c}");
+    let tag = format!("W/\"{}\"", c["updated_at"].as_str().unwrap());
+    let (st, cleared, _) = common::call(&app, &s, "PATCH", &format!("/v1/contractors/{}", c["id"].as_str().unwrap()), Some(json!({ "contact": null })), Some(&tag)).await;
+    assert_eq!((st, &cleared["contact"]), (StatusCode::OK, &Value::Null), "{cleared}");
     let (_, list) = common::as_user(&app, &s.hr_token, "GET", "/v1/contractors", None, &[]).await;
     assert_eq!(list["items"].as_array().unwrap().len(), 1);
     let (_, o) = common::as_user(&app, &s.hr_token, "GET", "/v1/organisation", None, &[]).await;

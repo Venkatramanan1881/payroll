@@ -2,7 +2,7 @@ import { api } from "./api";
 import type { Branch, ListEntry, Page } from "@/types/api";
 
 export type Option = { id: string; name: string; tz?: string };
-const opt = (x: { id: string; name: string; code?: string | null; tz?: string }): Option => ({
+const opt = (x: { id: string; name: string; code?: string | null; tz?: string | null }): Option => ({
   id: x.id,
   name: x.code ? `${x.name} (${x.code})` : x.name,
   ...(x.tz ? { tz: x.tz } : {}),
