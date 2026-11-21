@@ -11,6 +11,8 @@ const DECIDE: GrantKind[] = ["all", "scoped", "approve"];
 
 // Each slice adds its items here.
 export const ORG_MENU: MenuItem[] = [
+  // First: /app lands on the first item the user may open (DB-R1: the role's dashboard).
+  { key: "dashboard", href: "/app/dashboard", module: "C16", ops: ["DSH-01"] },
   { key: "employees", href: "/app/employees", module: "C02", ops: ["WRK-08"] },
   { key: "attendance", href: "/app/attendance", module: "C06", ops: ["ATT-01"] },
   { key: "approvals", href: "/app/attendance/regularisations", module: "C06", ops: ["ATT-03", "ATT-04", "ATT-05"], kinds: DECIDE },
@@ -23,6 +25,7 @@ export const ORG_MENU: MenuItem[] = [
   { key: "openingBalances", href: "/app/opening-balances", module: "C15", ops: ["OBL-01", "OBL-02", "OBL-04"], kinds: DECIDE },
   { key: "organisation", href: "/app/organisation", module: "C01", ops: ["ORG-01", "ORG-02", "ORG-03", "ORG-04", "ORG-05", "ORG-06", "ORG-07"] },
   { key: "access", href: "/app/access", module: "C03", ops: ["IAM-01", "IAM-02", "IAM-03", "IAM-04", "IAM-05", "IAM-06", "IAM-07", "IAM-09", "PLT-14", "PLT-18"], kinds: DECIDE },
+  { key: "reports", href: "/app/reports", module: "C13", ops: ["RPT-01", "RPT-02", "RPT-03", "RPT-04", "RPT-05", "RPT-06", "ADT-01", "ADT-02"] },
   { key: "requests", href: "/app/requests", module: ["C09", "M02"], ops: ["PRM-03", "PRM-04", "PRM-07", "PRM-09", "PRM-10", "PRM-11", "PRM-13", "CMP-05", "CMP-07"], kinds: DECIDE },
 ];
 

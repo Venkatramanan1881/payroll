@@ -39,7 +39,8 @@
     "VERSION_FROZEN": "This version is published and can no longer change. Create a new version instead.",
     "PERIOD_NOT_READY": "This period cannot be locked yet.",
     "PENDING_ITEMS": "Items are still pending for this period.",
-    "UNLOCK_NOT_ALLOWED": "The period settings do not allow unlocking a locked period."
+    "UNLOCK_NOT_ALLOWED": "The period settings do not allow unlocking a locked period.",
+    "NO_LINK": "The file is ready but no download link is available here."
   },
   "signIn": {
     "title": "Sign in",
@@ -81,7 +82,9 @@
     "periods": "Periods",
     "openingBalances": "Opening balances",
     "organisation": "Organisation",
-    "access": "Users and access"
+    "access": "Users and access",
+    "dashboard": "Dashboard",
+    "reports": "Reports and audit"
   },
   "me": {
     "title": "My details",
@@ -1027,5 +1030,107 @@
     "fromIst": "From (India time)",
     "toIst": "To (India time)",
     "inForceToday": "These are the settings in force today. A change dated later shows here from that date."
+  },
+  "dsh": {
+    "title": "Dashboard",
+    "role": "Dashboard for: {role}",
+    "branch": "Branch",
+    "allBranches": "All branches I see",
+    "asOf": "As of {time}",
+    "empty": "Nothing to show for your role yet.",
+    "none": "None.",
+    "w": {
+      "today_counts_by_branch": "Today by branch",
+      "missed_punches": "Missed punches",
+      "pending_approvals": "Waiting for approval",
+      "devices_offline": "Devices offline",
+      "joiners_leavers": "Joiners and leavers",
+      "periods_awaiting_lock": "Periods awaiting lock",
+      "pre_lock_issues": "Before locking",
+      "team_attendance_today": "My team today",
+      "team_leave_calendar": "Team leave",
+      "late_absence_trends": "Late marks and absences",
+      "who_is_in_now": "Who is in now",
+      "roster_today_tomorrow": "Roster today and tomorrow",
+      "today_punch_status": "My punches today",
+      "month_attendance": "My month",
+      "leave_balance": "My leave balance",
+      "permission_balance": "My permission balance",
+      "comp_off_balance": "My comp-off balance",
+      "my_pending_requests": "My pending requests"
+    },
+    "choices": "Widgets per role",
+    "choicesHelp": "Pick the widgets each role's dashboard shows, from the ones offered to that role.",
+    "defaultApplied": "Default",
+    "saveChoice": "Save widgets",
+    "saved": "Saved."
+  },
+  "rpt": {
+    "title": "Reports and audit",
+    "sub": {
+      "reports": "Reports",
+      "audit": "Audit trail",
+      "settings": "Settings history"
+    },
+    "report": "Report",
+    "noReports": "No reports are available to your role.",
+    "r": {
+      "R1": "R1 Daily attendance",
+      "R2": "R2 Monthly register",
+      "R3": "R3 Late and early",
+      "R4": "R4 Missed punches and regularisations",
+      "R5": "R5 Flagged punches and devices",
+      "R6": "R6 Leave balance and taken",
+      "R7": "R7 Uninformed and excess absence",
+      "R8": "R8 Permission and on-duty register",
+      "R9": "R9 Comp-off",
+      "R10": "R10 People and headcount",
+      "R13": "R13 Payroll input summary",
+      "R25": "R25 Opening balances",
+      "R26": "R26 Settings history",
+      "R27": "R27 Audit trail"
+    },
+    "range": "Dates",
+    "byDates": "From and to",
+    "byPeriod": "A period",
+    "from": "From",
+    "to": "To",
+    "period": "Period",
+    "periodOnly": "This report always covers one period.",
+    "branch": "Branch (optional)",
+    "department": "Department (optional)",
+    "format": "File type",
+    "any": "Any",
+    "run": "Run report",
+    "running": "Running…",
+    "st": {
+      "queued": "Queued",
+      "running": "Running",
+      "succeeded": "Ready",
+      "failed": "Failed"
+    },
+    "download": "Download",
+    "when": "When",
+    "actor": "Who",
+    "action": "Action",
+    "target": "Target",
+    "reason": "Reason",
+    "details": "Details",
+    "before": "Before",
+    "after": "After",
+    "actorKind": "Actor kind",
+    "targetType": "Target type",
+    "supportOnly": "Only under vendor support access",
+    "ak": {
+      "user": "User",
+      "vendor_user": "Vendor user",
+      "system_job": "System job",
+      "device": "Device"
+    },
+    "apply": "Apply filters",
+    "noEntries": "No entries match.",
+    "newest": "The newest 200 matching entries.",
+    "setting": "Setting (for example PL-06)",
+    "vendorAccess": "Vendor access"
   }
 }

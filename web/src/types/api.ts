@@ -345,3 +345,29 @@ export type SupportGrant = {
   window_end: string | null;
 };
 export type SupportAction = { occurred_at: string; vendor_user_name?: string; action: string; target: string | null };
+
+// Reports, dashboards and audit (reports.yaml)
+export type Job = {
+  id: string;
+  kind: string;
+  state: "queued" | "running" | "succeeded" | "failed";
+  created_at: string;
+  finished_at: string | null;
+  download_url: string | null;
+};
+export type Widget = { code: string; as_of: string; data: Record<string, unknown> };
+export type Dashboard = { role: string; filters?: { branch_id: string | null }; widgets: Widget[] };
+export type WidgetChoice = { role_id: string; role_name?: string; offered: string[]; chosen: string[]; default_applied?: boolean };
+export type AuditEntry = {
+  id: string;
+  actor_kind: "user" | "vendor_user" | "system_job" | "device";
+  actor_id: string | null;
+  support_grant_id: string | null;
+  action: string;
+  target_type: string;
+  target_id: string | null;
+  reason: string | null;
+  before_value: unknown;
+  after_value: unknown;
+  occurred_at: string;
+};
