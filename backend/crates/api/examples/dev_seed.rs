@@ -146,6 +146,14 @@ async fn main() -> anyhow::Result<()> {
             Some(json!({ "leave_type_id": ty["id"], "quantity": days, "entry_date": "2026-01-01", "reason": "dev seed: opening balance" }))).await?;
         types.push(ty["id"].clone());
     }
+    // A permission type: up to two hours, twice a month, the manager approves, applied for until two days after.
+    call(&app, t, "POST", "/v1/permissions/types", Some(json!({ "code": "PER", "name": "Personal permission", "version": {
+        "effective_from": "2026-01-01", "reason": "dev seed", "duration_unit": "block_30", "min_minutes": 30, "max_minutes": 120,
+        "limit_basis": "count", "limit_count": 2, "limit_period": "calendar_month", "max_per_day": 1, "allowed_position": "any",
+        "paid": true, "counts_as_worked": true, "counts_toward_overtime": false, "apply_window": "after_within_days", "after_event_days": 2,
+        "min_notice_minutes": 0, "approval": "manager", "timeout_action": "escalate", "over_limit": "block", "over_stay": "late_early_minutes",
+        "same_day_half_leave_allowed": false, "adjacent_off_allowed": true, "mid_period_joiner": "full", "eligibility": {},
+        "blackout_enabled": false, "blackout_dates": [], "punch_requirement": {}, "converted_uses_limit": true } }))).await?;
     let asha_token = domain_iam::tokens::issue_access(&secret, asha_user, org, None, now);
     let ahead = d + chrono::Duration::days(4);
     call(&app, &asha_token, "POST", "/v1/leave/requests", Some(json!({ "leave_type_id": types[0], "from_date": ahead, "to_date": ahead, "reason": "Family function" }))).await?;

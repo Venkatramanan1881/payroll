@@ -67,10 +67,14 @@ pub struct ListQuery {
     state: Option<String>,
     from: Option<NaiveDate>,
     to: Option<NaiveDate>,
+    awaiting_me: Option<bool>,
 }
 
 /// GET /v1/on-duty/requests.
 pub async fn list(Auth(p, mut tx): Auth, Query(q): Query<ListQuery>) -> Result<Json<Value>, ApiError> {
+    if q.awaiting_me == Some(true) {
+        return Ok(Json(json!({ "items": od::awaiting(&mut tx, &p).await?, "next_cursor": null })));
+    }
     let employees = readable(&mut tx, &p).await?;
     let f = od::Filter { employees, approver: p.user_id, employee: q.employee_id, state: q.state, from: q.from, to: q.to };
     Ok(Json(json!({ "items": od::list(&mut tx, &f).await?, "next_cursor": null })))
@@ -82,7 +86,23 @@ pub async fn get(Auth(p, mut tx): Auth, Path(id): Path<Uuid>) -> Result<Json<Val
     let employee = body["employee_id"].as_str().and_then(|s| s.parse().ok());
     let visible = sees(&readable(&mut tx, &p).await?, employee);
     let routed = body["current_approver_user_id"] == json!(p.user_id) || body["steps"].as_array().is_some_and(|s| s.iter().any(|x| x["actor_user_id"] == json!(p.user_id)));
-    if visible || routed { Ok(Json(body)) } else { Err(ApiError::NotFound) }
+    // A caller who may decide it (e.g. a delegate, or the HR pool) may also read it, as for leave.
+    let can_decide = od::can_decide(&mut tx, &p, id).await?;
+    if !(visible || routed || can_decide) {
+        return Err(ApiError::NotFound);
+    }
+    let mut body = body;
+    // What this caller may do now, by the checks approve / reject / cancel make (clients never rebuild them).
+    body["can_decide"] = json!(can_decide);
+    let open = ["pending_l1", "pending_l2", "approved"].contains(&body["state"].as_str().unwrap_or_default());
+    // cancel(): PRM-11 with the employee in scope (G-27: no role holds it by default).
+    body["can_cancel"] = json!(open
+        && match visible_employees(&mut tx, &p, "PRM-11").await {
+            Ok(v) => sees(&v, employee),
+            Err(ApiError::Forbidden) => false,
+            Err(e) => return Err(e),
+        });
+    Ok(Json(body))
 }
 
 #[derive(Deserialize, Default)]

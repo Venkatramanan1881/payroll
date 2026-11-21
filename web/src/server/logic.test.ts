@@ -77,6 +77,9 @@ describe("menus", () => {
     const c08 = [{ module_code: "C08", enabled: true }];
     expect(buildMenu([{ operation_code: "LVE-04", grant_kind: "approve" }], c08).map((i) => i.key)).toEqual(["leave"]);
     expect(buildMenu([{ operation_code: "LVE-08", grant_kind: "self" }], c08)).toEqual([]);
+    // Requests span two modules: either one switched on shows the item.
+    expect(buildMenu([{ operation_code: "CMP-05", grant_kind: "approve" }], [{ module_code: "M02", enabled: true }]).map((i) => i.key)).toEqual(["requests"]);
+    expect(buildMenu([{ operation_code: "PRM-02", grant_kind: "self" }], [{ module_code: "C09", enabled: true }])).toEqual([]);
   });
 });
 

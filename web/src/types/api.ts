@@ -207,3 +207,40 @@ export type RosterEntry = { id: string; employee_id: string; roster_date: string
 export type HolidayCalendar = { id: string; name: string; retired_at: string | null; branch_ids: string[]; updated_at: string };
 export type Holiday = { id: string; calendar_id: string; holiday_date: string; name: string; kind: "national" | "festival" | "optional"; updated_at: string };
 export type ScheduleDay = { date: string; source: string; is_weekly_off: boolean; holiday_name: string | null; shift_code?: string; shift_name?: string; start_time?: string | null; end_time?: string | null };
+
+// permissions.yaml / comp-off.yaml
+type Decidable = { state: string; escalated: boolean; steps: ApprovalStep[]; can_decide?: boolean; can_cancel?: boolean; employee_id: string; employee_code: string; employee_name: string };
+export type PermissionRequest = Decidable & {
+  id: string;
+  permission_type_id: string;
+  permission_type_name: string;
+  permission_date: string;
+  start_time: string;
+  end_time: string;
+  minutes: number;
+  reason: string;
+  origin: "applied" | "converted_late" | "converted_early";
+  submitted_at: string;
+};
+export type OnDutyRequest = Decidable & {
+  id: string;
+  duration_kind: "hours" | "half_day" | "full_day" | "several_days";
+  from_date: string;
+  to_date: string;
+  from_time: string | null;
+  to_time: string | null;
+  purpose: string;
+  place: string;
+  submitted_at: string;
+};
+export type CompOffCredit = Decidable & {
+  id: string;
+  worked_date: string;
+  fraction: string;
+  earned_basis: "policy" | "employee_choice" | "opening";
+  expires_on: string | null;
+  remaining: string;
+};
+export type PermissionType = { id: string; code: string; name: string; retired_at: string | null };
+export type PermissionUsage = { permission_type_id: string; limit_basis: string; period_from: string; period_to: string; used_count: number; used_minutes: number; remaining_count: number | null; remaining_minutes: number | null };
+export type CompOffBalance = { balance: string; pending_approval_days: string; open_credits: CompOffCredit[] };

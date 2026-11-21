@@ -301,6 +301,8 @@ pub async fn cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, reason: &str) -
 fn request_json() -> String {
     format!(
         "jsonb_build_object('id', q.id, 'employee_id', q.employee_id, 'duration_kind', q.duration_kind, 'from_date', q.from_date, 'to_date', q.to_date,
+           'employee_code', (SELECT e.employee_code FROM workforce.employee e WHERE e.id = q.employee_id),
+           'employee_name', (SELECT e.full_name FROM workforce.employee e WHERE e.id = q.employee_id),
            'from_time', to_char(q.from_time, 'HH24:MI'), 'to_time', to_char(q.to_time, 'HH24:MI'), 'purpose', q.purpose, 'place', q.place,
            'proof_path', q.proof_path, 'requested_by', q.requested_by, 'state', q.state, 'escalated', q.escalated, 'decided_basis', q.decided_basis,
            'current_approver_user_id', q.current_approver_user_id, 'submitted_at', q.submitted_at, 'cancelled_at', q.cancelled_at,
@@ -328,6 +330,22 @@ pub struct Filter {
     pub state: Option<String>,
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
+}
+
+/// Whether `decide` would accept the caller now (PRM-09 level 1, PRM-10 level 2).
+pub async fn can_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<bool, DomainError> {
+    approval::can_decide_two_level(tx, p, "on_duty", "perm.on_duty_request", id, ("PRM-09", "PRM-10")).await
+}
+
+/// The requests waiting for the caller's decision: exactly those `can_decide` accepts, newest first.
+pub async fn awaiting(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Vec<Value>, DomainError> {
+    let mut out = Vec::new();
+    for id in approval::awaiting_candidates(tx, p, "perm.on_duty_request", "q.submitted_at", &["pending_l1", "pending_l2"]).await? {
+        if can_decide(tx, p, id).await? {
+            out.push(get(tx, id).await?);
+        }
+    }
+    Ok(out)
 }
 
 pub async fn list(tx: &mut OrgTx<'_>, f: &Filter) -> Result<Vec<Value>, DomainError> {

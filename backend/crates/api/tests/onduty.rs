@@ -188,3 +188,31 @@ async fn half_day_hours_and_visibility(pool: PgPool) {
     assert_eq!(list["items"].as_array().map(Vec::len), Some(1), "{list}");
     assert_eq!(common::as_user(&app, &boss.token, "GET", &format!("/v1/on-duty/requests/{id}"), None, &[]).await.0, StatusCode::OK);
 }
+
+
+/// `awaiting_me` and the flags follow decide()/cancel() (web slice 6), including the two-level rule.
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn inbox_and_flags_follow_the_commands(pool: PgPool) {
+    let s = common::seed_org(&pool).await;
+    let app = common::app(pool.clone());
+    org_policy(&app, &s, Some(json!({ "OD-05": { "levels": "manager_then_hr" } }))).await;
+    let w = common::seed_worker(&pool, &app, &s, "Asha").await;
+    common::day_shift(&app, &s, w.employee_id).await;
+    let d = ((Utc::now() + Duration::minutes(330)).date_naive() + Duration::days(3)).to_string();
+    let (st, r) = common::as_user(&app, &w.token, "POST", "/v1/on-duty/requests", Some(ask("full_day", &d, &d)), &key()).await;
+    assert_eq!((st, r["employee_name"].as_str()), (StatusCode::CREATED, Some("Asha")), "{r}");
+    let id = r["id"].as_str().unwrap().to_string();
+    let waiting = |tok: String| {
+        let app = app.clone();
+        async move { common::as_user(&app, &tok, "GET", "/v1/on-duty/requests?awaiting_me=true", None, &[]).await.1["items"].as_array().unwrap().len() }
+    };
+    assert_eq!((waiting(s.hr_token.clone()).await, waiting(w.token.clone()).await), (1, 0));
+    let (_, own) = common::as_user(&app, &w.token, "GET", &format!("/v1/on-duty/requests/{id}"), None, &[]).await;
+    assert_eq!((own["can_decide"].as_bool(), own["can_cancel"].as_bool()), (Some(false), Some(false)), "G-27: no PRM-11 for employees");
+    let (_, hr) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/on-duty/requests/{id}"), None, &[]).await;
+    assert_eq!((hr["can_decide"].as_bool(), hr["can_cancel"].as_bool()), (Some(true), Some(true)));
+    common::as_user(&app, &s.hr_token, "POST", &format!("/v1/on-duty/requests/{id}/approve"), None, &key()).await;
+    let (_, l2) = common::as_user(&app, &s.hr_token, "GET", &format!("/v1/on-duty/requests/{id}"), None, &[]).await;
+    assert_eq!((l2["state"].as_str(), l2["can_decide"].as_bool()), (Some("pending_l2"), Some(false)), "never both levels");
+    assert_eq!(waiting(s.hr_token.clone()).await, 0);
+}

@@ -676,6 +676,25 @@ pub async fn decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, approve: bool, 
 
 /// PM-29: the employee before the start time (PRM-06); HR afterwards with a reason (PRM-07, checked by the caller).
 /// An approved permission gets a usage reversal and the day is recalculated.
+/// Whether `cancel` would accept the caller (the route has already established `hr`): an open request; the employee
+/// only before the start time (PM-29), HR at any time. The reason and locked periods are checked by the attempt.
+pub async fn can_cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, hr: bool) -> Result<bool, DomainError> {
+    let r: Option<(Uuid, String, NaiveDate, NaiveTime)> =
+        sqlx::query_as("SELECT employee_id, state, permission_date, start_time FROM perm.permission_request WHERE id = $1").bind(id).fetch_optional(&mut ***tx).await?;
+    let Some((employee, state, date, start)) = r else { return Ok(false) };
+    if !["pending_l1", "pending_l2", "approved"].contains(&state.as_str()) {
+        return Ok(false);
+    }
+    if hr {
+        return Ok(true);
+    }
+    if p.employee_id != Some(employee) {
+        return Ok(false);
+    }
+    let (from, _) = instants(tx, employee, date, start, start).await?;
+    Ok(Utc::now() < from)
+}
+
 pub async fn cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, reason: &str, hr: bool) -> Result<(), DomainError> {
     let employee = employee_of(tx, id).await?;
     lock_employee(tx, employee).await?;
@@ -727,6 +746,9 @@ pub async fn cancel(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid, reason: &str, h
 fn request_json() -> String {
     format!(
         "jsonb_build_object('id', q.id, 'employee_id', q.employee_id, 'permission_type_id', q.permission_type_id, 'permission_date', q.permission_date,
+           'employee_code', (SELECT e.employee_code FROM workforce.employee e WHERE e.id = q.employee_id),
+           'employee_name', (SELECT e.full_name FROM workforce.employee e WHERE e.id = q.employee_id),
+           'permission_type_name', (SELECT t.name FROM perm.permission_type t WHERE t.id = q.permission_type_id),
            'start_time', to_char(q.start_time, 'HH24:MI'), 'end_time', to_char(q.end_time, 'HH24:MI'), 'minutes', q.minutes, 'reason', q.reason,
            'document_path', q.document_path, 'origin', q.origin, 'requested_by', q.requested_by, 'state', q.state, 'escalated', q.escalated,
            'decided_basis', q.decided_basis, 'current_approver_user_id', q.current_approver_user_id, 'submitted_at', q.submitted_at,
@@ -752,6 +774,22 @@ pub struct Filter {
     pub origin: Option<String>,
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
+}
+
+/// Whether `decide` would accept the caller now (PRM-03 level 1, PRM-04 level 2).
+pub async fn can_decide(tx: &mut OrgTx<'_>, p: &Principal, id: Uuid) -> Result<bool, DomainError> {
+    approval::can_decide_two_level(tx, p, "permission", "perm.permission_request", id, ("PRM-03", "PRM-04")).await
+}
+
+/// The requests waiting for the caller's decision: exactly those `can_decide` accepts, newest first.
+pub async fn awaiting(tx: &mut OrgTx<'_>, p: &Principal) -> Result<Vec<Value>, DomainError> {
+    let mut out = Vec::new();
+    for id in approval::awaiting_candidates(tx, p, "perm.permission_request", "q.submitted_at", &["pending_l1", "pending_l2"]).await? {
+        if can_decide(tx, p, id).await? {
+            out.push(get(tx, id).await?);
+        }
+    }
+    Ok(out)
 }
 
 pub async fn list(tx: &mut OrgTx<'_>, f: &Filter) -> Result<Vec<Value>, DomainError> {

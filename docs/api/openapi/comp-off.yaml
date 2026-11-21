@@ -37,6 +37,10 @@ paths:
         - name: state
           in: query
           schema: { $ref: '#/components/schemas/CompOffCreditState' }
+        - name: awaiting_me
+          in: query
+          description: 'Only what the caller may decide now (routed to them, through an allowed delegation, or unrouted within their grant''s scope); the same check as approve / reject (web slice 6).'
+          schema: { type: boolean, default: false }
         - $ref: 'common.yaml#/components/parameters/From'
         - $ref: 'common.yaml#/components/parameters/To'
         - $ref: 'common.yaml#/components/parameters/BranchFilter'
@@ -298,6 +302,9 @@ components:
       properties:
         id: { $ref: 'common.yaml#/components/schemas/Id' }
         employee_id: { $ref: 'common.yaml#/components/schemas/Id' }
+        employee_code: { type: string, description: For display (web slice 6). }
+        employee_name: { type: string, description: For display (web slice 6). }
+        can_decide: { type: boolean, description: 'GET by id only: whether approve / reject would accept the caller now.' }
         worked_date: { $ref: 'common.yaml#/components/schemas/Date' }
         fraction: { type: string, enum: ['0.50', '1.00'], description: HW-04 half or full. }
         earned_basis: { type: string, enum: [policy, employee_choice, opening] }
