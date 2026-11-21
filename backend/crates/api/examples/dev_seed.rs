@@ -13,6 +13,7 @@
 //! - a monthly attendance cycle for the organisation from January (periods to review and lock).
 //! - an Organisation Admin (admin@dev.invalid, password, no authenticator step) with dev-only IAM-06 / IAM-09 / PLT-15 /
 //!   ORG-07 (G-08, G-10, G-03, G-14 open), and one support-access request from the dev vendor to decide.
+//! - an Auditor (auditor@dev.invalid, password) to read the audit trail and settings history.
 //!
 //! Organisation rows go straight in as the superuser; everything else goes through the API in-process.
 //!
@@ -102,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
         sqlx::query("INSERT INTO iam.role_grant (org_id, role_id, operation_code, grant_kind) VALUES ($1, $2, $3, 'all')").bind(org).bind(access_extras).bind(op).execute(&pool).await?;
     }
     sqlx::query("INSERT INTO iam.user_role (org_id, user_id, role_id) VALUES ($1, $2, $3)").bind(org).bind(admin).bind(access_extras).execute(&pool).await?;
+    // An Auditor: by default the only reader of the audit trail and settings history (G-34 open for OA and HR).
+    let auditor_role = role(&pool, org, "auditor", "Auditor").await?;
+    user(&pool, org, "auditor@dev.invalid", &hash, &[auditor_role], None).await?;
     sqlx::query("INSERT INTO platform.support_access_grant (org_id, vendor_user_id, reason) VALUES ($1, $2, 'Dev seed: look into a payroll export question')")
         .bind(org).bind(vendor).execute(&pool).await?;
 
@@ -183,6 +187,6 @@ async fn main() -> anyhow::Result<()> {
     let ahead = d + chrono::Duration::days(4);
     call(&app, &asha_token, "POST", "/v1/leave/requests", Some(json!({ "leave_type_id": types[0], "from_date": ahead, "to_date": ahead, "reason": "Family function" }))).await?;
 
-    println!("seeded organisation {org}: sign in as hr@dev.invalid (HR, manager of Asha), admin@dev.invalid (Organisation Admin) or asha@dev.invalid; punches on {d}");
+    println!("seeded organisation {org}: sign in as hr@dev.invalid (HR, manager of Asha), admin@dev.invalid (Organisation Admin), auditor@dev.invalid (Auditor) or asha@dev.invalid; punches on {d}");
     Ok(())
 }

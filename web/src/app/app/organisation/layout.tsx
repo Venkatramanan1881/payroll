@@ -1,5 +1,5 @@
 import { getTranslations } from "next-intl/server";
-import Link from "next/link";
+import { SubNav } from "@/components/sub-nav";
 
 const SUB = [
   ["settings", "/app/organisation"],
@@ -14,9 +14,7 @@ export default async function OrganisationLayout({ children }: { children: React
   return (
     <section className="grid gap-4">
       <h1 className="text-xl font-semibold">{t("title")}</h1>
-      <nav aria-label={t("title")} className="flex flex-wrap gap-4 border-b pb-2 text-sm">
-        {SUB.map(([k, href]) => <Link key={k} href={href} className="hover:underline">{t(`sub.${k}`)}</Link>)}
-      </nav>
+      <SubNav label={t("title")} links={SUB.map(([k, href]) => ({ href, text: t(`sub.${k}`) }))} />
       {children}
     </section>
   );

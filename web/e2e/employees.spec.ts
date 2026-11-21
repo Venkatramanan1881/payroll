@@ -14,6 +14,8 @@ test("HR signs in, adds and edits an employee, signs out", async ({ page, contex
   await page.getByLabel("Email").fill(email!);
   await page.getByLabel("Password").fill(password!);
   await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible(); // HR lands on their dashboard (DB-R1)
+  await page.getByRole("link", { name: "Employees" }).click();
   await expect(page.getByRole("heading", { name: "Employees" })).toBeVisible();
 
   // Tokens stay in httpOnly cookies, out of reach of page scripts.
